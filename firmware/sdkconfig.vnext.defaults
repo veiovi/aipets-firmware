@@ -1,0 +1,7 @@
+# Cloud-managed (vNext) firmware, appended after sdkconfig.defaults. Release
+# builds add the backend origin from sdkconfig.vnext.release.defaults.
+CONFIG_PET_VNEXT_ENROLLMENT=y
+CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-vnext.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions-vnext.csv"

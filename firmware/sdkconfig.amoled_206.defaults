@@ -1,0 +1,6 @@
+# Waveshare ESP32-S3-Touch-AMOLED-2.06: native 410x502, 32 MB flash, 8 MB PSRAM.
+# Builds declare 16 MB like the 1.85B: the Pocket layout uses only the first
+# 16 MB, so the bootloader and partition table are byte-identical to the
+# 1.85B's and only the application differs. Installers tell the boards apart by
+# the chip's physical capacity.
+CONFIG_BSP_DISPLAY_LVGL_BUF_HEIGHT=32

@@ -1,0 +1,11 @@
+# Build output
+build/
+dist/
+firmware/managed_components/
+firmware/sdkconfig
+firmware/sdkconfig.old
+
+# Python and macOS
+__pycache__/
+*.pyc
+.DS_Store

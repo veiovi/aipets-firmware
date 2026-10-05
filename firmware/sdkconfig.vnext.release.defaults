@@ -1,0 +1,3 @@
+# The AI Pets backend's public production endpoint.
+# Append after sdkconfig.defaults and sdkconfig.vnext.defaults. No credentials.
+CONFIG_PET_VNEXT_CONTROL_ORIGIN="https://device.aipets.com"

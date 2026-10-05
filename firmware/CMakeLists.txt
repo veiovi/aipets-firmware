@@ -1,0 +1,41 @@
+cmake_minimum_required(VERSION 3.16)
+
+set(AIPET_BOARD "waveshare-esp32-s3-touch-lcd-1.85b" CACHE STRING "Exact AI Pet board model")
+if(AIPET_BOARD STREQUAL "waveshare-esp32-s3-touch-amoled-2.06")
+    set(AIPET_BSP_COMPONENT waveshare__esp32_s3_touch_amoled_2_06)
+    list(APPEND EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/boards/amoled_206")
+elseif(AIPET_BOARD STREQUAL "waveshare-esp32-s3-touch-lcd-1.54")
+    # Waveshare publishes no BSP for this board; boards/lcd_154 is ours.
+    set(AIPET_BSP_COMPONENT lcd_154)
+    list(APPEND EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/boards/lcd_154")
+elseif(AIPET_BOARD STREQUAL "waveshare-esp32-s3-touch-lcd-1.85b")
+    set(AIPET_BSP_COMPONENT waveshare__esp32_s3_touch_lcd_1_85B)
+else()
+    message(FATAL_ERROR "Unsupported AIPET_BOARD: ${AIPET_BOARD}")
+endif()
+if(AIPET_BOARD STREQUAL "waveshare-esp32-s3-touch-lcd-1.85b" AND NOT DEFINED WAVESHARE_BSP)
+    set(WAVESHARE_BSP "${CMAKE_CURRENT_LIST_DIR}/../vendor/waveshare/Examples/ESP-IDF-V5.5.3/01_comprehensive_example/components/waveshare__esp32_s3_touch_lcd_1_85B")
+endif()
+if(AIPET_BOARD STREQUAL "waveshare-esp32-s3-touch-lcd-1.85b")
+    list(APPEND EXTRA_COMPONENT_DIRS "${WAVESHARE_BSP}")
+endif()
+
+if(NOT DEFINED PROJECT_VER)
+    set(PROJECT_VER "aipet-6.0.2-240")
+endif()
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+idf_build_set_property(AIPET_BSP_COMPONENT "${AIPET_BSP_COMPONENT}")
+if(AIPET_BOARD STREQUAL "waveshare-esp32-s3-touch-amoled-2.06")
+    idf_build_set_property(DEPENDENCIES_LOCK "${CMAKE_CURRENT_LIST_DIR}/dependencies.amoled_206.lock")
+elseif(AIPET_BOARD STREQUAL "waveshare-esp32-s3-touch-lcd-1.54")
+    idf_build_set_property(DEPENDENCIES_LOCK "${CMAKE_CURRENT_LIST_DIR}/dependencies.lcd_154.lock")
+endif()
+# The BSP lives outside this directory, so ESP-IDF's own prefix maps (the
+# project and IDF paths) miss it: its __FILE__ strings and debug info carried
+# the checkout path, and no two machines built the same image. Map it to a
+# fixed name so a reproducible build is byte-identical anywhere.
+if(AIPET_BOARD STREQUAL "waveshare-esp32-s3-touch-lcd-1.85b")
+    get_filename_component(AIPET_BSP_DIR "${WAVESHARE_BSP}" ABSOLUTE)
+    idf_build_set_property(COMPILE_OPTIONS "-ffile-prefix-map=${AIPET_BSP_DIR}=/waveshare_bsp" APPEND)
+endif()
+project(aipet_firmware)

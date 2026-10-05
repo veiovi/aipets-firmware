@@ -1,0 +1,166 @@
+{
+  "source": "UISFX with generated tones",
+  "source_url": "https://uisfx.com/",
+  "repository": "https://github.com/romainsimon/uisfx",
+  "revision": "v0.4.0",
+  "feel": "minimal",
+  "license": "CC0-1.0",
+  "format": "signed 16-bit little-endian mono PCM",
+  "sample_rate_hz": 24000,
+  "cues": {
+    "wake": {
+      "source_kind": "generated",
+      "generator": "tools/generate_sfx_tones.py",
+      "license": "Apache-2.0",
+      "frequency_hz": 660,
+      "samples": 12936,
+      "duration_ms": 539,
+      "pcm_sha256": "340D3AFAF003D52E6C89ABDD7A079CAE0EF4497670FF7A3634CE01E587BE44D7"
+    },
+    "connect": {
+      "source_url": "https://raw.githubusercontent.com/romainsimon/uisfx/v0.4.0/packages/uisfx/sounds/minimal/connect.ogg",
+      "source_sha256": "6439391BAFFEE7AD3C66226025885391CE77BC56C6A3E6BDF8637B5E17CBE838",
+      "source_sample_rate_hz": 48000,
+      "samples": 12182,
+      "duration_ms": 508,
+      "pcm_sha256": "732476B17EC186D0073E4B93B41674AD8F9B0152CC31DBB27D4E14155B037C37"
+    },
+    "start": {
+      "source_url": "https://raw.githubusercontent.com/romainsimon/uisfx/v0.4.0/packages/uisfx/sounds/minimal/start.ogg",
+      "source_sha256": "F6AF645AD0AB885D643B1C6506891E35D9051A4CB0E706C74E3252B4F6C4AE21",
+      "source_sample_rate_hz": 48000,
+      "samples": 9187,
+      "duration_ms": 383,
+      "pcm_sha256": "5607421794ECB6436E0921609C41670C37F7D154118A6F1E2802A4E58494CC6E"
+    },
+    "stop": {
+      "source_url": "https://raw.githubusercontent.com/romainsimon/uisfx/v0.4.0/packages/uisfx/sounds/minimal/stop.ogg",
+      "source_sha256": "12AEEE8B7F6D6883CA5887AD68CC760D88CB80E691777FDB2D737A121A33A80A",
+      "source_sample_rate_hz": 48000,
+      "samples": 8064,
+      "duration_ms": 336,
+      "pcm_sha256": "2B9C97A778A13D7B244BD73F07814A49FF1E49D5DAD3128F5B276B5D8972005C"
+    },
+    "complete": {
+      "source_url": "https://raw.githubusercontent.com/romainsimon/uisfx/v0.4.0/packages/uisfx/sounds/minimal/complete.ogg",
+      "source_sha256": "472B8A981CB5F215E3B0D5729D985808C0B3B57DE8FE19C5356CF98591FD880F",
+      "source_sample_rate_hz": 48000,
+      "samples": 15552,
+      "duration_ms": 648,
+      "pcm_sha256": "58004CC6A374131EB178AF09A9A122118DDBEF7EC80A46367AB22C0592415703"
+    },
+    "cancel": {
+      "source_url": "https://raw.githubusercontent.com/romainsimon/uisfx/v0.4.0/packages/uisfx/sounds/minimal/cancel.ogg",
+      "source_sha256": "48152B3DDEA1B187A4A44106B94D8BAED253E102726A8A14449C52F3BF3E0D39",
+      "source_sample_rate_hz": 48000,
+      "samples": 6941,
+      "duration_ms": 289,
+      "pcm_sha256": "73C2E03F5D5E65F5E4FD56A1F38F983E237E9E8D2736B2A8D585579B11148487"
+    },
+    "retry": {
+      "source_url": "https://raw.githubusercontent.com/romainsimon/uisfx/v0.4.0/packages/uisfx/sounds/minimal/retry.ogg",
+      "source_sha256": "220BE4F51705E7E81F1696B5C369CD1C143F1C666B08E80FA7CE69282B8CA1C6",
+      "source_sample_rate_hz": 48000,
+      "samples": 8439,
+      "duration_ms": 352,
+      "pcm_sha256": "45D8E3A61610CC007235EBD0E86231A9771E434E7DA9FA402994FA99A40AD552"
+    },
+    "error": {
+      "source_url": "https://raw.githubusercontent.com/romainsimon/uisfx/v0.4.0/packages/uisfx/sounds/minimal/error.ogg",
+      "source_sha256": "798A782A320756AF3D9CFFC9DFF15135706396EA58ED4EA55663149EB52C74EE",
+      "source_sample_rate_hz": 48000,
+      "samples": 12125,
+      "duration_ms": 505,
+      "pcm_sha256": "605C5A718C08089C7BC1911A33CCAD6C45C336110674BBAB9726A252149BC027"
+    },
+    "no_voice": {
+      "source_kind": "generated",
+      "generator": "tools/generate_sfx_tones.py",
+      "license": "Apache-2.0",
+      "frequency_hz": 330,
+      "samples": 3344,
+      "duration_ms": 139,
+      "pcm_sha256": "7C207357BBB4CCAF63827819F96C7231A492E8E532F563AE422FE879B6BD26D2"
+    },
+    "settings_open": {
+      "source_kind": "generated",
+      "generator": "tools/generate_sfx_tones.py",
+      "license": "Apache-2.0",
+      "frequency_hz": 880,
+      "samples": 6956,
+      "duration_ms": 290,
+      "pcm_sha256": "ACDA463167E79EDE427D21F0E1E3932A7DAED5433BB3F52AA88B4CC9B25B1496"
+    },
+    "settings_close": {
+      "source_kind": "generated",
+      "generator": "tools/generate_sfx_tones.py",
+      "license": "Apache-2.0",
+      "frequency_hz": 660,
+      "samples": 14754,
+      "duration_ms": 615,
+      "pcm_sha256": "2DB5192A0029FFB48364E2FB60DC910413CCCAF551661853BFA6DA5F8470C256"
+    },
+    "face_swipe_0": {
+      "source_kind": "generated",
+      "generator": "tools/generate_sfx_tones.py",
+      "license": "Apache-2.0",
+      "frequency_hz": 523,
+      "samples": 22896,
+      "duration_ms": 954,
+      "pcm_sha256": "685999F83F505CF418AB79B75F0EB0DB297A6A527101406E628EE7D7066DA23C"
+    },
+    "face_swipe_1": {
+      "source_kind": "generated",
+      "generator": "tools/generate_sfx_tones.py",
+      "license": "Apache-2.0",
+      "frequency_hz": 587,
+      "samples": 22882,
+      "duration_ms": 953,
+      "pcm_sha256": "513F7794E6BA5B9F9655E0BEB028743CA557F1B4EB4F9C1A02F9FDAEC157F578"
+    },
+    "face_swipe_2": {
+      "source_kind": "generated",
+      "generator": "tools/generate_sfx_tones.py",
+      "license": "Apache-2.0",
+      "frequency_hz": 659,
+      "samples": 22922,
+      "duration_ms": 955,
+      "pcm_sha256": "6C354CB9CB792D35FDCAB0C869BFB6E9964D125F4718EAC6551B7FE8638D08F4"
+    },
+    "face_swipe_3": {
+      "source_kind": "generated",
+      "generator": "tools/generate_sfx_tones.py",
+      "license": "Apache-2.0",
+      "frequency_hz": 784,
+      "samples": 22943,
+      "duration_ms": 956,
+      "pcm_sha256": "8221CBF44B31C4BFE38E67B560D85FD47BD86B273DEB57DCB0DD44CA55551512"
+    },
+    "face_swipe_4": {
+      "source_kind": "generated",
+      "generator": "tools/generate_sfx_tones.py",
+      "license": "Apache-2.0",
+      "frequency_hz": 880,
+      "samples": 22907,
+      "duration_ms": 954,
+      "pcm_sha256": "5BF5F6A2631E0EC9E92F02C34DDEB44CB4BBF56EC8A7384EA9895B0A5B490509"
+    },
+    "gesture_shake": {
+      "source_url": "https://raw.githubusercontent.com/romainsimon/uisfx/v0.4.0/packages/uisfx/sounds/minimal/blocked.ogg",
+      "source_sha256": "1EA81B7A22B6C39D72AE94D13C39D7EACAEB512BF6747E5DABBCDD46AD7BDE4A",
+      "source_sample_rate_hz": 48000,
+      "samples": 8381,
+      "duration_ms": 349,
+      "pcm_sha256": "773959C9D6E50E901A7371240E479BA3AB790029D6D68E7015A10BAC32B57FD6"
+    },
+    "gesture_pop": {
+      "source_url": "https://raw.githubusercontent.com/romainsimon/uisfx/v0.4.0/packages/uisfx/sounds/minimal/press.ogg",
+      "source_sha256": "174B27587E2BD6A26CD5AF32CAECD13BA73CC30DF9B0C03250175D76848CA647",
+      "source_sample_rate_hz": 48000,
+      "samples": 3572,
+      "duration_ms": 149,
+      "pcm_sha256": "F02881910C4FBEBFEF2B120F6325A7CAF751DE23AC854DECB0A424B7EB5EB2BB"
+    }
+  },
+  "license_scope": "Top-level CC0 license applies to UISFX cues; generated cues are Apache-2.0 and other per-cue licenses apply otherwise."
+}

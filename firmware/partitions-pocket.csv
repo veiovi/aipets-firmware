@@ -1,0 +1,11 @@
+# Pocket Terminal three-pet geometry (pet_flash_layout.c three-pet-3p5m-v3).
+# Written once by the settings-preserving USB migration; never by OTA.
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xf000,   0x1000,
+otadata,    data, ota,     0x10000,  0x2000,
+coredump,   data, coredump,0x12000,  0x10000,
+ota_0,      app,  ota_0,   0x30000,  0x380000,
+ota_1,      app,  ota_1,   0x3b0000, 0x380000,
+pet_journal,data, 0x41,    0x730000, 0x10000,
+pet_store,  data, 0x43,    0x740000, 0x8c0000,

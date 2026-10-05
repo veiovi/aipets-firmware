@@ -1,0 +1,71 @@
+name: Release
+
+# Pushing a tag vX.Y.Z builds every board in the pinned ESP-IDF container and
+# publishes a GitHub release: per board a full image (write at 0x0) and an app
+# image, plus manifest.json and SHA256SUMS.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.board }}
+    runs-on: ubuntu-24.04
+    container: espressif/idf:v5.5.3@sha256:8ccd4d2ce413889c6c2bba57e986c670302094efb91c913c6091152e317a7805
+    strategy:
+      matrix:
+        board:
+          - waveshare-esp32-s3-touch-lcd-1.85b
+          - waveshare-esp32-s3-touch-amoled-2.06
+          - waveshare-esp32-s3-touch-lcd-1.54
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Build
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          tools/build-firmware.sh "${{ matrix.board }}" build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.board }}
+          if-no-files-found: error
+          path: |
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/ota_data_initial.bin
+            build/aipet_firmware.bin
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: builds
+      - name: Package
+        run: |
+          python3 tools/package_release.py --version "${GITHUB_REF_NAME#v}" --commit "$GITHUB_SHA" --out dist \
+            $(for build in builds/*; do printf '%s=%s ' "${build#builds/}" "$build"; done)
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > "$RUNNER_TEMP/notes.md" <<'EOF'
+          Firmware images for each supported board. `*-full.bin` is written at `0x0` and
+          replaces everything on the board, including Wi-Fi and pets. `*-app.bin` updates a
+          board that already runs this firmware and is written at `0x30000` and `0x3b0000`.
+          Check downloads against `SHA256SUMS`.
+          EOF
+          printf '\nFlashing steps: %s/%s/blob/%s/docs/getting-started.md\n' \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" >> "$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag \
+            --title "AI Pets firmware ${GITHUB_REF_NAME#v}" --notes-file "$RUNNER_TEMP/notes.md"

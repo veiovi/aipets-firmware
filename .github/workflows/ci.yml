@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.board }}
+    runs-on: ubuntu-24.04
+    container: espressif/idf:v5.5.3@sha256:8ccd4d2ce413889c6c2bba57e986c670302094efb91c913c6091152e317a7805
+    strategy:
+      fail-fast: false
+      matrix:
+        board:
+          - waveshare-esp32-s3-touch-lcd-1.85b
+          - waveshare-esp32-s3-touch-amoled-2.06
+          - waveshare-esp32-s3-touch-lcd-1.54
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Build
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          tools/build-firmware.sh "${{ matrix.board }}" build
+      - name: Package (not published)
+        run: python3 tools/package_release.py --version ci --commit "$GITHUB_SHA" --out dist "${{ matrix.board }}=build"
+
+  host-tests:
+    name: Host tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Tests that need ESP-IDF or LVGL sources skip here; set IDF_PATH and
+      # LVGL_SOURCE_DIR to run them locally (docs/getting-started.md).
+      - run: python3 -m unittest discover -s firmware/tests -p 'test_*.py'

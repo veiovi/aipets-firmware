@@ -1,0 +1,17 @@
+menu "Board: Waveshare ESP32-S3-Touch-LCD-1.54"
+    # The Waveshare BSPs' option names, so sdkconfig.defaults sets every board.
+    config BSP_I2C_NUM
+        int "I2C port of the shared bus"
+        default 1
+        range 0 1
+
+    config BSP_I2S_NUM
+        int "I2S port of the codecs"
+        default 1
+        range 0 1
+
+    config BSP_DISPLAY_BRIGHTNESS_LEDC_CH
+        int "LEDC channel of the backlight"
+        default 1
+        range 0 7
+endmenu

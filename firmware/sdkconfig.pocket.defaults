@@ -1,0 +1,5 @@
+# Pocket Terminal firmware, appended after sdkconfig.defaults and
+# sdkconfig.vnext.defaults. Requires the three-pet flash geometry.
+CONFIG_PET_POCKET_TERMINAL=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-pocket.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions-pocket.csv"

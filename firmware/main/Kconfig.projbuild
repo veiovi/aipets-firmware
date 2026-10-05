@@ -1,0 +1,136 @@
+menu "AI Pet firmware vNext"
+
+config PET_VNEXT_ENROLLMENT
+    bool "Enable generic cloud-managed firmware with native setup"
+    default n
+    select MBEDTLS_HAVE_TIME
+    select MBEDTLS_HAVE_TIME_DATE
+    select ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
+    help
+        Starts native Wi-Fi/code setup, signed dual-slot pet installation and
+        bound conversation. No embedded production pets or legacy fallback.
+        Requires the vNext partition map, verified cloud deployment and public
+        release key. Release and physical acceptance gates still apply.
+
+config PET_VNEXT_CONTROL_ORIGIN
+    string "Backend HTTPS origin"
+    depends on PET_VNEXT_ENROLLMENT
+    default ""
+    help
+        The backend the device talks to: https://<host>, or https://<host>:<port>
+        for a port other than 443. The host is a lowercase DNS name; no path or
+        trailing slash. Setup and control use the origin itself, voice
+        wss://<host>[:<port>]/v1/device and firmware updates
+        <origin>/v1/device/firmware/. sdkconfig.vnext.release.defaults sets the
+        AI Pets backend, https://device.aipets.com. Empty deliberately prevents
+        backend requests; an invalid origin is logged as BACKEND_ORIGIN_INVALID
+        and treated as empty.
+
+config PET_VNEXT_RELEASE_KEY_ID
+    string "Pinned private-pack release signing key ID"
+    depends on PET_VNEXT_ENROLLMENT
+    default "com.aipets.visual-keys.2026-08-30"
+
+config PET_VNEXT_RELEASE_PUBLIC_KEY
+    string "Pinned P-256 SEC1 public point (130 hex characters)"
+    depends on PET_VNEXT_ENROLLMENT
+    default "04b5f9094e4d60032979ab6b0c977e471dd7a8cf3a962b4ff8a3b07c3b7cceabf0ea9073876cdd1d1aaa6a82f55e9a4bbee04ce53fee50a6c49af1c64440320f1c"
+    help
+        Public verification key of the pet release signing key.
+        Never put a signing private key here. Empty rejects every private pack.
+
+config PET_VNEXT_DEVELOPER_LIBRARY
+    bool "Show the on-device test pet library"
+    depends on PET_VNEXT_ENROLLMENT
+    default n
+    help
+        Exposes the development-only Test another pet action in the native
+        status screen. Production devices keep this disabled and receive pet
+        packages through the website Send workflow.
+
+config PET_POCKET_TERMINAL
+    bool "Pocket Terminal experience"
+    depends on PET_VNEXT_ENROLLMENT
+    default n
+    help
+        Enables the Pocket Terminal experience as it lands, starting with the
+        18 interaction sounds (about 474 KB). It requires the three-pet flash
+        geometry with 3.5 MiB firmware copies. Keep it off for firmware
+        released to devices that still have 2 MiB firmware slots.
+
+config PET_DEVICE_RELINK
+    bool "Move a linked Pocket Terminal to another account by its own code"
+    depends on PET_POCKET_TERMINAL
+    default n
+    help
+        Shows LINK TO ANOTHER ACCOUNT on the deck and lets the setup worker call
+        /v1/device/link/*. Off until the cloud's relink contract, whose
+        link/confirm also rotates the device credential, is released and this
+        firmware sends that credential. Off, nothing
+        calls /v1/device/link/*.
+
+config PET_VNEXT_FIRMWARE_EPOCH
+    int "Qualified firmware capability epoch (0 disables v2 application writes)"
+    depends on PET_VNEXT_ENROLLMENT
+    default 0
+    range 0 2147483647
+
+config PET_VNEXT_IMPORTED_RELEASE
+    bool
+    default y
+    depends on PET_VNEXT_ENROLLMENT
+    help
+        Build marker, not a choice: the release parser verifies imported pet
+        releases and the capabilities advertise renderer.importedRelease.
+        The release tooling declares it in firmware release metadata only
+        for builds that carry this marker.
+
+config PET_VNEXT_BOOTLOADER_BYTES
+    int "Qualified deployed rollback bootloader byte length"
+    depends on PET_VNEXT_ENROLLMENT
+    default 0
+    range 0 32768
+    help
+        Release input covering the exact deployed bytes, including any
+        flashing-tool header normalization. Zero allows recovery polling only.
+
+config PET_VNEXT_BOOTLOADER_SHA256
+    string "Qualified deployed rollback bootloader SHA-256"
+    depends on PET_VNEXT_ENROLLMENT
+    default ""
+    help
+        Public immutable release input, not an arbitrary hash observed at boot.
+        Empty or mismatched profile blocks OTA; USB migration must seed both
+        compatible apps and the qualified rollback-enabled bootloader.
+
+config PET_PLAYBACK_TAIL_MS
+    int "Speaker time kept open after a reply (ms)"
+    default 2000
+    range 0 10000
+    help
+        After the last frame of a reply the speaker stays open on silence for
+        this long, so the audio still in the I2S DMA and the codec is heard to
+        the end. The face goes idle and the reply counts as done once that
+        audio has drained (at least 300 ms), not after the whole tail. The
+        microphone, a sound cue, a new reply or a stop ends the tail at once.
+        The speaker never closes before the audio has drained, so 0 closes it
+        then.
+
+config PET_AUDIO_DMA_BUFFERS
+    int "I2S DMA buffers of 240 frames per direction"
+    default 6
+    range 2 16
+    help
+        The speaker's I2S DMA ring: 6 buffers of 240 frames, 60 ms at 24 kHz,
+        as the Waveshare BSP sets it. The playback task must write again
+        within the ring, or the speaker plays silence inside the speech (a
+        click); each reply's "playback audio" log line counts those buffers
+        (dma_underflows). The mouth's delay and the reply's drain follow the
+        ring. The port runs in full duplex, so the microphone's ring has as
+        many buffers. Each buffer costs internal DMA-capable RAM: 480 B for the
+        speaker while speech plays, 1,920 B for the microphone once it has
+        recorded, and 1,920 B more for the speaker while the microphone
+        records (esp_codec_dev runs the port at the microphone's 32-bit
+        stereo format then).
+
+endmenu

@@ -1,0 +1,61 @@
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
+CONFIG_SPIRAM_RODATA=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# Keep margin in ESP-IDF's default event loop even though application work is
+# dispatched to dedicated tasks. This loop handles Wi-Fi/IP lifecycle events.
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+# TLS buffers live in PSRAM. In internal RAM a handshake failed with -0x7F00
+# once the face, audio and Wi-Fi were running.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# Half a second of microphone audio fits in the send buffer, so a brief
+# stall does not block websocket writes.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+# Speech arrives at 48 KB/s (PCM16 at 24 kHz). TCP delivers at most one
+# receive window per round trip, so lwIP's 5,760 B default kept up only below
+# about 120 ms: on a 240 ms link (a phone hotspot, a weak access point) a
+# reply arrived at half speed, hundreds of 20 ms gaps (Pocket, 30 Sep 2026).
+# 32 KiB keeps up to about 680 ms. Its buffers are in PSRAM like the rest of
+# lwIP, and the mailbox holds a whole window of segments.
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+# SNTP asks at once: pet_setup asks again on its own schedule, and a random
+# delay of up to 5 s before each ask only held back the first request.
+# CONFIG_LWIP_SNTP_STARTUP_DELAY is not set
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+CONFIG_LV_USE_CLIB_MALLOC=y
+CONFIG_LV_USE_CLIB_STRING=y
+CONFIG_LV_USE_CLIB_SPRINTF=y
+CONFIG_LV_OS_FREERTOS=y
+CONFIG_LV_DEF_REFR_PERIOD=20
+CONFIG_LV_OBJ_STYLE_CACHE=y
+CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=2
+# The application does not use LVGL's bundled demo/example sources.
+CONFIG_LV_BUILD_EXAMPLES=n
+CONFIG_ESP_LVGL_ADAPTER_ENABLE_FPS_STATS=y
+CONFIG_BSP_I2C_NUM=1
+CONFIG_BSP_I2C_FAST_MODE=y
+CONFIG_BSP_I2C_CLK_SPEED_HZ=400000
+CONFIG_BSP_LCD_TRANS_QUEUE_DEPTH=4
+# CONFIG_BSP_LCD_TE_RESISTANT is not set
+CONFIG_BSP_DISPLAY_BRIGHTNESS_LEDC_CH=1
+CONFIG_BSP_I2S_NUM=1
