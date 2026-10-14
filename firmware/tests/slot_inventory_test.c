@@ -39,7 +39,7 @@ static void same(const pet_slot_inventory_t *a, const pet_slot_inventory_t *b)
 static void persist(const pet_slot_inventory_t *next)
 {
     memcpy(baseline, flash, sizeof(flash));
-    const size_t cuts[] = {0, 1, 19, 20, 24, 512, 1042, 4095};
+    const size_t cuts[] = {0, 1, 19, 20, 24, 512, 20 + PET_SLOT_RECORD_BYTES - 1, 4095};
     const pet_slot_inventory_t previous = store.state;
     for (unsigned i = 0; i < sizeof(cuts) / sizeof(cuts[0]); ++i) {
         memcpy(flash, baseline, sizeof(flash)); fail = false;
@@ -91,13 +91,14 @@ static bool request(pet_replace_t *op, const pet_replace_pack_t *t, unsigned n)
     char r[37]; uuid(r, n + 100);
     return pet_replace_request(op, r, t, op->phase == PET_REPLACE_ACTIVE ? op->binding_revision : "revision-0");
 }
-/* One installation through every step; returns the slot it landed in. */
+/* One installation through every step; returns the slot it landed in. A
+ * Pocket keeps one pet: it is always slot 0, on screen and bound or not. */
 static int install(pet_slot_inventory_t *inv, unsigned n)
 {
     const pet_replace_pack_t t = pack(n);
     apply(inv, request, &t, n);
     const int slot = inv->target;
-    assert(slot >= 0 && slot != inv->active && slot != inv->bound);
+    assert(slot == 0);
     apply(inv, fence, &t, n);
     apply(inv, invalidate, &t, n);
     assert(inv->slots[slot].state == PET_SLOT_INSTALLING && inv->bound == -1 && inv->active != slot);
@@ -125,6 +126,8 @@ static void codec_rejects(const pet_slot_inventory_t *inv)
     const struct { size_t at; uint8_t value; } corrupt[] = {
         {0, 'X'},           /* magic */
         {4, 1},             /* version 1 (never written by a device) */
+        {4, 2},             /* old three-pet inventory version */
+        {6, 3},             /* old three-pet slot count */
         {6, 4},             /* slot count */
         {7, 9},             /* active out of range */
         {13, 9},            /* bound out of range */
@@ -132,7 +135,7 @@ static void codec_rejects(const pet_slot_inventory_t *inv)
         {16, 3},            /* slot state */
         {17, 1},            /* slot reserved */
         {16 + 12 + 36, 'x'},       /* garbage after a string terminator */
-        {16 + 3 * 114, 'X'},       /* embedded single-slot record */
+        {16 + PET_SLOT_COUNT * 114, 'X'}, /* embedded single-slot record */
     };
     for (unsigned i = 0; i < sizeof(corrupt) / sizeof(corrupt[0]); ++i) {
         uint8_t copy[PET_SLOT_RECORD_BYTES]; memcpy(copy, bytes, sizeof(copy));
@@ -141,35 +144,17 @@ static void codec_rejects(const pet_slot_inventory_t *inv)
     }
 }
 
-/* A cloud release of bytes already installed over USB replaces that copy, not
- * the stalest pet, so no pet ends up twice. The shown and bound pets stay. */
-static void installs_over_its_copy(void)
-{
-    memset(flash, 0xff, sizeof(flash));
-    assert(pet_slot_journal_open(&store, &io) == PET_JOURNAL_OK);
-    pet_slot_inventory_t inv = store.state;
-    assert(install(&inv, 1) == 0 && install(&inv, 2) == 1 && install(&inv, 3) == 2);
-    char relationship[37]; uuid(relationship, 903);
-    assert(pet_slot_inventory_select(&inv, 0) && pet_slot_inventory_rebind(&inv, 0, "binding-copy", relationship, "config-copy"));
-    assert(inv.slots[1].shown_at < inv.slots[2].shown_at && inv.active == 0 && inv.bound == 0);
-    pet_replace_pack_t signed_copy = pack(3); uuid(signed_copy.build_id, 777);
-    apply(&inv, request, &signed_copy, 7);
-    assert(inv.target == 2);
-    pet_replace_t op = inv.operation; assert(pet_replace_cancel(&op));
-    assert(pet_slot_inventory_apply(&inv, &op, 7) && inv.target == -1);
-    pet_replace_pack_t on_screen = pack(1); uuid(on_screen.build_id, 778);
-    apply(&inv, request, &on_screen, 8);
-    assert(inv.target == 1);
-}
-
 static void exact_replacement(void)
 {
-    /* Includes the only pet, the shown/bound pet, and a non-LRU other pet. */
-    for (unsigned count=1;count<=3;++count) for (unsigned target=0;target<count;++target) {
+    /* The only pet, shown and bound, and the pet in slot 0 beside an older one
+     * in slot 1, which shows and is bound. Slot 0 is always the target. */
+    for (unsigned count=1;count<=PET_SLOT_COUNT;++count) {
+        const unsigned target=0;
         memset(flash,0xff,sizeof(flash));
         assert(pet_slot_journal_open(&store,&io)==PET_JOURNAL_OK);
         pet_slot_inventory_t inv=store.state;
-        for (unsigned n=1;n<=count;++n) assert(install(&inv,n)==(int)n-1);
+        assert(install(&inv,1)==0);
+
         const pet_slot_inventory_t before=inv;
         pet_replace_pack_t old=inv.slots[target].pack,incoming=pack(9),wrong=old;
         pet_replace_t op=inv.operation;assert(request(&op,&incoming,9));
@@ -179,6 +164,7 @@ static void exact_replacement(void)
         assert(!pet_slot_inventory_apply_target(&inv,&op,7,&wrong));same(&inv,&before);
         wrong=old;uuid(wrong.build_id,999);
         assert(!pet_slot_inventory_apply_target(&inv,&op,7,&wrong));same(&inv,&before);
+
         assert(pet_slot_inventory_apply_target(&inv,&op,7,&old)&&inv.target==(int)target);
         persist(&inv); /* Includes power loss before fencing an active target. */
         pet_slot_inventory_t cancelled=inv;pet_replace_t cancel=inv.operation;
@@ -196,15 +182,15 @@ static void exact_replacement(void)
 
 static void exact_removal(void)
 {
-    for (unsigned count = 1; count <= 3; ++count)
+    for (unsigned count = 1; count <= PET_SLOT_COUNT; ++count)
     {
         for (unsigned target = 0; target < count; ++target)
         {
             memset(flash, 0xff, sizeof(flash));
             assert(pet_slot_journal_open(&store, &io) == PET_JOURNAL_OK);
             pet_slot_inventory_t inv = store.state;
-            for (unsigned n = 1; n <= count; ++n)
-                assert(install(&inv, n) == (int)n - 1);
+            assert(install(&inv, 1) == 0);
+
             const pet_slot_inventory_t before = inv;
             pet_replace_pack_t old = inv.slots[target].pack;
             for (unsigned field = 0; field < 3; ++field)
@@ -239,12 +225,39 @@ static void exact_removal(void)
     assert(!pet_slot_inventory_remove(&installing, &incoming));
 }
 
+static void old_journal_is_foreign(void)
+{
+    pet_slot_inventory_t empty;
+    uint8_t current[PET_SLOT_RECORD_BYTES], old[1042] = {0};
+    assert(pet_slot_inventory_empty(&empty));
+    assert(pet_slot_inventory_encode(&empty, current, sizeof(current)));
+    memcpy(old, current, 16 + 114);
+    old[4] = 2;
+    old[6] = 3;
+    memcpy(old + 16 + 3 * 114, current + 16 + 114, PET_REPLACE_RECORD_BYTES);
+    uint32_t capacity = PET_LAYOUT_THREE_SLOT_PACK_BYTES;
+    for (unsigned i = 0; i < 4; ++i)
+        old[16 + 3 * 114 + 4 + i] = (uint8_t)(capacity >> (8 * i));
+    memset(flash, 0xff, sizeof(flash));
+    pet_journal_t journal;
+    uint8_t loaded[sizeof(old)];
+    size_t length = 0;
+    assert(pet_journal_open(&journal, &io, loaded, sizeof(loaded), &length) == PET_JOURNAL_EMPTY);
+    assert(pet_journal_save(&journal, old, sizeof(old)) == PET_JOURNAL_OK);
+    memcpy(baseline, flash, sizeof(flash));
+    pet_slot_journal_t foreign;
+    /* The old valid payload is larger than the new record buffer. */
+    assert(pet_slot_journal_open(&foreign, &io) == PET_JOURNAL_ARGUMENT && !foreign.ready);
+    assert(!memcmp(flash, baseline, sizeof(flash)));
+}
+
 int main(void)
 {
     pet_flash_layout_t layout; uint32_t pack_at, manifest_at;
-    assert(pet_flash_layout_known(PET_LAYOUT_THREE_3P5M, &layout) && layout.pet_slots == PET_SLOT_COUNT);
-    assert(pet_replace_capacity_valid(PET_LAYOUT_THREE_SLOT_PACK_BYTES) && PET_LAYOUT_THREE_SLOT_PACK_BYTES >= 3000000u);
-    assert(pet_flash_layout_slot(&layout, 2, &pack_at, &manifest_at));
+    assert(pet_flash_layout_known(PET_LAYOUT_ONE_10M, &layout) && layout.pet_slots == PET_SLOT_COUNT);
+    assert(pet_replace_capacity_valid(PET_LAYOUT_ONE_SLOT_PACK_BYTES) && PET_LAYOUT_ONE_SLOT_PACK_BYTES >= 4000000u);
+    assert(pet_flash_layout_slot(&layout, 0, &pack_at, &manifest_at));
+    assert(!pet_flash_layout_slot(&layout, 1, NULL, NULL));
     assert(manifest_at + PET_LAYOUT_MANIFEST_BYTES <= layout.pet_partition_bytes);
 
     memset(flash, 0xff, sizeof(flash));
@@ -253,34 +266,35 @@ int main(void)
     assert(pet_slot_inventory_valid(&inv) && inv.active == -1 && inv.bound == -1 && inv.target == -1);
     assert(pet_slot_inventory_step(&inv, -1, 1) == -1 && !pet_slot_inventory_select(&inv, 0));
 
-    /* Each new pet fills a free slot and becomes the bound, shown pet; the
-     * previous pets stay installed. */
-    assert(install(&inv, 1) == 0 && install(&inv, 2) == 1 && install(&inv, 3) == 2);
-    for (unsigned slot = 0; slot < PET_SLOT_COUNT; ++slot) assert(inv.slots[slot].state == PET_SLOT_READY);
-    assert(pet_slot_inventory_step(&inv, 2, 1) == 0 && pet_slot_inventory_step(&inv, 0, -1) == 2);
-    assert(pet_slot_inventory_step(&inv, 1, 2) == -1);
+    /* Each new pet replaces the one in slot 0 and becomes the bound, shown pet;
+     * slot 1 stays free for the sound bank. */
+    assert(install(&inv, 1) == 0 && install(&inv, 3) == 0);
+    assert(!strcmp(inv.slots[0].pack.sha256, pack(3).sha256));
+    assert(pet_slot_inventory_step(&inv, 0, 1) == 0);
     codec_rejects(&inv);
-
-    /* A swipe shows another pet; the cloud's confirmation rebinds to it. */
-    uint32_t revision = inv.selection_revision;
-    assert(pet_slot_inventory_select(&inv, 0) && inv.active == 0 && inv.selection_revision == revision + 1);
-    assert(inv.bound == 2 && !pet_slot_inventory_select(&inv, 3));
+    /* A new pet targets slot 0 even when it is on screen and another pet is
+     * bound; cancelled before its fence, it changes nothing. */
+    before = inv;
+    pet_replace_t requested = inv.operation;
+    const pet_replace_pack_t incoming = pack(4);
+    assert(request(&requested, &incoming, 4) && pet_slot_inventory_apply(&inv, &requested, 7) && inv.target == 0);
+    assert(pet_replace_cancel(&requested) && pet_slot_inventory_apply(&inv, &requested, 7));
+    same(&inv, &before);
     char relationship[37]; uuid(relationship, 901);
-    before = inv; assert(!pet_slot_inventory_rebind(&before, 3, "binding-2", relationship, "config-2"));
+    before = inv; assert(!pet_slot_inventory_rebind(&before, 2, "binding-2", relationship, "config-2"));
     assert(!pet_slot_inventory_rebind(&before, 0, "", relationship, "config-2"));
     assert(pet_slot_inventory_rebind(&inv, 0, "binding-2", relationship, "config-2") && inv.bound == 0);
     assert(inv.operation.phase == PET_REPLACE_ACTIVE && !strcmp(inv.operation.binding_revision, "binding-2"));
     persist(&inv);
 
-    /* With every slot full, the stalest pet neither shown nor bound makes room. */
-    assert(inv.slots[1].shown_at < inv.slots[2].shown_at);
-    assert(install(&inv, 4) == 1 && !strcmp(inv.slots[0].pack.sha256, pack(1).sha256));
+    /* With both slots full, the new pet still replaces slot 0; slot 1's stays. */
+    assert(install(&inv, 4) == 0);
 
     /* A request cancelled before its fence changes nothing. */
     const pet_replace_pack_t fifth = pack(5);
     before = inv; apply(&inv, request, &fifth, 5);
     const int target = inv.target;
-    assert(target == 2 && !pet_slot_inventory_rebind(&inv, 0, "binding-3", relationship, "config-3"));
+    assert(target == 0 && !pet_slot_inventory_rebind(&inv, 0, "binding-3", relationship, "config-3"));
     pet_replace_t op = inv.operation; assert(pet_replace_cancel(&op));
     assert(pet_slot_inventory_apply(&inv, &op, 7) && inv.target == -1 && inv.bound == before.bound);
     same(&inv, &before);
@@ -288,16 +302,16 @@ int main(void)
 
     /* The target was on screen when invalidation came: another pet shows. */
     apply(&inv, request, &fifth, 5);
-    assert(inv.target == 2 && pet_slot_inventory_select(&inv, 2) && inv.active == 2);
+    assert(inv.target == 0 && pet_slot_inventory_select(&inv, 0) && inv.active == 0);
     apply(&inv, fence, &fifth, 5);
     apply(&inv, invalidate, &fifth, 5);
-    assert(inv.active == 1 && inv.bound == -1 && inv.slots[2].state == PET_SLOT_INSTALLING);
-    assert(!pet_slot_inventory_select(&inv, 2) && pet_slot_inventory_step(&inv, 1, 1) == 0);
+    assert(inv.active == -1 && inv.bound == -1 && inv.slots[0].state == PET_SLOT_INSTALLING);
+    assert(!pet_slot_inventory_select(&inv, 0) && pet_slot_inventory_step(&inv, 0, 1) == -1);
     codec_rejects(&inv);
 
     /* A cancel after the fence is recovery on the same slot: retry, then finish. */
     op = inv.operation; assert(pet_replace_cancel(&op) && op.phase == PET_REPLACE_RECOVERY);
-    assert(pet_slot_inventory_apply(&inv, &op, 7) && inv.slots[2].state == PET_SLOT_INSTALLING && inv.bound == -1);
+    assert(pet_slot_inventory_apply(&inv, &op, 7) && inv.slots[0].state == PET_SLOT_INSTALLING && inv.bound == -1);
     persist(&inv);
     char o[37], f[37]; uuid(o, 5); uuid(f, 505);
     op = inv.operation; assert(pet_replace_retry(&op, o, f, &fifth) && pet_slot_inventory_apply(&inv, &op, 7));
@@ -307,18 +321,26 @@ int main(void)
     op = inv.operation; assert(pet_replace_cancel(&op) && pet_slot_inventory_apply(&inv, &op, 7));
     const pet_replace_pack_t sixth = pack(6);
     pet_replace_t replacement; char r[37], o6[37], f6[37]; uuid(r, 106); uuid(o6, 6); uuid(f6, 506);
-    assert(pet_replace_empty(&replacement, PET_LAYOUT_THREE_SLOT_PACK_BYTES) &&
+    assert(pet_replace_empty(&replacement, PET_LAYOUT_ONE_SLOT_PACK_BYTES) &&
            pet_replace_request(&replacement, r, &sixth, "revision-6") && pet_replace_fenced(&replacement, o6, f6, &sixth));
     op = inv.operation; assert(pet_replace_supersede(&op, o, f, &replacement));
-    assert(pet_slot_inventory_apply(&inv, &op, 7) && inv.target == 2 && inv.slots[2].state == PET_SLOT_INSTALLING);
+    assert(pet_slot_inventory_apply(&inv, &op, 7) && inv.target == 0 && inv.slots[0].state == PET_SLOT_INSTALLING);
     persist(&inv);
     apply(&inv, invalidate, &sixth, 6); apply(&inv, download, &sixth, 6); apply(&inv, verify, &sixth, 6);
     apply(&inv, activate, &sixth, 6);
     op = inv.operation; assert(commit(&op, &sixth, 6));
     assert(!pet_slot_inventory_apply(&inv, &op, 0));
     apply(&inv, commit, &sixth, 6);
-    assert(inv.active == 2 && inv.bound == 2 && !strcmp(inv.slots[2].pack.sha256, sixth.sha256));
+    assert(inv.active == 0 && inv.bound == 0 && !strcmp(inv.slots[0].pack.sha256, sixth.sha256));
     codec_rejects(&inv);
+
+    /* The physical capacity, independent of the resident RAM budget. */
+    pet_replace_pack_t oversized = pack(7);
+    oversized.bytes = PET_POCKET_MAX_PACK_BYTES + 1;
+    before = inv;
+    op = inv.operation;
+    assert(!request(&op, &oversized, 7));
+    same(&inv, &before);
 
     /* A capacity from another layout is refused. */
     op = inv.operation; op.capacity_bytes = PET_REPLACE_MAX_BYTES;
@@ -328,9 +350,10 @@ int main(void)
     memset(flash, 0xff, sizeof(flash));
     pet_replace_journal_t single; assert(pet_replace_journal_open(&single, &io, PET_REPLACE_MAX_BYTES) == PET_JOURNAL_OK);
     pet_slot_journal_t foreign; assert(pet_slot_journal_open(&foreign, &io) == PET_JOURNAL_CORRUPT && !foreign.ready);
-    installs_over_its_copy();
     exact_replacement();
     exact_removal();
-    puts("slot inventory: installs over a copy, into free and stalest slots, swipes and rebinding, cancel, recovery, supersession, torn writes and foreign journals passed");
+    old_journal_is_foreign();
+    puts("slot inventory: every installation into slot 0, one-slot selection and rebinding, "
+         "cancel, recovery, supersession, torn writes and foreign journals passed");
     return 0;
 }

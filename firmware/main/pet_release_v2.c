@@ -81,14 +81,17 @@ static bool requirements(const cJSON *o,pet_release_v2_t *r)
     if(!keys_only(layout,"id|partitionTableSha256|flashBytes|appSlotBytes|petPartitionBytes|manifestReservationBytes|packCapacityBytes",7))return false;
     /* A release names one physical layout: a single-pet device or the Pocket
      * Terminal's three-pet store, where packCapacityBytes is one slot. */
-    for(unsigned id=PET_LAYOUT_SINGLE_2M;id<=PET_LAYOUT_THREE_3P5M;++id)
+    for(unsigned id=PET_LAYOUT_SINGLE_2M;id<=PET_LAYOUT_ONE_10M;++id)
         if(equal(layout,"id",pet_flash_layout_name((pet_layout_id_t)id))){pet_flash_layout_known((pet_layout_id_t)id,&known);break;}
     if(!known.pet_slots||!text(layout,"partitionTableSha256",p->partition_sha256,sizeof(p->partition_sha256))||
        !hex(p->partition_sha256,sizeof(p->partition_sha256))||!exact(layout,"flashBytes",PET_FLASH_BYTES)||
        !exact(layout,"appSlotBytes",known.app_slot_bytes)||!exact(layout,"petPartitionBytes",known.pet_partition_bytes)||
        !exact(layout,"manifestReservationBytes",PET_REPLACE_MANIFEST_BYTES)||!exact(layout,"packCapacityBytes",known.pack_capacity_bytes)||
        r->pack.bytes>known.pack_capacity_bytes||(known.id==PET_LAYOUT_THREE_3P5M&&
-       (r->pack.bytes>PET_RELEASE_V2_THREE_PET_MAX_BYTES||p->minimum_firmware_epoch<PET_RELEASE_V2_THREE_PET_EPOCH)))return false;
+       (r->pack.bytes>PET_RELEASE_V2_THREE_PET_MAX_BYTES||p->minimum_firmware_epoch<PET_RELEASE_V2_THREE_PET_EPOCH))||
+       (known.id==PET_LAYOUT_TWO_4M && (r->pack.bytes>PET_LAYOUT_TWO_MAX_PACK_BYTES ||
+        p->minimum_firmware_epoch<PET_RELEASE_V2_TWO_PET_EPOCH))||
+       (known.id==PET_LAYOUT_ONE_10M && p->minimum_firmware_epoch<7))return false;
     const cJSON *codecs=field(o,"codecs");uint8_t mask=0;
     if(!cJSON_IsArray(codecs)||cJSON_GetArraySize(codecs)<1||cJSON_GetArraySize(codecs)>8)return false;
     for(const cJSON *v=codecs->child;v;v=v->next){
@@ -136,8 +139,11 @@ static bool replacement_target_ok(const cJSON *target,pet_release_v2_t *r)
     return keys_only(target,"buildId|sha256|bytes",3)&&
         text(target,"buildId",t->build_id,sizeof(t->build_id))&&uuid(t->build_id)&&
         text(target,"sha256",t->sha256,sizeof(t->sha256))&&hex(t->sha256,sizeof(t->sha256))&&
-        number(target,"bytes",1,PET_RELEASE_V2_THREE_PET_MAX_BYTES,&t->bytes)&&
-        r->requirements.layout_id==PET_LAYOUT_THREE_3P5M&&
+        number(target,"bytes",1,r->requirements.layout_id==PET_LAYOUT_ONE_10M ? PET_LAYOUT_ONE_SLOT_PACK_BYTES :
+            r->requirements.layout_id==PET_LAYOUT_TWO_4M ?
+            PET_LAYOUT_TWO_MAX_PACK_BYTES : PET_RELEASE_V2_THREE_PET_MAX_BYTES,&t->bytes)&&
+        (r->requirements.layout_id==PET_LAYOUT_THREE_3P5M||r->requirements.layout_id==PET_LAYOUT_TWO_4M||
+         r->requirements.layout_id==PET_LAYOUT_ONE_10M)&&
         r->requirements.minimum_firmware_epoch>=PET_RELEASE_V2_TARGETED_EPOCH;
 }
 static bool verify(const char *payload,const char *key,const char *signature,const char *account,
@@ -194,8 +200,10 @@ bool pet_release_v2_verify(const cJSON *envelope,const char *account,const pet_r
 }
 bool pet_release_v2_compatible(const pet_release_v2_t *r,const pet_firmware_requirements_t *current)
 {
-    if(!r||!current||!same_pack(&r->pack,&r->pack)||current->bootloader.bytes<4096||current->bootloader.bytes>0x8000||
-       !hex(current->bootloader.sha256,sizeof(current->bootloader.sha256))||!hex(current->partition_sha256,sizeof(current->partition_sha256)))return false;
+    if(!r||!current||!same_pack(&r->pack,&r->pack)||
+       (current->layout.id!=PET_LAYOUT_ONE_10M&&(current->bootloader.bytes<4096||current->bootloader.bytes>0x8000||
+        !hex(current->bootloader.sha256,sizeof(current->bootloader.sha256))))||
+       !hex(current->partition_sha256,sizeof(current->partition_sha256)))return false;
     pet_flash_layout_t layout;
     if(!pet_flash_layout_known(current->layout.id,&layout)||current->layout.id<PET_LAYOUT_SINGLE_2M||
        current->layout.app_slot_bytes!=layout.app_slot_bytes||current->layout.pet_partition_bytes!=layout.pet_partition_bytes||

@@ -72,13 +72,34 @@ typedef void (*pet_face_gesture_callback_t)(uint8_t gesture);
 typedef void (*pet_face_realtime_boost_callback_t)(pet_realtime_boost_t boost);
 typedef void (*pet_face_speech_mouth_callback_t)(pet_speech_mouth_mode_t mode);
 typedef void (*pet_face_wifi_join_callback_t)(const char *ssid, const char *password);
-/* +1: swipe left, next installed pet; -1: swipe right, previous one. */
-typedef void (*pet_face_swipe_callback_t)(int direction);
+/* Which way the finger moved: right is a swipe from the left edge. */
+typedef enum {
+    PET_FACE_SWIPE_RIGHT,
+    PET_FACE_SWIPE_LEFT,
+    PET_FACE_SWIPE_UP,
+    PET_FACE_SWIPE_DOWN,
+    PET_FACE_SWIPE_NONE,
+} pet_face_swipe_t;
+/* A finger's path on the pet, from (x0, y0) to (x1, y1): a swipe once it
+ * travelled 48 px, mostly one way, within 1.5 s, wherever it started on the
+ * glass. Anything shorter or slower is NONE: a tap or a press. */
+static inline pet_face_swipe_t pet_face_swipe(int x0, int y0, int x1, int y1, int64_t duration_us)
+{
+    const int dx = x1 - x0, dy = y1 - y0;
+    const int horizontal = dx < 0 ? -dx : dx, vertical = dy < 0 ? -dy : dy;
+    if (duration_us >= 1500000) return PET_FACE_SWIPE_NONE;
+    if (horizontal >= 48 && horizontal > vertical) return dx > 0 ? PET_FACE_SWIPE_RIGHT : PET_FACE_SWIPE_LEFT;
+    if (vertical >= 48 && vertical > horizontal) return dy > 0 ? PET_FACE_SWIPE_DOWN : PET_FACE_SWIPE_UP;
+    return PET_FACE_SWIPE_NONE;
+}
+/* RIGHT, LEFT or UP. */
+typedef void (*pet_face_swipe_callback_t)(pet_face_swipe_t swipe);
 
 typedef struct {
     pet_face_tap_callback_t tapped;
-    /* When set, horizontal swipes switch installed pets instead of faces. */
-    pet_face_swipe_callback_t pet_swiped;
+    /* When set, a swipe right, left or up opens another screen over the pet
+     * (Pocket Terminal), and the face rests until pet_face_show. */
+    pet_face_swipe_callback_t swiped;
     pet_face_settings_callback_t settings_opened;
     pet_face_settings_closed_callback_t settings_closed;
     pet_face_settings_callback_t wifi_scan_requested;
@@ -132,6 +153,9 @@ bool pet_face_touch_reaction(void);
  * one character per 24 ms, holds it, then clears it. Longer text is cut. */
 #define PET_FACE_TERMINAL_MAX 26
 void pet_face_announce(const char *text);
+/* Pocket Terminal. The story frame (pet_onboarding_story_frame) over the pet,
+ * shown or not on the face's next tick. Any task; it never waits. */
+void pet_face_set_story_frame(bool shown);
 bool pet_face_shake_detection_enabled(void);
 pet_face_state_t pet_face_get_state(void);
 uint32_t pet_face_render_heartbeat(void);

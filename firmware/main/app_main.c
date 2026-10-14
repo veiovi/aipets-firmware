@@ -24,6 +24,9 @@
 #include "pet_vnext.h"
 #include "pet_sfx.h"
 #include "pet_tap_policy.h"
+#include "pet_display.h"
+#include "pet_flash_layout_esp.h"
+#include "bsp/esp-bsp.h"
 
 typedef enum {
     APP_EVENT_TAP,
@@ -799,7 +802,7 @@ static esp_err_t open_microphone(void)
                                                   sizeof(ai_pet_id)), TAG,
                         "read synchronized AI identity");
     ESP_RETURN_ON_ERROR(pet_network_input_start(s_active_input_stream,
-                                                ai_pet_id), TAG,
+                                                ai_pet_id, NULL), TAG,
                         "announce audio start");
     ESP_RETURN_ON_ERROR(pet_audio_capture_start(s_active_input_stream), TAG, "start microphone");
     return ESP_OK;
@@ -1523,6 +1526,26 @@ static void app_event_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "AI Pet firmware %s booting", esp_app_get_description()->version);
+#if CONFIG_PET_POCKET_TERMINAL
+    /* An interrupted USB migration can boot this app with the old table.
+     * Check before NVS, diagnostics, Wi-Fi or any storage writer starts. */
+    pet_flash_layout_t layout;
+    char partition_sha256[65];
+    if (pet_flash_layout_read(&layout, partition_sha256) != ESP_OK || layout.id != PET_LAYOUT_ONE_10M)
+    {
+        ESP_LOGE(TAG, "Finish the update over USB: partition layout mismatch");
+        if (pet_display_start() && pet_display_lock(-1) == ESP_OK)
+        {
+            lv_obj_t *label = lv_label_create(lv_screen_active());
+            lv_label_set_text(label, "Finish the update\nConnect USB to continue");
+            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_center(label);
+            pet_display_unlock();
+            bsp_display_brightness_set(60);
+        }
+        return;
+    }
+#endif
     ESP_ERROR_CHECK(pet_diagnostics_init());
     ESP_ERROR_CHECK(pet_config_init());
 #if CONFIG_PET_VNEXT_ENROLLMENT

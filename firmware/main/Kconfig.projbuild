@@ -53,10 +53,9 @@ config PET_POCKET_TERMINAL
     depends on PET_VNEXT_ENROLLMENT
     default n
     help
-        Enables the Pocket Terminal experience as it lands, starting with the
-        18 interaction sounds (about 474 KB). It requires the three-pet flash
-        geometry with 3.5 MiB firmware copies. Keep it off for firmware
-        released to devices that still have 2 MiB firmware slots.
+        Enables one installed pet and a dedicated story sound bank. Requires
+        the one-pet-10m-v5 geometry, one 3.5 MiB factory application and
+        firmware epoch 7 or later. Firmware updates use USB; pets install over Wi-Fi.
 
 config PET_DEVICE_RELINK
     bool "Move a linked Pocket Terminal to another account by its own code"

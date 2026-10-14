@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "frame_player.h"
+#include "frame_stream.h"
 #include "../../components/frame_player/src/frame_internal.h"
 static const char *test_face_id;
 static unsigned touch_calls, shake_calls, gesture_calls;
@@ -134,9 +135,59 @@ static void assert_live_inputs(void)
     assert(!s_scene.gesture_until_ms);
 }
 
+/* A story event (pet_face_pack_play_event) over the bound pet `id`, here the
+ * synthetic, unapproved fuzz seed, whose base-plane ambient loop shows frames
+ * 0, 2 and 1 for 6 ticks each: it plays that loop three times whatever the pet
+ * does, then the pet's player is bound again. Stopped early or held, it ends
+ * at once, each event exactly once. The face stays the pet's, and the
+ * unapproved pack can never be registered as a pet. */
+static unsigned events_ended;
+static unsigned stream_reads;
+static int stream_read(void *context, uint32_t offset, void *out, uint32_t bytes)
+{
+    ++stream_reads;
+    memcpy(out, (const uint8_t *)context + offset, bytes);
+    return 1;
+}
+
+static void event_ended(void) { ++events_ended; }
+static void assert_story_event(const char *id, const uint8_t *event, size_t length)
+{
+    bool rendered;
+    char face[PET_FACE_ID_MAX];
+    const fp_pack_info_t pet = *fp_pack_info(s_scene.player); /* Its id points into the pet's bytes. */
+    assert(pet_face_pack_play_event(event, length, event_ended) == ESP_OK);
+    assert(pet_face_pack_play_event(event, length, event_ended) == ESP_ERR_INVALID_STATE); /* one at a time */
+    static const uint16_t frames[] = {0, 2, 1};
+    assert(!fp_pack_info(s_scene.player)->approved);
+    assert(pet_face_pack_current_id(face, sizeof(face)) == ESP_OK && !strcmp(face, id));
+    const uint32_t loop = fp_idle_loop_ticks(s_scene.player);
+    assert(loop == 18);
+    touch_calls = 0;
+    assert(pet_face_pack_trigger_gesture(FC_GESTURE_SHAKE) == FC_GESTURE_NONE && !pet_face_pack_touch());
+    for (uint32_t t = 0; t < 3 * loop; ++t) {
+        assert(pet_face_pack_update(PET_FACE_SPEAKING, PET_EXPRESSION_ANGRY, 255, 0, t & 1, 0, 0, 400, 400,
+                                    PET_ANIMATION_FULL, 1000 + t, true, &rendered) == ESP_OK);
+        assert(s_scene.player->sys_state == FP_SYS_IDLE && fp_debug_frame(s_scene.player) == frames[(t / 6) % 3]);
+        assert(!events_ended && !touch_calls);
+    }
+    assert(tick() == ESP_OK && events_ended == 1 && fp_pack_info(s_scene.player)->id == pet.id && !s_scene.event_done);
+    /* Stopped early, then stopping again changes nothing. */
+    assert(pet_face_pack_play_event(event, length, event_ended) == ESP_OK && tick() == ESP_OK);
+    pet_face_pack_stop_event();
+    pet_face_pack_stop_event();
+    assert(events_ended == 2 && fp_pack_info(s_scene.player)->id == pet.id);
+    /* The pet's copy is about to hold another pet: the event ends with it. */
+    assert(pet_face_pack_play_event(event, length, event_ended) == ESP_OK);
+    pet_face_pack_hold_external();
+    assert(events_ended == 3 && s_scene.holding && !s_scene.player);
+    assert(pet_face_pack_play_event(event, length, event_ended) == ESP_ERR_INVALID_STATE);
+    assert(pet_face_pack_use_external("fuzz-seed", event, length) == ESP_ERR_INVALID_CRC);
+}
+
 int main(int argc, char **argv)
 {
-    assert(argc >= 2 && argc <= 4);
+    assert(argc >= 2 && argc <= 5);
     int display_size = argc >= 3 ? atoi(argv[2]) : 360;
     int display_height = argc == 4 ? atoi(argv[3]) : display_size;
     assert(display_size > 0 && display_size <= 502);
@@ -300,14 +351,37 @@ int main(int argc, char **argv)
     }
     assert(pet_face_pack_use_external(test_face_id, fixture, length) == ESP_OK && tick() == ESP_OK);
 
+    /* The live adapter binds resident spans, returns from story events to
+     * those spans, and detaches them without any render-thread reads. */
+    void *stream_buffer = NULL;
+    assert(!posix_memalign(&stream_buffer, 16, 4000000));
+    fp_stream_t *stream = NULL;
+    assert(fp_stream_open(stream_buffer, 4000000, length, stream_read, fixture, 1, 256000, &stream) == FP_OK);
+    unsigned opened_reads = stream_reads;
+    assert(pet_face_pack_use_source(test_face_id, fp_stream_source(stream), fp_stream_info(stream)) == ESP_OK);
+    assert(tick() == ESP_OK && s_scene.player->source.frame);
     assert_live_inputs();
+    if (argc == 5) {
+        FILE *file = fopen(argv[4], "rb");
+        assert(file);
+        uint8_t *event = malloc(262144);
+        size_t event_length = fread(event, 1, 262144, file);
+        fclose(file);
+        assert(event_length && event_length < 262144);
+        assert_story_event(test_face_id, event, event_length);
+        free(event);
+        assert(pet_face_pack_use_source(test_face_id, fp_stream_source(stream), fp_stream_info(stream)) == ESP_OK);
+        assert(tick() == ESP_OK);
+    }
 
     /* Clearing the external catalog must not destroy a separately bound pack. */
     s_scene.bound_external = false;
     old = s_scene.player;
     pet_face_pack_release_external();
     assert(s_scene.player == old && tick() == ESP_OK);
+    assert(stream_reads == opened_reads);
     forget_player();
+    free(stream_buffer);
     lv_obj_delete(parent);
     free(s_scene.arena);
     free(s_scene.physical);

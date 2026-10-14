@@ -1,4 +1,4 @@
-"""Host-only three-pet store inventory: ASan/UBSan, torn writes, no ESP-IDF."""
+"""Host-only one-pet store inventory: ASan/UBSan, torn writes, no ESP-IDF."""
 import os
 from pathlib import Path
 import subprocess
@@ -36,6 +36,8 @@ class SlotInventoryTests(unittest.TestCase):
             "-I", str(ROOT / "components/frame_player/include"),
             str(MBED / "library/sha256.c"), str(MBED / "library/platform_util.c"), str(MBED / "library/md5.c"),
             *[str(ROOT / "main" / source) for source in sources],
+            *[str(p) for p in sorted((ROOT / "components/frame_player/src").glob("*.c"))],
+            str(ROOT / "components/frame_player/vendor/miniz/miniz_tinfl.c"),
             str(ROOT / "tests" / test), "-o", binary,
         ], check=True)
         return binary
@@ -51,11 +53,11 @@ class SlotInventoryTests(unittest.TestCase):
             result = subprocess.run([self._store_binary(directory, "slot_install_test.c")],
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("three-pet installation", result.stdout)
+            self.assertIn("one-pet installation", result.stdout)
 
     def test_pocket_partition_table_matches_the_firmware_geometry(self):
         """ESP-IDF builds partitions-pocket.csv; the device identifies it by the C table."""
-        names = {"nvs": 2, "phy": 1, "ota": 0, "coredump": 3, "ota_0": 0x10, "ota_1": 0x11}
+        names = {"nvs": 2, "phy": 1, "ota": 0, "coredump": 3, "ota_0": 0x10, "ota_1": 0x11, "factory": 0}
         rows = []
         for line in (ROOT / "partitions-pocket.csv").read_text(encoding="utf-8").splitlines():
             if not line.strip() or line.startswith("#"):
@@ -79,7 +81,7 @@ class SlotInventoryTests(unittest.TestCase):
         values = dict(line.split("=", 1) for line in release.splitlines() if line and not line.startswith("#"))
         # Epoch 4 protects every slot during firmware updates; a Pocket never
         # updates to an older epoch.
-        self.assertGreaterEqual(int(values["CONFIG_PET_VNEXT_FIRMWARE_EPOCH"]), 4)
+        self.assertGreaterEqual(int(values["CONFIG_PET_VNEXT_FIRMWARE_EPOCH"]), 7)
         self.assertTrue(4096 <= int(values["CONFIG_PET_VNEXT_BOOTLOADER_BYTES"]) <= 0x8000)
         self.assertRegex(values["CONFIG_PET_VNEXT_BOOTLOADER_SHA256"], r'^"[0-9a-f]{64}"$')
 

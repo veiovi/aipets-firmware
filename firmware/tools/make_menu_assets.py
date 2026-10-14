@@ -10,7 +10,15 @@ keeps that license, is named pet_menu_font_* because 'Share' is a Reserved
 Font Name, and carries the copyright notice and license text as
 pet_menu_font_license, which the menu's ABOUT page shows, so every copy of
 the firmware includes them. Icons are drawn here, supersampled, as 8-bit alpha
-masks the menu tints (main/pet_menu_icons.c). Needs Pillow with FreeType.
+masks the menu tints (main/pet_menu_icons.c); the story screens' pixel art is
+drawn here bit by bit. Needs Pillow with FreeType.
+
+The WOODLAND style: the ASCII glyphs of Jersey 10, 15 and 20
+(third_party/jersey) and of Jacquard 12 (third_party/jacquard-12), each at the
+size where one of its pixels is one of the screen's, 1 bit per pixel, in
+main/pet_menu_woodland_font.c (SIL OFL 1.1, no Reserved Font Names); and its
+plank and rope tiles, drawn here pixel by pixel, as RGB565 images in
+main/pet_menu_icons.c.
 
 The boot page shows a mark above its log: pet_boot_mark in main/pet_menu_icons.c,
 an 8-bit coverage mask the page tints lime. --logo makes it from a PNG's alpha;
@@ -32,6 +40,21 @@ LOGO_WIDTH = 200  # px on the 360 px glass: about the width of the boot log belo
 LOGO_NOISE = 16  # alpha below this is export noise around the ink, not ink
 LOGO_INK = 253  # alpha from this up is solid ink: full coverage
 RING_HEIGHT = 115  # px: the room the boot page leaves for its mark at LOGO_WIDTH
+# WOODLAND's faces, pixel fonts from the Soft Type collection, each drawn at
+# the size where one of its pixels is one of the screen's (units per em over
+# its pixel), 1 bit per pixel: Jersey for text, standing in for the menu's
+# sizes and keeping their line heights, so every page keeps its layout; and
+# titles in Jacquard 12, a pixel blackletter. The number in each name is the
+# height of its capitals.
+JERSEY = ROOT / "third_party/jersey"
+WOODLAND_FACES = (  # the face, its pixel size and the menu sizes it stands in for
+    (JERSEY / "Jersey10-Regular.ttf", 1400 / 75, (12, 16)),
+    (JERSEY / "Jersey15-Regular.ttf", 1350 / 50, (20,)),
+    (JERSEY / "Jersey20-Regular.ttf", 1292 / 38, (28,)),
+)
+BLACKLETTER = ROOT / "third_party/jacquard-12/Jacquard12-Regular.ttf"
+BLACKLETTER_SIZE = 21  # 1260 / 60
+PIXEL_SUPERSAMPLE = 8
 
 
 def glyph(font: ImageFont.FreeTypeFont, size: int, character: str, baseline: int):
@@ -51,14 +74,37 @@ def glyph(font: ImageFont.FreeTypeFont, size: int, character: str, baseline: int
     return levels, advance, width, height, x0 - origin, baseline - y1
 
 
-def pack(levels):
-    """High nibble first, one continuous stream per glyph, like lv_font_conv."""
+def pack(levels, bpp=4):
+    """The first pixel in the highest bits, one continuous stream per glyph, like lv_font_conv."""
     data = bytearray()
-    for index in range(0, len(levels), 2):
-        high = levels[index]
-        low = levels[index + 1] if index + 1 < len(levels) else 0
-        data.append(high << 4 | low)
+    per_byte = 8 // bpp
+    for index in range(0, len(levels), per_byte):
+        byte = 0
+        for offset in range(per_byte):
+            level = levels[index + offset] if index + offset < len(levels) else 0
+            byte |= level << (8 - bpp * (offset + 1))
+        data.append(byte)
     return data
+
+
+def pixel_glyph(font: ImageFont.FreeTypeFont, size: int, character: str):
+    """1-bit rows of one glyph of a pixel face and its LVGL descriptor fields.
+
+    `font` is the face at PIXEL_SUPERSAMPLE times the size where its pixels
+    are the screen's, `size` that size rounded up. A pixel is lit when most of
+    its block is inked."""
+    scale = PIXEL_SUPERSAMPLE
+    origin, baseline = size * scale, 2 * size * scale
+    canvas = Image.new("L", (4 * size * scale, 3 * size * scale), 0)
+    ImageDraw.Draw(canvas).text((origin, baseline), character, font=font, fill=255, anchor="ls")
+    small = canvas.resize((canvas.width // scale, canvas.height // scale), Image.Resampling.BOX)
+    small = small.point(lambda value: 1 if value >= 128 else 0)
+    advance = round(font.getlength(character) / scale)
+    box = small.getbbox()
+    if box is None:
+        return [], advance, 0, 0, 0, 0
+    x0, y0, x1, y1 = box
+    return list(small.crop(box).tobytes()), advance, x1 - x0, y1 - y0, x0 - size, 2 * size - y1
 
 
 def c_bytes(data, indent="    ", per_line=16):
@@ -103,43 +149,81 @@ def font_source(ttf: Path) -> str:
     for size in SIZES:
         font = ImageFont.truetype(str(ttf), size)
         ascent, descent = font.getmetrics()
-        bitmap = bytearray()
-        descriptors = ["    {.bitmap_index = 0, .adv_w = 0, .box_w = 0, .box_h = 0, .ofs_x = 0, .ofs_y = 0},"]
-        for code in range(FIRST, LAST + 1):
-            levels, advance, width, height, ofs_x, ofs_y = glyph(font, size, chr(code), ascent + size // 2)
-            descriptors.append(
-                f"    {{.bitmap_index = {len(bitmap)}, .adv_w = {advance * 16}, .box_w = {width}, "
-                f".box_h = {height}, .ofs_x = {ofs_x}, .ofs_y = {ofs_y}}}, /* {chr(code)!r} */")
-            bitmap += pack(levels)
-        name = f"pet_menu_font_{size}"
-        parts += [
-            f"static LV_ATTRIBUTE_LARGE_CONST const uint8_t {name}_bitmap[] = {{",
-            c_bytes(bitmap),
-            "};",
-            f"static const lv_font_fmt_txt_glyph_dsc_t {name}_glyphs[] = {{",
-            *descriptors,
-            "};",
-            f"static const lv_font_fmt_txt_cmap_t {name}_cmaps[] = {{",
-            f"    {{.range_start = {FIRST}, .range_length = {LAST - FIRST + 1}, .glyph_id_start = 1,",
-            "     .unicode_list = NULL, .glyph_id_ofs_list = NULL, .list_length = 0,",
-            "     .type = LV_FONT_FMT_TXT_CMAP_FORMAT0_TINY},",
-            "};",
-            f"static const lv_font_fmt_txt_dsc_t {name}_dsc = {{",
-            f"    .glyph_bitmap = {name}_bitmap, .glyph_dsc = {name}_glyphs, .cmaps = {name}_cmaps,",
-            "    .kern_dsc = NULL, .kern_scale = 0, .cmap_num = 1, .bpp = 4, .kern_classes = 0, .bitmap_format = 0,",
-            "};",
-            f"const lv_font_t {name} = {{",
-            "    .get_glyph_dsc = lv_font_get_glyph_dsc_fmt_txt,",
-            "    .get_glyph_bitmap = lv_font_get_bitmap_fmt_txt,",
-            f"    .line_height = {ascent + descent},",
-            f"    .base_line = {descent},",
-            "    .subpx = LV_FONT_SUBPX_NONE,",
-            "    .underline_position = -2,",
-            "    .underline_thickness = 1,",
-            f"    .dsc = &{name}_dsc,",
-            "};",
-            "",
-        ]
+        glyphs = [glyph(font, size, chr(code), ascent + size // 2) for code in range(FIRST, LAST + 1)]
+        parts += font_c(glyphs, 4, [(f"pet_menu_font_{size}", ascent + descent, descent)])
+    return "\n".join(parts)
+
+
+def font_c(glyphs, bpp: int, fonts) -> list[str]:
+    """LVGL fonts of the ASCII glyphs FIRST to LAST, rendered at `bpp` bits:
+    one for each (name, line height, base line) of `fonts`, sharing them."""
+    name = fonts[0][0]
+    bitmap = bytearray()
+    descriptors = ["    {.bitmap_index = 0, .adv_w = 0, .box_w = 0, .box_h = 0, .ofs_x = 0, .ofs_y = 0},"]
+    for code, (levels, advance, width, height, ofs_x, ofs_y) in zip(range(FIRST, LAST + 1), glyphs):
+        descriptors.append(
+            f"    {{.bitmap_index = {len(bitmap)}, .adv_w = {advance * 16}, .box_w = {width}, "
+            f".box_h = {height}, .ofs_x = {ofs_x}, .ofs_y = {ofs_y}}}, /* {chr(code)!r} */")
+        bitmap += pack(levels, bpp)
+    return [
+        f"static LV_ATTRIBUTE_LARGE_CONST const uint8_t {name}_bitmap[] = {{",
+        c_bytes(bitmap),
+        "};",
+        f"static const lv_font_fmt_txt_glyph_dsc_t {name}_glyphs[] = {{",
+        *descriptors,
+        "};",
+        f"static const lv_font_fmt_txt_cmap_t {name}_cmaps[] = {{",
+        f"    {{.range_start = {FIRST}, .range_length = {LAST - FIRST + 1}, .glyph_id_start = 1,",
+        "     .unicode_list = NULL, .glyph_id_ofs_list = NULL, .list_length = 0,",
+        "     .type = LV_FONT_FMT_TXT_CMAP_FORMAT0_TINY},",
+        "};",
+        f"static const lv_font_fmt_txt_dsc_t {name}_dsc = {{",
+        f"    .glyph_bitmap = {name}_bitmap, .glyph_dsc = {name}_glyphs, .cmaps = {name}_cmaps,",
+        f"    .kern_dsc = NULL, .kern_scale = 0, .cmap_num = 1, .bpp = {bpp}, .kern_classes = 0, .bitmap_format = 0,",
+        "};",
+    ] + [line for font, line_height, base_line in fonts for line in (
+        f"const lv_font_t {font} = {{",
+        "    .get_glyph_dsc = lv_font_get_glyph_dsc_fmt_txt,",
+        "    .get_glyph_bitmap = lv_font_get_bitmap_fmt_txt,",
+        f"    .line_height = {line_height},",
+        f"    .base_line = {base_line},",
+        "    .subpx = LV_FONT_SUBPX_NONE,",
+        "    .underline_position = -2,",
+        "    .underline_thickness = 1,",
+        f"    .dsc = &{name}_dsc,",
+        "};",
+    )] + [""]
+
+
+def woodland_font_source() -> str:
+    """WOODLAND's faces: Jersey 10, 15 and 20 for text and Jacquard 12 for titles."""
+    sources = [face for face, _, _ in WOODLAND_FACES] + [BLACKLETTER]
+    notices = [path.read_text().splitlines()[0] for path in (JERSEY / "OFL.txt", BLACKLETTER.parent / "OFL.txt")]
+    parts = [
+        "/* SPDX-License-Identifier: OFL-1.1",
+        " *",
+        *[f" * {notice}" for notice in notices],
+        " *",
+        " * Generated by firmware/tools/make_menu_assets.py: the ASCII glyphs of",
+        *[f" * {path.name} (sha256 {hashlib.sha256(path.read_bytes()).hexdigest()[:16]}...)," for path in sources],
+        " * each at the size where one of its pixels is one of the screen's, 1 bit",
+        " * per pixel. Modified Versions of the Font Software, licensed under the SIL",
+        " * Open Font License 1.1 (firmware/third_party/jersey/OFL.txt and",
+        " * firmware/third_party/jacquard-12/OFL.txt), not under the firmware's license.",
+        " * The menu's ABOUT page shows these notices and the license. Do not edit. */",
+        '#include "pet_menu_assets.h"',
+        "",
+    ]
+    for face, size, stands_for in WOODLAND_FACES:
+        font = ImageFont.truetype(str(face), size * PIXEL_SUPERSAMPLE)
+        glyphs = [pixel_glyph(font, math.ceil(size), chr(code)) for code in range(FIRST, LAST + 1)]
+        metrics = [ImageFont.truetype(str(FONT), menu).getmetrics() for menu in stands_for]
+        parts += font_c(glyphs, 1, [(f"pet_woodland_font_{menu}", ascent + descent, descent)
+                                    for menu, (ascent, descent) in zip(stands_for, metrics)])
+    font = ImageFont.truetype(str(BLACKLETTER), BLACKLETTER_SIZE * PIXEL_SUPERSAMPLE)
+    ascent, descent = ImageFont.truetype(str(BLACKLETTER), BLACKLETTER_SIZE).getmetrics()
+    glyphs = [pixel_glyph(font, BLACKLETTER_SIZE, chr(code)) for code in range(FIRST, LAST + 1)]
+    parts += font_c(glyphs, 1, [("pet_woodland_title", ascent + descent, descent)])
     return "\n".join(parts)
 
 
@@ -162,6 +246,10 @@ class Pen:
         ry = rx if ry is None else ry
         self.draw.ellipse(self.scale(cx - rx, cy - ry, cx + rx, cy + ry), fill=255)
 
+    def hole(self, cx, cy, rx, ry=None):
+        ry = rx if ry is None else ry
+        self.draw.ellipse(self.scale(cx - rx, cy - ry, cx + rx, cy + ry), fill=0)
+
     def line(self, points, width):
         scaled = [tuple(self.scale(x, y)) for x, y in points]
         self.draw.line(scaled, fill=255, width=round(width * SUPERSAMPLE), joint="curve")
@@ -177,6 +265,289 @@ class Pen:
 
     def mask(self):
         return self.image.resize(self.size, Image.Resampling.BOX)
+
+
+# The story screens' pixel art: 12x12, one bit per pixel ('#' is ink), drawn
+# here for this firmware. The menu shows each two or three times larger,
+# without smoothing.
+PIXEL_ICONS = {
+    "flame": (".....#......", ".....##.....", "....###.....", "....####..#.", "...#####.##.", "..#########.",
+              "..####.####.", ".####...###.", ".###....####", ".###..#..###", "..##.###.##.", "...#######.."),
+    "shield": ("############", "#....##....#", "#....##....#", "#.########.#", "#.########.#", "#....##....#",
+               ".#...##...#.", ".#...##...#.", "..#..##..#..", "...#.##.#...", "....####....", ".....##....."),
+    "star": (".....##.....", ".....##.....", "....####....", "....####....", "############", ".##########.",
+             "..########..", "...######...", "...######...", "..###..###..", "..##....##..", ".##......##."),
+    "heart": ("............", ".###....###.", "#####..#####", "############", "############", "############",
+              ".##########.", "..########..", "...######...", "....####....", ".....##.....", "............"),
+    "bolt": (".......####.", "......####..", ".....####...", "....####....", "...#######..", "..#######...",
+             ".....###....", "....###.....", "...###......", "..###.......", "..##........", ".#.........."),
+    "eye": ("............", "............", "....####....", "..##....##..", ".#...##...#.", "#...####...#",
+            "#...####...#", ".#...##...#.", "..##....##..", "....####....", "............", "............"),
+    "leaf": ("..........##", ".......#####", ".....######.", "....####.##.", "...####.###.", "..####.####.",
+             "..###.####..", "..##.####...", "..#.####....", "...####.....", "..#.........", ".#.........."),
+    "moon": ("....####....", "..####......", ".####.......", ".###........", "####........", "####........",
+             "####........", "####........", ".###........", ".####.......", "..####......", "....####...."),
+    "key": ("............", "............", "............", ".####.......", "##..##......", "#....#######",
+            "#....#######", "##..##..#.##", ".####...#.##", "............", "............", "............"),
+    # The rest of a story game's blessing icons; its storm is the bolt.
+    "feather": ("..........##", "........####", ".......####.", "......####.#", ".....####.#.", "....####.#..",
+                "...####.#...", "...###.#....", "..##..#.....", "..#.##......", ".#..........", "#..........."),
+    "potion": ("....####....", ".....##.....", ".....##.....", "....#..#....", "...#....#...", "..#......#..",
+               ".#........#.", ".##########.", ".##########.", ".##########.", "..########..", "...######..."),
+    "sword": ("..........##", ".........###", "........###.", ".......###..", "......###...", ".....###....",
+              ".#..###.....", "..####......", "...##.......", "..####......", ".##..#......", "##.........."),
+}
+
+
+def blessing_icons() -> dict[str, tuple[str, ...]]:
+    """Public pixel definitions for the additional story-blessings-v2 icons."""
+    return {'blessing_mask': ('............',
+                       '............',
+                       '#..........#',
+                       '##........##',
+                       '############',
+                       '##...##...##',
+                       '##...##...##',
+                       '############',
+                       '.####..####.',
+                       '..##....##..',
+                       '............',
+                       '............'),
+     'blessing_hand': ('....#.#.....',
+                       '..#.#.#.#...',
+                       '..#.#.#.#...',
+                       '..#.#.#.#...',
+                       '..#.#.#.#.#.',
+                       '..#######.#.',
+                       '..#########.',
+                       '..########..',
+                       '...#######..',
+                       '...######...',
+                       '....#####...',
+                       '....#####...'),
+     'blessing_bubble': ('............',
+                         '.##########.',
+                         '############',
+                         '##..#..#..##',
+                         '##..#..#..##',
+                         '############',
+                         '############',
+                         '.##########.',
+                         '..###.......',
+                         '..##........',
+                         '..#.........',
+                         '............'),
+     'blessing_skull': ('...######...',
+                        '..########..',
+                        '.##########.',
+                        '.##########.',
+                        '.#..####..#.',
+                        '.#..####..#.',
+                        '.##########.',
+                        '..###..###..',
+                        '...######...',
+                        '...#.##.#...',
+                        '...######...',
+                        '............'),
+     'blessing_crown': ('............',
+                        '.....##.....',
+                        '#....##....#',
+                        '##..####..##',
+                        '###.####.###',
+                        '############',
+                        '############',
+                        '##.##..##.##',
+                        '############',
+                        '############',
+                        '............',
+                        '............'),
+     'blessing_coin': ('...######...',
+                       '.##########.',
+                       '.###....###.',
+                       '###..##..###',
+                       '##..###...##',
+                       '##...##...##',
+                       '##...##...##',
+                       '##...##...##',
+                       '###.####.###',
+                       '.###....###.',
+                       '.##########.',
+                       '...######...'),
+     'blessing_ring': ('....####....',
+                       '.....##.....',
+                       '...######...',
+                       '..##....##..',
+                       '.##......##.',
+                       '.#........#.',
+                       '.#........#.',
+                       '.##......##.',
+                       '..##....##..',
+                       '...######...',
+                       '............',
+                       '............'),
+     'blessing_scroll': ('.##########.',
+                         '##........##',
+                         '.##########.',
+                         '..#......#..',
+                         '..#.####.#..',
+                         '..#......#..',
+                         '..#.####.#..',
+                         '..#......#..',
+                         '.##########.',
+                         '##........##',
+                         '.##########.',
+                         '............'),
+     'blessing_bell': ('.....##.....',
+                       '....####....',
+                       '...######...',
+                       '..########..',
+                       '..########..',
+                       '..########..',
+                       '..########..',
+                       '.##########.',
+                       '############',
+                       '............',
+                       '.....##.....',
+                       '............'),
+     'blessing_hourglass': ('############',
+                            '.##########.',
+                            '..########..',
+                            '...######...',
+                            '....####....',
+                            '.....##.....',
+                            '.....##.....',
+                            '....#..#....',
+                            '...#.##.#...',
+                            '..#.####.#..',
+                            '.##########.',
+                            '############'),
+     'blessing_sun': ('.....##.....',
+                      '.#...##...#.',
+                      '..#......#..',
+                      '....####....',
+                      '...######...',
+                      '##.######.##',
+                      '##.######.##',
+                      '...######...',
+                      '....####....',
+                      '..#......#..',
+                      '.#...##...#.',
+                      '.....##.....'),
+     'blessing_cloud': ('............',
+                        '............',
+                        '.....###....',
+                        '....#####...',
+                        '.##.######..',
+                        '############',
+                        '############',
+                        '############',
+                        '.##########.',
+                        '............',
+                        '............',
+                        '............'),
+     'blessing_drop': ('.....##.....',
+                       '.....##.....',
+                       '....####....',
+                       '....####....',
+                       '...######...',
+                       '..########..',
+                       '..########..',
+                       '.##.#######.',
+                       '.##.#######.',
+                       '.###.######.',
+                       '..########..',
+                       '...######...'),
+     'blessing_pick': ('...######...',
+                       '.###....###.',
+                       '##...##...##',
+                       '#....##....#',
+                       '.....##.....',
+                       '.....##.....',
+                       '.....##.....',
+                       '.....##.....',
+                       '.....##.....',
+                       '.....##.....',
+                       '.....##.....',
+                       '.....##.....'),
+     'blessing_bow': ('.##.........',
+                      '.#.#........',
+                      '.#..#.......',
+                      '.#...#....#.',
+                      '.#....#...##',
+                      '############',
+                      '.#....#...##',
+                      '.#...#....#.',
+                      '.#..#.......',
+                      '.#.#........',
+                      '.##.........',
+                      '............'),
+     'blessing_lantern': ('....####....',
+                          '....#..#....',
+                          '...######...',
+                          '..#......#..',
+                          '..#.####.#..',
+                          '..#.####.#..',
+                          '..#.####.#..',
+                          '..#.####.#..',
+                          '..#......#..',
+                          '...######...',
+                          '....####....',
+                          '............'),
+     'blessing_gem': ('............',
+                      '............',
+                      '..########..',
+                      '.##.####.##.',
+                      '############',
+                      '.##########.',
+                      '..########..',
+                      '...######...',
+                      '....####....',
+                      '.....##.....',
+                      '............',
+                      '............'),
+     'blessing_ghost': ('...######...',
+                        '..########..',
+                        '.##########.',
+                        '.##..##..##.',
+                        '.##..##..##.',
+                        '.##########.',
+                        '.##########.',
+                        '.##########.',
+                        '.##########.',
+                        '.##########.',
+                        '.##########.',
+                        '.#..##..#..#'),
+     'blessing_paw': ('............',
+                      '...##..##...',
+                      '...##..##...',
+                      '............',
+                      '##........##',
+                      '##..####..##',
+                      '...######...',
+                      '..########..',
+                      '..########..',
+                      '..########..',
+                      '...##..##...',
+                      '............'),
+     'blessing_gear': ('.....##.....',
+                       '..#.####.#..',
+                       '.##########.',
+                       '..###..###..',
+                       '.###....###.',
+                       '####....####',
+                       '####....####',
+                       '.###....###.',
+                       '..###..###..',
+                       '.##########.',
+                       '..#.####.#..',
+                       '.....##.....')}
+
+
+def pixel_icon(rows) -> Image.Image:
+    """A 1-bit drawing as an alpha mask: ink is fully opaque."""
+    mask = Image.new("L", (len(rows[0]), len(rows)), 0)
+    mask.putdata([255 if cell == "#" else 0 for row in rows for cell in row])
+    return mask
 
 
 def arrow_head(pen: Pen, cx, cy, radius, angle):
@@ -235,7 +606,109 @@ def icons():
     pen = Pen(22, 10)
     pen.line([(3, 8), (11, 2), (19, 8)], 2)
     drawn["chevron_up"] = pen
-    return {name: pen.mask() for name, pen in drawn.items()}
+    # The story screens' handles: chevron_up turned to the swipe that closes each.
+    pen = Pen(22, 10)
+    pen.line([(3, 2), (11, 8), (19, 2)], 2)
+    drawn["handle_down"] = pen
+    pen = Pen(10, 22)
+    pen.line([(8, 3), (2, 11), (8, 19)], 2)
+    drawn["handle_left"] = pen
+    pen = Pen(10, 22)
+    pen.line([(2, 3), (8, 11), (2, 19)], 2)
+    drawn["handle_right"] = pen
+    pen = Pen(24, 22)  # STYLE: a painter's palette, its thumb hole and three wells
+    pen.disc(12, 11, 11, 9.5)
+    pen.hole(3.5, 17, 3.6)
+    pen.hole(15.5, 15, 2.6)
+    for x, y in ((6.5, 8), (11.5, 5.5), (17, 7.5)):
+        pen.hole(x, y, 2.1)
+    drawn["palette"] = pen
+    masks = {name: pen.mask() for name, pen in drawn.items()}
+    masks.update({name: pixel_icon(rows) for name, rows in {**PIXEL_ICONS, **blessing_icons()}.items()})
+    return masks
+
+
+# WOODLAND's dark planks: a tile of two boards 16 px high, each with its grain,
+# a light lip under the seam above it, a dark seam at its foot and one butt
+# joint, drawn here pixel by pixel. Cards are panelled with it.
+WOOD_SIZE = (128, 32)
+WOOD_BOARD = 16
+WOOD_BASE = (74, 46, 23)
+WOOD_GRAIN = ((62, 38, 19), (84, 53, 27))  # darker and lighter streaks
+WOOD_SEAM = (30, 18, 9)
+WOOD_LIP = (96, 62, 31)
+WOOD_JOINTS = (88, 30)  # where each board's end meets the next
+WOOD_KNOTS = ((20, 5), (70, 22))
+KNOT = ((0, 0), (1, 0), (2, 0), (-1, 1), (0, 1), (1, 1), (2, 1), (3, 1), (0, 2), (1, 2), (2, 2))
+
+
+def lcg(seed: int):
+    """A fixed sequence of numbers, the same on every machine."""
+    state = seed
+    while True:
+        state = (state * 1103515245 + 12345) & 0x7FFFFFFF
+        yield state >> 8
+
+
+def wood_planks() -> Image.Image:
+    width, height = WOOD_SIZE
+    image = Image.new("RGB", WOOD_SIZE, WOOD_BASE)
+    pixels = image.load()
+    numbers = lcg(7)
+    for board, joint in enumerate(WOOD_JOINTS):
+        top = board * WOOD_BOARD
+        for _ in range(16):  # streaks that wrap around the tile, each stepping down once
+            y = top + 2 + next(numbers) % (WOOD_BOARD - 5)
+            x = next(numbers) % width
+            length = 10 + next(numbers) % 44
+            color = WOOD_GRAIN[0] if next(numbers) % 3 else WOOD_GRAIN[1]
+            bend = next(numbers) % length
+            for i in range(length):
+                pixels[(x + i) % width, y + (i > bend)] = color
+        for x in range(width):
+            pixels[x, top] = WOOD_LIP
+            pixels[x, top + WOOD_BOARD - 1] = WOOD_SEAM
+        for y in range(top, top + WOOD_BOARD - 1):
+            pixels[joint, y] = WOOD_SEAM
+            pixels[joint + 1, y] = WOOD_LIP
+    for x, y in WOOD_KNOTS:
+        for dx, dy in KNOT:
+            pixels[x + dx, y + dy] = WOOD_GRAIN[0]
+        pixels[x + 1, y + 1] = WOOD_SEAM
+    return image
+
+
+# A signboard's rope, twisted: a tile 2 px wide that repeats downward.
+ROPE = ("LS", "LL", "SL", "SS")
+ROPE_COLORS = {"L": (214, 178, 112), "S": (128, 92, 46)}
+
+
+def wood_rope() -> Image.Image:
+    image = Image.new("RGB", (len(ROPE[0]), len(ROPE)))
+    image.putdata([ROPE_COLORS[cell] for row in ROPE for cell in row])
+    return image
+
+
+def rgb565_image(name: str, image: Image.Image) -> list[str]:
+    """An RGB image as an LVGL RGB565 image, drawn as it is."""
+    width, height = image.size
+    rgb = image.tobytes()
+    data = bytearray()
+    for i in range(0, len(rgb), 3):
+        red, green, blue = rgb[i:i + 3]
+        data += ((red >> 3) << 11 | (green >> 2) << 5 | blue >> 3).to_bytes(2, "little")
+    return [
+        f"static const uint8_t {name}_map[] = {{",
+        c_bytes(data),
+        "};",
+        f"const lv_image_dsc_t {name} = {{",
+        "    .header = {.magic = LV_IMAGE_HEADER_MAGIC, .cf = LV_COLOR_FORMAT_RGB565,",
+        f"               .w = {width}, .h = {height}, .stride = {width * 2}}},",
+        f"    .data_size = sizeof({name}_map),",
+        f"    .data = {name}_map,",
+        "};",
+        "",
+    ]
 
 
 def logo(path: Path) -> Image.Image:
@@ -288,6 +761,9 @@ def icon_source(logo_path: Path | None = None) -> str:
     ]
     for name, mask in icons().items():
         parts += mask_image(f"pet_icon_{name}", mask)
+    parts.append("/* WOODLAND's plank tile, which its cards are panelled with, and its rope. */")
+    parts += rgb565_image("pet_wood_planks", wood_planks())
+    parts += rgb565_image("pet_wood_rope", wood_rope())
     if logo_path is None:
         parts.append("/* The boot page's mark, a plain ring: the coverage mask the page tints lime. */")
         parts += mask_image("pet_boot_mark", ring())
@@ -310,8 +786,15 @@ def header_source() -> str:
         *[f"extern const lv_font_t pet_menu_font_{size};" for size in SIZES],
         "/* The fonts' copyright notice and SIL OFL 1.1 text, verbatim. */",
         "extern const char pet_menu_font_license[];",
+        "/* WOODLAND's faces (pet_menu_woodland_font.c, SIL OFL 1.1): Jersey at each of",
+        " * the menu's sizes, and Jacquard 12 for titles. */",
+        *[f"extern const lv_font_t pet_woodland_font_{size};" for size in SIZES],
+        "extern const lv_font_t pet_woodland_title;",
         "",
         *[f"extern const lv_image_dsc_t pet_icon_{name};" for name in icons()],
+        "/* WOODLAND's plank and rope tiles, RGB565. */",
+        "extern const lv_image_dsc_t pet_wood_planks;",
+        "extern const lv_image_dsc_t pet_wood_rope;",
         "/* The boot page's mark, an 8-bit mask the page tints. */",
         "extern const lv_image_dsc_t pet_boot_mark;",
         "",
@@ -326,9 +809,10 @@ def main() -> None:
     arguments = parser.parse_args()
     arguments.output.mkdir(parents=True, exist_ok=True)
     (arguments.output / "pet_menu_font.c").write_text(font_source(FONT))
+    (arguments.output / "pet_menu_woodland_font.c").write_text(woodland_font_source())
     (arguments.output / "pet_menu_icons.c").write_text(icon_source(arguments.logo))
     (arguments.output / "pet_menu_assets.h").write_text(header_source())
-    for name in ("pet_menu_font.c", "pet_menu_icons.c", "pet_menu_assets.h"):
+    for name in ("pet_menu_font.c", "pet_menu_woodland_font.c", "pet_menu_icons.c", "pet_menu_assets.h"):
         print(arguments.output / name)
 
 

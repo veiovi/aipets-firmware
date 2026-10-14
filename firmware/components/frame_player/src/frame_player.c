@@ -1,4 +1,5 @@
 #include "frame_internal.h"
+#include <stddef.h>
 
 #if defined(__wasm__)
 #define FP_EXPORT(name) __attribute__((export_name(#name)))
@@ -18,6 +19,52 @@ static int fp_range_ok(uint32_t total, uint32_t offset, uint32_t length)
     return offset >= FP_HEADER_BYTES && offset <= total && length <= total - offset;
 }
 
+static const uint8_t *fp_source_span(const fp_pack_source_t *source, uint32_t offset, uint32_t length)
+{
+    if (!source || offset > source->bytes || length > source->bytes - offset) return 0;
+    for (uint32_t i = 0; i < 2u; i++)
+    {
+        const fp_pack_span_t *span = &source->spans[i];
+        if (span->bytes && offset >= span->offset && offset - span->offset <= span->length &&
+            length <= span->length - (offset - span->offset))
+        {
+            return span->bytes + (offset - span->offset);
+        }
+    }
+    return 0;
+}
+
+const uint8_t *fp_source_at(const fp_pack_source_t *source, uint32_t offset)
+{
+    return fp_source_span(source, offset, 1u);
+}
+
+const uint8_t *fp_player_at(const fp_player_t *player, uint32_t offset)
+{
+    return fp_source_at(&player->source, offset);
+}
+
+static int fp_metadata_ok(const fp_pack_source_t *source, uint32_t offset, uint32_t length)
+{
+    return fp_range_ok(source->bytes, offset, length) && fp_source_span(source, offset, length) != 0;
+}
+
+static const uint8_t *fp_source_resource(const fp_pack_source_t *source, uint16_t frame, uint32_t offset,
+                                         uint32_t length)
+{
+    if (!fp_range_ok(source->bytes, offset, length)) return 0;
+    return source->frame ? source->frame(source->context, frame, offset, length)
+                         : fp_source_span(source, offset, length);
+}
+
+const uint8_t *fp_player_resource(const fp_player_t *player, uint16_t frame)
+{
+    if (frame >= player->view.frame_count) return 0;
+    const uint8_t *entry =
+        fp_player_at(player, player->view.frame_dir_offset + (uint32_t)frame * FP_FRAME_DIR_ENTRY_BYTES);
+    return fp_source_resource(&player->source, frame, fp_rd32(entry), fp_rd32(entry + 4u));
+}
+
 static uint32_t fp_crc32_step(uint32_t crc, uint8_t byte)
 {
     crc ^= byte;
@@ -30,6 +77,28 @@ static uint32_t fp_crc32_bytes(const uint8_t *bytes, uint32_t length)
     uint32_t crc = 0xffffffffu;
     for (uint32_t i = 0; i < length; i++) crc = fp_crc32_step(crc, bytes[i]);
     return crc ^ 0xffffffffu;
+}
+
+static int fp_payload_crc_matches(const fp_pack_source_t *source, uint32_t expected, uint8_t *scratch,
+                                  uint32_t scratch_bytes)
+{
+    uint32_t length = source->bytes - FP_HEADER_BYTES;
+    if (!source->read)
+    {
+        const uint8_t *bytes = fp_source_span(source, FP_HEADER_BYTES, length);
+        return bytes && fp_crc32_bytes(bytes, length) == expected;
+    }
+    if (!scratch || !scratch_bytes) return 0;
+    uint32_t crc = 0xffffffffu;
+    for (uint32_t offset = FP_HEADER_BYTES; offset < source->bytes;)
+    {
+        uint32_t count = source->bytes - offset;
+        if (count > scratch_bytes) count = scratch_bytes;
+        if (!source->read(source->context, offset, scratch, count)) return 0;
+        for (uint32_t i = 0; i < count; i++) crc = fp_crc32_step(crc, scratch[i]);
+        offset += count;
+    }
+    return (crc ^ 0xffffffffu) == expected;
 }
 
 static uint32_t fp_crc32_header(const uint8_t *bytes)
@@ -49,26 +118,26 @@ static void fp_zero_bytes(void *target, uint32_t length)
 }
 
 /* Called only after the frame and clip directories have been validated. */
-static int fp_full_frame(const uint8_t *pack, uint32_t frame_dir, uint16_t frame)
+static int fp_full_frame(const fp_pack_source_t *source, uint32_t frame_dir, uint16_t frame)
 {
-    uint8_t codec = pack[frame_dir + (uint32_t)frame * FP_FRAME_DIR_ENTRY_BYTES + 8u];
+    uint8_t codec = fp_source_at(source, frame_dir + (uint32_t)frame * FP_FRAME_DIR_ENTRY_BYTES + 8u)[0];
     return fp_full_codec(codec);
 }
 
-static int fp_full_clip(const uint8_t *pack, uint32_t frame_dir, uint32_t clip_dir, uint16_t clip)
+static int fp_full_clip(const fp_pack_source_t *source, uint32_t frame_dir, uint32_t clip_dir, uint16_t clip)
 {
-    const uint8_t *entry = pack + clip_dir + (uint32_t)clip * FP_CLIP_DIR_ENTRY_BYTES;
+    const uint8_t *entry = fp_source_at(source, clip_dir + (uint32_t)clip * FP_CLIP_DIR_ENTRY_BYTES);
     uint32_t steps = fp_rd32(entry + 8u), count = fp_rd16(entry + 12u);
     for (uint32_t i = 0; i < count; i++)
-        if (!fp_full_frame(pack, frame_dir, fp_rd16(pack + steps + i * FP_CLIP_STEP_BYTES))) return 0;
+        if (!fp_full_frame(source, frame_dir, fp_rd16(fp_source_at(source, steps + i * FP_CLIP_STEP_BYTES)))) return 0;
     return 1;
 }
 
-static uint32_t fp_clip_ticks(const uint8_t *pack, uint32_t clip_dir, uint32_t clip)
+static uint32_t fp_clip_ticks(const fp_pack_source_t *source, uint32_t clip_dir, uint32_t clip)
 {
-    const uint8_t *entry = pack + clip_dir + clip * FP_CLIP_DIR_ENTRY_BYTES;
+    const uint8_t *entry = fp_source_at(source, clip_dir + clip * FP_CLIP_DIR_ENTRY_BYTES);
     uint32_t steps = fp_rd32(entry + 8u), count = fp_rd16(entry + 12u), ticks = 0u;
-    for (uint32_t i = 0; i < count; i++) ticks += fp_rd16(pack + steps + i * FP_CLIP_STEP_BYTES + 2u);
+    for (uint32_t i = 0; i < count; i++) ticks += fp_rd16(fp_source_at(source, steps + i * FP_CLIP_STEP_BYTES + 2u));
     return ticks;
 }
 
@@ -101,31 +170,34 @@ uint32_t fp_validation_workspace_size(void) { return ((uint32_t)sizeof(fp_codec_
  * frames are not inflated. Rendering checks each compressed frame as it
  * decodes it into the fixed-size workspace, so bytes that would fail the full
  * check stay memory-safe; they can only render wrong. */
-static fp_error_t fp_check_pack(const void *pack_bytes_in, uint32_t pack_bytes,
-    fp_pack_info_t *info, fp_codec_workspace_t *work, int prove)
+static fp_error_t fp_check_source(const fp_pack_source_t *source, fp_pack_info_t *info, fp_codec_workspace_t *work,
+                                  int prove, uint8_t *scratch, uint32_t scratch_bytes)
 {
-    const uint8_t *pack = (const uint8_t *)pack_bytes_in;
-    if (pack == 0) return FP_ERR_ARGUMENT;
+    if (!source || !source->spans[0].bytes) return FP_ERR_ARGUMENT;
+    uint32_t pack_bytes = source->bytes;
     if (pack_bytes < FP_HEADER_BYTES) return FP_ERR_TRUNCATED;
+    const uint8_t *pack = fp_source_span(source, 0, FP_HEADER_BYTES);
+    if (!pack) return FP_ERR_ARGUMENT;
     for (uint32_t i = 0; i < 8u; i++) {
-        if (pack[i] != fp_magic[i]) return FP_ERR_BAD_MAGIC;
+        if (fp_source_at(source, i)[0] != fp_magic[i]) return FP_ERR_BAD_MAGIC;
     }
-    uint16_t format_version = fp_rd16(pack + FP_HDR_VERSION);
+    uint16_t format_version = fp_rd16(fp_source_at(source, FP_HDR_VERSION));
     if (format_version != FP_PACK_VERSION && format_version != FP_PACK_VERSION_240) return FP_ERR_UNSUPPORTED_VERSION;
     uint32_t canvas = format_version == FP_PACK_VERSION_240 ? 240u : 120u;
-    if (fp_rd16(pack + FP_HDR_HEADER_BYTES) != FP_HEADER_BYTES) return FP_ERR_BAD_HEADER;
-    if (fp_rd16(pack + FP_HDR_CANVAS_W) != canvas) return FP_ERR_BAD_HEADER;
-    if (fp_rd16(pack + FP_HDR_CANVAS_H) != canvas) return FP_ERR_BAD_HEADER;
-    uint32_t file_length = fp_rd32(pack + FP_HDR_FILE_LENGTH);
+    if (fp_rd16(fp_source_at(source, FP_HDR_HEADER_BYTES)) != FP_HEADER_BYTES) return FP_ERR_BAD_HEADER;
+    if (fp_rd16(fp_source_at(source, FP_HDR_CANVAS_W)) != canvas) return FP_ERR_BAD_HEADER;
+    if (fp_rd16(fp_source_at(source, FP_HDR_CANVAS_H)) != canvas) return FP_ERR_BAD_HEADER;
+    uint32_t file_length = fp_rd32(fp_source_at(source, FP_HDR_FILE_LENGTH));
     if (file_length != pack_bytes) return FP_ERR_TRUNCATED;
     if (file_length > (format_version == FP_PACK_VERSION_240 ? FP_PACK_MAX_BYTES_240 : FP_PACK_MAX_BYTES)) return FP_ERR_BAD_HEADER;
-    if (fp_rd16(pack + FP_HDR_TICK_MS) != FP_TICK_MS) return FP_ERR_BAD_HEADER;
-    if (fp_crc32_header(pack) != fp_rd32(pack + FP_HDR_HEADER_CRC32)) return FP_ERR_BAD_CHECKSUM;
-    uint32_t payload_crc = fp_rd32(pack + FP_HDR_PAYLOAD_CRC32);
-    if (prove && fp_crc32_bytes(pack + FP_HEADER_BYTES, file_length - FP_HEADER_BYTES) != payload_crc) {
+    if (fp_rd16(fp_source_at(source, FP_HDR_TICK_MS)) != FP_TICK_MS) return FP_ERR_BAD_HEADER;
+    if (fp_crc32_header(pack) != fp_rd32(fp_source_at(source, FP_HDR_HEADER_CRC32))) return FP_ERR_BAD_CHECKSUM;
+    uint32_t payload_crc = fp_rd32(fp_source_at(source, FP_HDR_PAYLOAD_CRC32));
+    if (prove && !fp_payload_crc_matches(source, payload_crc, scratch, scratch_bytes))
+    {
         return FP_ERR_BAD_CHECKSUM;
     }
-    uint16_t features = fp_rd16(pack + FP_HDR_FLAGS);
+    uint16_t features = fp_rd16(fp_source_at(source, FP_HDR_FLAGS));
     if ((features & ~(FP_FLAG_APPROVED | FP_FEATURE_OVERLAY_ACTIONS | FP_FEATURE_FACIAL_REGIONS | FP_FEATURE_ACTION_LIFECYCLE | FP_FEATURE_PERFORMANCE_ACTIONS | FP_FEATURE_SPEAKING_POSES | FP_FEATURE_MOVE)) != 0u) return FP_ERR_BAD_HEADER;
     /* A move pack is a 240px pack of at most 300,000 bytes whose only other
      * feature is its optional effect (binary.ts parseFramePack). */
@@ -133,26 +205,26 @@ static fp_error_t fp_check_pack(const void *pack_bytes_in, uint32_t pack_bytes,
     if (move && (canvas != 240u || file_length > FP_MOVE_MAX_BYTES ||
                  (features & ~(FP_FLAG_APPROVED | FP_FEATURE_MOVE | FP_FEATURE_OVERLAY_ACTIONS)) != 0u)) return FP_ERR_BAD_MOVE;
     for (uint32_t i = FP_HDR_SPEAKING_LENGTH + 2u; i < FP_HEADER_BYTES; i++) {
-        if (pack[i] != 0u) return FP_ERR_BAD_HEADER;
+        if (fp_source_at(source, i)[0] != 0u) return FP_ERR_BAD_HEADER;
     }
 
-    uint32_t palette_offset = fp_rd32(pack + FP_HDR_PALETTE_OFFSET);
-    uint32_t palette_count = fp_rd16(pack + FP_HDR_PALETTE_COUNT);
+    uint32_t palette_offset = fp_rd32(fp_source_at(source, FP_HDR_PALETTE_OFFSET));
+    uint32_t palette_count = fp_rd16(fp_source_at(source, FP_HDR_PALETTE_COUNT));
     if (palette_count < 1u || palette_count > FP_MAX_PALETTE) return FP_ERR_BAD_HEADER;
-    if (!fp_range_ok(file_length, palette_offset, palette_count * 2u)) return FP_ERR_BAD_BOUNDS;
-    uint8_t bg_index = pack[FP_HDR_BG_PALETTE_INDEX];
+    if (!fp_metadata_ok(source, palette_offset, palette_count * 2u)) return FP_ERR_BAD_BOUNDS;
+    uint8_t bg_index = fp_source_at(source, FP_HDR_BG_PALETTE_INDEX)[0];
     if (bg_index >= palette_count) return FP_ERR_BAD_HEADER;
-    uint8_t gender = pack[FP_HDR_GENDER];
+    uint8_t gender = fp_source_at(source, FP_HDR_GENDER)[0];
     if (gender > 3u) return FP_ERR_BAD_HEADER;
 
-    uint32_t frame_count = fp_rd16(pack + FP_HDR_FRAME_COUNT);
+    uint32_t frame_count = fp_rd16(fp_source_at(source, FP_HDR_FRAME_COUNT));
     if (frame_count < 1u || frame_count > (format_version == FP_PACK_VERSION_240 ? FP_MAX_FRAMES : 640u)) return FP_ERR_BAD_HEADER;
     if (move && frame_count > FP_MOVE_MAX_FRAMES) return FP_ERR_BAD_MOVE;
-    uint32_t frame_dir = fp_rd32(pack + FP_HDR_FRAME_DIR_OFFSET);
-    if (!fp_range_ok(file_length, frame_dir, frame_count * FP_FRAME_DIR_ENTRY_BYTES)) return FP_ERR_BAD_BOUNDS;
+    uint32_t frame_dir = fp_rd32(fp_source_at(source, FP_HDR_FRAME_DIR_OFFSET));
+    if (!fp_metadata_ok(source, frame_dir, frame_count * FP_FRAME_DIR_ENTRY_BYTES)) return FP_ERR_BAD_BOUNDS;
     uint8_t codecs = 0;
     for (uint32_t i = 0; i < frame_count; i++) {
-        const uint8_t *entry = pack + frame_dir + i * FP_FRAME_DIR_ENTRY_BYTES;
+        const uint8_t *entry = fp_source_at(source, frame_dir + i * FP_FRAME_DIR_ENTRY_BYTES);
         uint32_t offset = fp_rd32(entry);
         uint32_t length = fp_rd32(entry + 4);
         uint8_t codec = entry[8];
@@ -160,7 +232,9 @@ static fp_error_t fp_check_pack(const void *pack_bytes_in, uint32_t pack_bytes,
         codecs |= (uint8_t)(1u << codec);
         if (codec == FP_CODEC_INDEX8_FULL && length != canvas * canvas) return FP_ERR_BAD_FRAME;
         if (!fp_range_ok(file_length, offset, length)) return FP_ERR_BAD_BOUNDS;
-        const uint8_t *pixels = pack + offset;
+        if (!prove && source->frame) continue;
+        const uint8_t *pixels = fp_source_resource(source, (uint16_t)i, offset, length);
+        if (!pixels) return FP_ERR_TRUNCATED;
         if (fp_zlib_codec(codec)) {
             if (!prove) continue;
             if (!work) return FP_ERR_ARENA;
@@ -205,16 +279,16 @@ static fp_error_t fp_check_pack(const void *pack_bytes_in, uint32_t pack_bytes,
         } else { if(length<5u)return FP_ERR_BAD_FRAME;uint32_t x=pixels[0],y=pixels[1],w=pixels[2],h=pixels[3]; if(!w||!h||x+w>canvas||y+h>canvas||length!=4u+w*h)return FP_ERR_BAD_FRAME;for(uint32_t p=4;p<length;p++)if(pixels[p]>=palette_count)return FP_ERR_BAD_FRAME; }
     }
 
-    uint32_t strings_offset = fp_rd32(pack + FP_HDR_STRINGS_OFFSET);
-    uint32_t strings_length = fp_rd32(pack + FP_HDR_STRINGS_LENGTH);
-    if (strings_length > 0u && !fp_range_ok(file_length, strings_offset, strings_length)) return FP_ERR_BAD_BOUNDS;
+    uint32_t strings_offset = fp_rd32(fp_source_at(source, FP_HDR_STRINGS_OFFSET));
+    uint32_t strings_length = fp_rd32(fp_source_at(source, FP_HDR_STRINGS_LENGTH));
+    if (strings_length > 0u && !fp_metadata_ok(source, strings_offset, strings_length)) return FP_ERR_BAD_BOUNDS;
 
-    uint32_t clip_count = fp_rd16(pack + FP_HDR_CLIP_COUNT);
+    uint32_t clip_count = fp_rd16(fp_source_at(source, FP_HDR_CLIP_COUNT));
     if (clip_count < 1u || clip_count > FP_MAX_CLIPS) return FP_ERR_BAD_HEADER;
-    uint32_t clip_dir = fp_rd32(pack + FP_HDR_CLIP_DIR_OFFSET);
-    if (!fp_range_ok(file_length, clip_dir, clip_count * FP_CLIP_DIR_ENTRY_BYTES)) return FP_ERR_BAD_BOUNDS;
+    uint32_t clip_dir = fp_rd32(fp_source_at(source, FP_HDR_CLIP_DIR_OFFSET));
+    if (!fp_metadata_ok(source, clip_dir, clip_count * FP_CLIP_DIR_ENTRY_BYTES)) return FP_ERR_BAD_BOUNDS;
     for (uint32_t i = 0; i < clip_count; i++) {
-        const uint8_t *entry = pack + clip_dir + i * FP_CLIP_DIR_ENTRY_BYTES;
+        const uint8_t *entry = fp_source_at(source, clip_dir + i * FP_CLIP_DIR_ENTRY_BYTES);
         if (!fp_string_ok(strings_offset, strings_length, fp_rd32(entry), fp_rd16(entry + 4))) {
             return FP_ERR_BAD_BOUNDS;
         }
@@ -223,9 +297,9 @@ static fp_error_t fp_check_pack(const void *pack_bytes_in, uint32_t pack_bytes,
         uint32_t steps_offset = fp_rd32(entry + 8);
         uint32_t step_count = fp_rd16(entry + 12);
         if (step_count < 1u || step_count > FP_MAX_CLIP_STEPS) return FP_ERR_BAD_CLIP;
-        if (!fp_range_ok(file_length, steps_offset, step_count * FP_CLIP_STEP_BYTES)) return FP_ERR_BAD_BOUNDS;
+        if (!fp_metadata_ok(source, steps_offset, step_count * FP_CLIP_STEP_BYTES)) return FP_ERR_BAD_BOUNDS;
         for (uint32_t s = 0; s < step_count; s++) {
-            const uint8_t *step = pack + steps_offset + s * FP_CLIP_STEP_BYTES;
+            const uint8_t *step = fp_source_at(source, steps_offset + s * FP_CLIP_STEP_BYTES);
             if (fp_rd16(step) >= frame_count) return FP_ERR_BAD_CLIP;
             if (fp_rd16(step + 2) < 1u) return FP_ERR_BAD_CLIP;
         }
@@ -234,30 +308,35 @@ static fp_error_t fp_check_pack(const void *pack_bytes_in, uint32_t pack_bytes,
     /* A move pack has no roles, emotions, talk table or idle section. */
     uint32_t emotion_count = 0u, talk_offset = 0u, stage_count = 0u, micro_count = 0u;
     if (move) {
-        if (fp_rd32(pack + FP_HDR_ROLES_OFFSET) || fp_rd16(pack + FP_HDR_EMOTION_COUNT) || fp_rd32(pack + FP_HDR_EMOTIONS_OFFSET) ||
-            fp_rd32(pack + FP_HDR_TALK_OFFSET) || fp_rd32(pack + FP_HDR_IDLE_OFFSET)) return FP_ERR_BAD_MOVE;
+        if (fp_rd32(fp_source_at(source, FP_HDR_ROLES_OFFSET)) || fp_rd16(fp_source_at(source, FP_HDR_EMOTION_COUNT)) ||
+            fp_rd32(fp_source_at(source, FP_HDR_EMOTIONS_OFFSET)) ||
+            fp_rd32(fp_source_at(source, FP_HDR_TALK_OFFSET)) || fp_rd32(fp_source_at(source, FP_HDR_IDLE_OFFSET)))
+            return FP_ERR_BAD_MOVE;
     } else {
-        uint32_t roles_offset = fp_rd32(pack + FP_HDR_ROLES_OFFSET);
-        if (!fp_range_ok(file_length, roles_offset, FP_ROLE_COUNT * 2u)) return FP_ERR_BAD_BOUNDS;
+        uint32_t roles_offset = fp_rd32(fp_source_at(source, FP_HDR_ROLES_OFFSET));
+        if (!fp_metadata_ok(source, roles_offset, FP_ROLE_COUNT * 2u)) return FP_ERR_BAD_BOUNDS;
         for (uint32_t i = 0; i < FP_ROLE_COUNT; i++) {
-            uint16_t role = fp_rd16(pack + roles_offset + i * 2u);
+            uint16_t role = fp_rd16(fp_source_at(source, roles_offset + i * 2u));
             if (role != FP_ROLE_ABSENT && role >= clip_count) return FP_ERR_BAD_ROLE;
-            if (role != FP_ROLE_ABSENT && !fp_full_clip(pack, frame_dir, clip_dir, role)) return FP_ERR_BAD_ROLE;
+            if (role != FP_ROLE_ABSENT && !fp_full_clip(source, frame_dir, clip_dir, role)) return FP_ERR_BAD_ROLE;
         }
-        if (fp_rd16(pack + roles_offset + FP_ROLE_IDLE_NEUTRAL * 2u) == FP_ROLE_ABSENT) return FP_ERR_BAD_ROLE;
+        if (fp_rd16(fp_source_at(source, roles_offset + FP_ROLE_IDLE_NEUTRAL * 2u)) == FP_ROLE_ABSENT)
+            return FP_ERR_BAD_ROLE;
 
-        emotion_count = fp_rd16(pack + FP_HDR_EMOTION_COUNT);
+        emotion_count = fp_rd16(fp_source_at(source, FP_HDR_EMOTION_COUNT));
         if (emotion_count > FP_MAX_EMOTIONS) return FP_ERR_BAD_EMOTION;
-        uint32_t emotions_offset = fp_rd32(pack + FP_HDR_EMOTIONS_OFFSET);
-        if (emotion_count > 0u && !fp_range_ok(file_length, emotions_offset, emotion_count * FP_EMOTION_ENTRY_BYTES)) {
+        uint32_t emotions_offset = fp_rd32(fp_source_at(source, FP_HDR_EMOTIONS_OFFSET));
+        if (emotion_count > 0u && !fp_metadata_ok(source, emotions_offset, emotion_count * FP_EMOTION_ENTRY_BYTES))
+        {
             return FP_ERR_BAD_BOUNDS;
         }
         for (uint32_t i = 0; i < emotion_count; i++) {
-            const uint8_t *entry = pack + emotions_offset + i * FP_EMOTION_ENTRY_BYTES;
+            const uint8_t *entry = fp_source_at(source, emotions_offset + i * FP_EMOTION_ENTRY_BYTES);
             uint8_t id = entry[0];
             if (id == 0u || id > FP_MAX_EMOTION_ID) return FP_ERR_BAD_EMOTION;
             for (uint32_t j = 0; j < i; j++) {
-                if (pack[emotions_offset + j * FP_EMOTION_ENTRY_BYTES] == id) return FP_ERR_BAD_EMOTION;
+                if (fp_source_at(source, emotions_offset + j * FP_EMOTION_ENTRY_BYTES)[0] == id)
+                    return FP_ERR_BAD_EMOTION;
             }
             if (!fp_string_ok(strings_offset, strings_length, fp_rd32(entry + 4), fp_rd16(entry + 2))) {
                 return FP_ERR_BAD_BOUNDS;
@@ -266,42 +345,47 @@ static fp_error_t fp_check_pack(const void *pack_bytes_in, uint32_t pack_bytes,
             if (fp_rd16(entry + 10) >= clip_count) return FP_ERR_BAD_EMOTION;
             if (fp_rd16(entry + 12) >= clip_count) return FP_ERR_BAD_EMOTION;
             for (uint32_t at = 8; at <= 12; at += 2)
-                if (!fp_full_clip(pack, frame_dir, clip_dir, fp_rd16(entry + at))) return FP_ERR_BAD_EMOTION;
+                if (!fp_full_clip(source, frame_dir, clip_dir, fp_rd16(entry + at))) return FP_ERR_BAD_EMOTION;
             if (fp_rd16(entry + 14) > fp_rd16(entry + 16)) return FP_ERR_BAD_EMOTION;
             /* Non-terminating enter/exit clips would wedge the director. */
-            if (pack[clip_dir + (uint32_t)fp_rd16(entry + 8) * FP_CLIP_DIR_ENTRY_BYTES + 6u] != FP_LOOP_ONCE) {
+            if (fp_source_at(source, clip_dir + (uint32_t)fp_rd16(entry + 8) * FP_CLIP_DIR_ENTRY_BYTES + 6u)[0] !=
+                FP_LOOP_ONCE)
+            {
                 return FP_ERR_BAD_EMOTION;
             }
-            if (pack[clip_dir + (uint32_t)fp_rd16(entry + 12) * FP_CLIP_DIR_ENTRY_BYTES + 6u] != FP_LOOP_ONCE) {
+            if (fp_source_at(source, clip_dir + (uint32_t)fp_rd16(entry + 12) * FP_CLIP_DIR_ENTRY_BYTES + 6u)[0] !=
+                FP_LOOP_ONCE)
+            {
                 return FP_ERR_BAD_EMOTION;
             }
         }
 
-        talk_offset = fp_rd32(pack + FP_HDR_TALK_OFFSET);
-        if (!fp_range_ok(file_length, talk_offset, 4u)) return FP_ERR_BAD_BOUNDS;
-        stage_count = pack[talk_offset];
+        talk_offset = fp_rd32(fp_source_at(source, FP_HDR_TALK_OFFSET));
+        if (!fp_metadata_ok(source, talk_offset, 4u)) return FP_ERR_BAD_BOUNDS;
+        stage_count = fp_source_at(source, talk_offset)[0];
         if (stage_count < 1u || stage_count > FP_MAX_TALK_STAGES) return FP_ERR_BAD_TALK;
         uint32_t talk_stage_bytes = (4u + stage_count * 2u + 3u) & ~3u;
         uint32_t talk_lut_bytes = (FP_TALK_LUT_BYTES + 3u) & ~3u;
-        if (!fp_range_ok(file_length, talk_offset, talk_stage_bytes + talk_lut_bytes)) return FP_ERR_BAD_BOUNDS;
+        if (!fp_metadata_ok(source, talk_offset, talk_stage_bytes + talk_lut_bytes)) return FP_ERR_BAD_BOUNDS;
         for (uint32_t i = 0; i < stage_count; i++) {
-            if (fp_rd16(pack + talk_offset + 4u + i * 2u) >= frame_count) return FP_ERR_BAD_TALK;
-            if (!fp_full_frame(pack, frame_dir, fp_rd16(pack + talk_offset + 4u + i * 2u))) return FP_ERR_BAD_TALK;
+            if (fp_rd16(fp_source_at(source, talk_offset + 4u + i * 2u)) >= frame_count) return FP_ERR_BAD_TALK;
+            if (!fp_full_frame(source, frame_dir, fp_rd16(fp_source_at(source, talk_offset + 4u + i * 2u))))
+                return FP_ERR_BAD_TALK;
         }
         for (uint32_t level = 0; level < FP_TALK_LUT_BYTES; level++) {
-            if (pack[talk_offset + talk_stage_bytes + level] >= stage_count) return FP_ERR_BAD_TALK;
+            if (fp_source_at(source, talk_offset + talk_stage_bytes + level)[0] >= stage_count) return FP_ERR_BAD_TALK;
         }
 
-        uint32_t idle_offset = fp_rd32(pack + FP_HDR_IDLE_OFFSET);
-        if (!fp_range_ok(file_length, idle_offset, FP_IDLE_PARAMS_BYTES)) return FP_ERR_BAD_BOUNDS;
-        uint16_t bob_amplitude = fp_rd16(pack + idle_offset);
-        uint16_t bob_period = fp_rd16(pack + idle_offset + 2u);
-        uint16_t micro_gap_min = fp_rd16(pack + idle_offset + 4u);
-        uint16_t micro_gap_max = fp_rd16(pack + idle_offset + 6u);
-        uint32_t micro_list_offset = fp_rd32(pack + idle_offset + 8u);
-        micro_count = fp_rd16(pack + idle_offset + 12u);
-        uint8_t motion_flags = pack[idle_offset + 14u];
-        uint8_t max_parallax_px = pack[idle_offset + 15u];
+        uint32_t idle_offset = fp_rd32(fp_source_at(source, FP_HDR_IDLE_OFFSET));
+        if (!fp_metadata_ok(source, idle_offset, FP_IDLE_PARAMS_BYTES)) return FP_ERR_BAD_BOUNDS;
+        uint16_t bob_amplitude = fp_rd16(fp_source_at(source, idle_offset));
+        uint16_t bob_period = fp_rd16(fp_source_at(source, idle_offset + 2u));
+        uint16_t micro_gap_min = fp_rd16(fp_source_at(source, idle_offset + 4u));
+        uint16_t micro_gap_max = fp_rd16(fp_source_at(source, idle_offset + 6u));
+        uint32_t micro_list_offset = fp_rd32(fp_source_at(source, idle_offset + 8u));
+        micro_count = fp_rd16(fp_source_at(source, idle_offset + 12u));
+        uint8_t motion_flags = fp_source_at(source, idle_offset + 14u)[0];
+        uint8_t max_parallax_px = fp_source_at(source, idle_offset + 15u)[0];
         if ((motion_flags & ~3u) != 0u || max_parallax_px > 1u || (max_parallax_px > 0u && (motion_flags & 2u) == 0u)) {
             return FP_ERR_BAD_IDLE;
         }
@@ -309,17 +393,20 @@ static fp_error_t fp_check_pack(const void *pack_bytes_in, uint32_t pack_bytes,
         if (bob_amplitude > 0u && bob_period < 2u) return FP_ERR_BAD_IDLE;
         if (micro_count > 0u && micro_gap_min >= micro_gap_max) return FP_ERR_BAD_IDLE;
         if (micro_count > FP_MAX_MICRO) return FP_ERR_BAD_IDLE;
-        if (micro_count > 0u && !fp_range_ok(file_length, micro_list_offset, micro_count * FP_MICRO_ENTRY_BYTES)) {
+        if (micro_count > 0u && !fp_metadata_ok(source, micro_list_offset, micro_count * FP_MICRO_ENTRY_BYTES))
+        {
             return FP_ERR_BAD_BOUNDS;
         }
         uint32_t micro_weight_total = 0;
         for (uint32_t i = 0; i < micro_count; i++) {
-            const uint8_t *entry = pack + micro_list_offset + i * FP_MICRO_ENTRY_BYTES;
+            const uint8_t *entry = fp_source_at(source, micro_list_offset + i * FP_MICRO_ENTRY_BYTES);
             if (fp_rd16(entry) >= clip_count) return FP_ERR_BAD_IDLE;
-            if (!fp_full_clip(pack, frame_dir, clip_dir, fp_rd16(entry))) return FP_ERR_BAD_IDLE;
+            if (!fp_full_clip(source, frame_dir, clip_dir, fp_rd16(entry))) return FP_ERR_BAD_IDLE;
             uint16_t weight = fp_rd16(entry + 2);
             if (weight < 1u) return FP_ERR_BAD_IDLE;
-            if (pack[clip_dir + (uint32_t)fp_rd16(entry) * FP_CLIP_DIR_ENTRY_BYTES + 6u] != FP_LOOP_ONCE) {
+            if (fp_source_at(source, clip_dir + (uint32_t)fp_rd16(entry) * FP_CLIP_DIR_ENTRY_BYTES + 6u)[0] !=
+                FP_LOOP_ONCE)
+            {
                 return FP_ERR_BAD_IDLE;
             }
             micro_weight_total += weight;
@@ -327,17 +414,18 @@ static fp_error_t fp_check_pack(const void *pack_bytes_in, uint32_t pack_bytes,
         if (micro_weight_total > 0xffffu) return FP_ERR_BAD_IDLE;
     }
 
-    uint32_t action_count = fp_rd16(pack + FP_HDR_OVERLAY_COUNT);
+    uint32_t action_count = fp_rd16(fp_source_at(source, FP_HDR_OVERLAY_COUNT));
     if (action_count > (format_version == FP_PACK_VERSION_240 ? FP_MAX_ACTIONS : 32u)) return FP_ERR_BAD_OVERLAY;
     if (action_count > 0u && (features & FP_FEATURE_OVERLAY_ACTIONS) == 0u) return FP_ERR_BAD_OVERLAY;
     if (action_count == 0u && (features & FP_FEATURE_OVERLAY_ACTIONS) != 0u) return FP_ERR_BAD_OVERLAY;
-    uint32_t action_dir = fp_rd32(pack + FP_HDR_OVERLAY_DIR_OFFSET);
-    if (action_count > 0u && !fp_range_ok(file_length, action_dir, action_count * FP_ACTION_ENTRY_BYTES)) {
+    uint32_t action_dir = fp_rd32(fp_source_at(source, FP_HDR_OVERLAY_DIR_OFFSET));
+    if (action_count > 0u && !fp_metadata_ok(source, action_dir, action_count * FP_ACTION_ENTRY_BYTES))
+    {
         return FP_ERR_BAD_BOUNDS;
     }
     uint32_t base_actions = 0, effect_actions = 0;
     for (uint32_t i = 0; i < action_count; i++) {
-        const uint8_t *a = pack + action_dir + i * FP_ACTION_ENTRY_BYTES;
+        const uint8_t *a = fp_source_at(source, action_dir + i * FP_ACTION_ENTRY_BYTES);
         if (a[1] == FP_PLANE_BASE) base_actions++; else effect_actions++;
         if (format_version == FP_PACK_VERSION_240 && (base_actions > 64u || effect_actions > 8u)) return FP_ERR_BAD_OVERLAY;
         if (a[0] > FP_SEM_GESTURE_POP || a[1] >= FP_PLANE_COUNT || a[2] > (format_version==FP_PACK_VERSION_240?FP_ACTIVATION_MANUAL:FP_ACTIVATION_AMBIENT_EVENT)) return FP_ERR_BAD_OVERLAY;
@@ -353,21 +441,27 @@ static fp_error_t fp_check_pack(const void *pack_bytes_in, uint32_t pack_bytes,
         }
         if (fp_rd16(a + 10u) == 0u || fp_rd16(a + 12u) == 0u ||
             fp_rd16(a + 14u) > fp_rd16(a + 16u)) return FP_ERR_BAD_OVERLAY;
-        if (enter_clip != FP_ACTION_NO_CLIP && pack[clip_dir + (uint32_t)enter_clip * FP_CLIP_DIR_ENTRY_BYTES + 6u] != FP_LOOP_ONCE) return FP_ERR_BAD_OVERLAY;
+        if (enter_clip != FP_ACTION_NO_CLIP &&
+            fp_source_at(source, clip_dir + (uint32_t)enter_clip * FP_CLIP_DIR_ENTRY_BYTES + 6u)[0] != FP_LOOP_ONCE)
+            return FP_ERR_BAD_OVERLAY;
         /* Nothing interrupts an exit clip, so one that never ends would hold
          * its plane forever. */
-        if (exit_clip != FP_ACTION_NO_CLIP && pack[clip_dir + (uint32_t)exit_clip * FP_CLIP_DIR_ENTRY_BYTES + 6u] != FP_LOOP_ONCE) return FP_ERR_BAD_OVERLAY;
+        if (exit_clip != FP_ACTION_NO_CLIP &&
+            fp_source_at(source, clip_dir + (uint32_t)exit_clip * FP_CLIP_DIR_ENTRY_BYTES + 6u)[0] != FP_LOOP_ONCE)
+            return FP_ERR_BAD_OVERLAY;
         uint32_t reserved_at = (features & FP_FEATURE_PERFORMANCE_ACTIONS) != 0u ? 24u :
             (features & FP_FEATURE_ACTION_LIFECYCLE) != 0u ? 22u : 20u;
         for (uint32_t r = reserved_at; r < FP_ACTION_ENTRY_BYTES; r++) if (a[r] != 0u) return FP_ERR_BAD_OVERLAY;
         uint16_t clips_to_check[3] = { clip, enter_clip, exit_clip };
         for (uint32_t c = 0; c < 3u; c++) {
             if (clips_to_check[c] == FP_ACTION_NO_CLIP) continue;
-            uint16_t steps = fp_rd16(pack + clip_dir + (uint32_t)clips_to_check[c] * FP_CLIP_DIR_ENTRY_BYTES + 12u);
-            uint32_t step_offset = fp_rd32(pack + clip_dir + (uint32_t)clips_to_check[c] * FP_CLIP_DIR_ENTRY_BYTES + 8u);
+            uint16_t steps =
+                fp_rd16(fp_source_at(source, clip_dir + (uint32_t)clips_to_check[c] * FP_CLIP_DIR_ENTRY_BYTES + 12u));
+            uint32_t step_offset =
+                fp_rd32(fp_source_at(source, clip_dir + (uint32_t)clips_to_check[c] * FP_CLIP_DIR_ENTRY_BYTES + 8u));
             for (uint32_t s = 0; s < steps; s++) {
-                uint16_t frame = fp_rd16(pack + step_offset + s * FP_CLIP_STEP_BYTES);
-                uint8_t codec = pack[frame_dir + (uint32_t)frame * FP_FRAME_DIR_ENTRY_BYTES + 8u];
+                uint16_t frame = fp_rd16(fp_source_at(source, step_offset + s * FP_CLIP_STEP_BYTES));
+                uint8_t codec = fp_source_at(source, frame_dir + (uint32_t)frame * FP_FRAME_DIR_ENTRY_BYTES + 8u)[0];
                 int valid = a[1] == FP_PLANE_BASE
                     ? fp_full_codec(codec)
                     : fp_masked_codec(codec);
@@ -378,26 +472,119 @@ static fp_error_t fp_check_pack(const void *pack_bytes_in, uint32_t pack_bytes,
     if (move) {
         /* Clip 0 plays once, in complete frames; an optional characterFx
          * effect plays clip 1 alongside it for exactly as long. */
-        uint32_t ticks = fp_clip_ticks(pack, clip_dir, 0u);
-        if (action_count > 1u || clip_count != 1u + action_count || pack[clip_dir + 6u] != FP_LOOP_ONCE ||
-            !fp_full_clip(pack, frame_dir, clip_dir, 0u) || ticks < FP_MOVE_MIN_TICKS || ticks > FP_MOVE_MAX_TICKS) return FP_ERR_BAD_MOVE;
-        if (action_count == 1u && (pack[action_dir + 1u] != FP_PLANE_CHARACTER_FX || fp_rd16(pack + action_dir + 4u) != 1u ||
-            fp_rd16(pack + action_dir + 6u) != FP_ACTION_NO_CLIP || pack[clip_dir + FP_CLIP_DIR_ENTRY_BYTES + 6u] != FP_LOOP_ONCE ||
-            fp_clip_ticks(pack, clip_dir, 1u) != ticks)) return FP_ERR_BAD_MOVE;
+        uint32_t ticks = fp_clip_ticks(source, clip_dir, 0u);
+        if (action_count > 1u || clip_count != 1u + action_count ||
+            fp_source_at(source, clip_dir + 6u)[0] != FP_LOOP_ONCE || !fp_full_clip(source, frame_dir, clip_dir, 0u) ||
+            ticks < FP_MOVE_MIN_TICKS || ticks > FP_MOVE_MAX_TICKS)
+            return FP_ERR_BAD_MOVE;
+        if (action_count == 1u && (fp_source_at(source, action_dir + 1u)[0] != FP_PLANE_CHARACTER_FX ||
+                                   fp_rd16(fp_source_at(source, action_dir + 4u)) != 1u ||
+                                   fp_rd16(fp_source_at(source, action_dir + 6u)) != FP_ACTION_NO_CLIP ||
+                                   fp_source_at(source, clip_dir + FP_CLIP_DIR_ENTRY_BYTES + 6u)[0] != FP_LOOP_ONCE ||
+                                   fp_clip_ticks(source, clip_dir, 1u) != ticks))
+            return FP_ERR_BAD_MOVE;
     }
 
-    uint32_t facial_offset=fp_rd32(pack+FP_HDR_FACIAL_OFFSET),facial_length=fp_rd32(pack+FP_HDR_FACIAL_LENGTH);
+    uint32_t facial_offset = fp_rd32(fp_source_at(source, FP_HDR_FACIAL_OFFSET)),
+             facial_length = fp_rd32(fp_source_at(source, FP_HDR_FACIAL_LENGTH));
     /* The talk stage selects one of the seven mouth replacements, and mouth
      * and eye patches must not overlap (binary.ts parseFramePack). */
-    if((features&FP_FEATURE_FACIAL_REGIONS)!=0u){if(facial_length<FP_FACIAL_HEADER_BYTES)return FP_ERR_BAD_FACIAL;if(!fp_range_ok(file_length,facial_offset,facial_length))return FP_ERR_BAD_BOUNDS;if(fp_rd16(pack+facial_offset)!=1u&&(format_version!=FP_PACK_VERSION_240||fp_rd16(pack+facial_offset)!=2u))return FP_ERR_BAD_FACIAL;if(stage_count>FP_FACIAL_MOUTH_STAGES)return FP_ERR_BAD_FACIAL;uint32_t count=pack[facial_offset+2u],center=pack[facial_offset+3u],dir=fp_rd32(pack+facial_offset+52u);if(count!=5u||center>=count||facial_length!=FP_FACIAL_HEADER_BYTES+count*FP_FACIAL_GROUP_BYTES||dir!=facial_offset+FP_FACIAL_HEADER_BYTES)return FP_ERR_BAD_FACIAL;if(fp_rd16(pack+facial_offset)==2u)for(uint32_t j=0;j<5u;j++)if(!pack[facial_offset+20u+j]||pack[facial_offset+20u+j]>10u)return FP_ERR_BAD_FACIAL;uint8_t roles=0;for(uint32_t i=0;i<count;i++){const uint8_t*g=pack+dir+i*FP_FACIAL_GROUP_BYTES;uint8_t role=g[0];if(role>4u||(roles&(1u<<role)))return FP_ERR_BAD_FACIAL;roles|=1u<<role;uint16_t base=fp_rd16(g+2u);uint8_t base_codec=base<frame_count?pack[frame_dir+(uint32_t)base*FP_FRAME_DIR_ENTRY_BYTES+8u]:255u;if(base>=frame_count||!fp_full_codec(base_codec))return FP_ERR_BAD_FACIAL;const uint8_t*mouth=g+4u,*eyes=g+8u;if(mouth[0]<eyes[0]+eyes[2]&&mouth[0]+mouth[2]>eyes[0]&&mouth[1]<eyes[1]+eyes[3]&&mouth[1]+mouth[3]>eyes[1])return FP_ERR_BAD_FACIAL;for(uint32_t bank=0;bank<2;bank++){const uint8_t*r=g+4u+bank*4u;uint32_t n=bank?5u:7u,start=bank?26u:12u;if(!r[2]||!r[3]||r[0]+r[2]>canvas||r[1]+r[3]>canvas)return FP_ERR_BAD_FACIAL;for(uint32_t j=0;j<n;j++){uint16_t f=fp_rd16(g+start+j*2u);if(f>=frame_count||!fp_dense_codec(pack[frame_dir+(uint32_t)f*FP_FRAME_DIR_ENTRY_BYTES+8u]))return FP_ERR_BAD_FACIAL;uint32_t o=fp_rd32(pack+frame_dir+(uint32_t)f*FP_FRAME_DIR_ENTRY_BYTES);if(pack[o]!=r[0]||pack[o+1]!=r[1]||pack[o+2]!=r[2]||pack[o+3]!=r[3])return FP_ERR_BAD_FACIAL;}}}for(uint32_t i=0;i<6;i+=2)if(fp_rd16(pack+facial_offset+8u+i*2u)>=fp_rd16(pack+facial_offset+10u+i*2u))return FP_ERR_BAD_FACIAL;if(fp_rd16(pack+facial_offset)==2u){for(uint32_t i=0;i<8;i++){uint16_t t=fp_rd16(pack+facial_offset+36u+i*2u);if(i<5u?(!t||t>1818u):t!=0u)return FP_ERR_BAD_FACIAL;}}else for(uint32_t i=0;i<8;i+=2)if(fp_rd16(pack+facial_offset+36u+i*2u)>=fp_rd16(pack+facial_offset+38u+i*2u))return FP_ERR_BAD_FACIAL;}else if(facial_offset||facial_length)return FP_ERR_BAD_FACIAL;
+    if ((features & FP_FEATURE_FACIAL_REGIONS) != 0u)
+    {
+        if (facial_length < FP_FACIAL_HEADER_BYTES) return FP_ERR_BAD_FACIAL;
+        if (!fp_metadata_ok(source, facial_offset, facial_length)) return FP_ERR_BAD_BOUNDS;
+        const uint8_t *section = fp_source_at(source, facial_offset);
+        uint16_t version = fp_rd16(section);
+        if (version != 1u && (format_version != FP_PACK_VERSION_240 || version != 2u))
+        {
+            return FP_ERR_BAD_FACIAL;
+        }
+        if (stage_count > FP_FACIAL_MOUTH_STAGES) return FP_ERR_BAD_FACIAL;
+        uint32_t count = section[2], center = section[3], dir = fp_rd32(section + 52u);
+        if (count != 5u || center >= count || facial_length != FP_FACIAL_HEADER_BYTES + count * FP_FACIAL_GROUP_BYTES ||
+            dir != facial_offset + FP_FACIAL_HEADER_BYTES)
+            return FP_ERR_BAD_FACIAL;
+        if (version == 2u)
+        {
+            for (uint32_t j = 0; j < 5u; j++)
+            {
+                if (!section[20u + j] || section[20u + j] > 10u) return FP_ERR_BAD_FACIAL;
+            }
+        }
+        uint8_t roles = 0;
+        for (uint32_t i = 0; i < count; i++)
+        {
+            const uint8_t *g = fp_source_at(source, dir + i * FP_FACIAL_GROUP_BYTES);
+            uint8_t role = g[0];
+            if (role > 4u || (roles & (1u << role))) return FP_ERR_BAD_FACIAL;
+            roles |= 1u << role;
+            uint16_t base = fp_rd16(g + 2u);
+            if (base >= frame_count || !fp_full_frame(source, frame_dir, base)) return FP_ERR_BAD_FACIAL;
+            const uint8_t *mouth = g + 4u, *eyes = g + 8u;
+            if (mouth[0] < eyes[0] + eyes[2] && mouth[0] + mouth[2] > eyes[0] && mouth[1] < eyes[1] + eyes[3] &&
+                mouth[1] + mouth[3] > eyes[1])
+                return FP_ERR_BAD_FACIAL;
+            for (uint32_t bank = 0; bank < 2u; bank++)
+            {
+                const uint8_t *rect = g + 4u + bank * 4u;
+                uint32_t count_frames = bank ? 5u : 7u, start = bank ? 26u : 12u;
+                if (!rect[2] || !rect[3] || rect[0] + rect[2] > canvas || rect[1] + rect[3] > canvas)
+                {
+                    return FP_ERR_BAD_FACIAL;
+                }
+                for (uint32_t j = 0; j < count_frames; j++)
+                {
+                    uint16_t frame = fp_rd16(g + start + j * 2u);
+                    if (frame >= frame_count) return FP_ERR_BAD_FACIAL;
+                    const uint8_t *entry = fp_source_at(source, frame_dir + (uint32_t)frame * FP_FRAME_DIR_ENTRY_BYTES);
+                    if (!fp_dense_codec(entry[8])) return FP_ERR_BAD_FACIAL;
+                    uint32_t length = fp_rd32(entry + 4u);
+                    if (length < 4u) return FP_ERR_BAD_FACIAL;
+                    const uint8_t *pixels = fp_source_resource(source, frame, fp_rd32(entry), length);
+                    if (!pixels) return FP_ERR_TRUNCATED;
+                    for (uint32_t k = 0; k < 4u; k++)
+                    {
+                        if (pixels[k] != rect[k]) return FP_ERR_BAD_FACIAL;
+                    }
+                }
+            }
+        }
+        for (uint32_t i = 0; i < 6u; i += 2u)
+        {
+            if (fp_rd16(section + 8u + i * 2u) >= fp_rd16(section + 10u + i * 2u)) return FP_ERR_BAD_FACIAL;
+        }
+        if (version == 2u)
+        {
+            for (uint32_t i = 0; i < 8u; i++)
+            {
+                uint16_t ticks = fp_rd16(section + 36u + i * 2u);
+                if (i < 5u ? (!ticks || ticks > 1818u) : ticks != 0u) return FP_ERR_BAD_FACIAL;
+            }
+        }
+        else
+        {
+            for (uint32_t i = 0; i < 8u; i += 2u)
+            {
+                if (fp_rd16(section + 36u + i * 2u) >= fp_rd16(section + 38u + i * 2u))
+                {
+                    return FP_ERR_BAD_FACIAL;
+                }
+            }
+        }
+    }
+    else if (facial_offset || facial_length)
+    {
+        return FP_ERR_BAD_FACIAL;
+    }
 
     /* Speaking poses (binary.ts parseFramePack, same check order). */
-    uint32_t speaking_offset = fp_rd32(pack + FP_HDR_SPEAKING_OFFSET), speaking_length = fp_rd16(pack + FP_HDR_SPEAKING_LENGTH);
+    uint32_t speaking_offset = fp_rd32(fp_source_at(source, FP_HDR_SPEAKING_OFFSET)),
+             speaking_length = fp_rd16(fp_source_at(source, FP_HDR_SPEAKING_LENGTH));
     if ((features & FP_FEATURE_SPEAKING_POSES) != 0u) {
         if (canvas != 240u || (features & FP_FEATURE_FACIAL_REGIONS) != 0u) return FP_ERR_BAD_SPEAKING;
         if (speaking_length < FP_SPEAKING_HEADER_BYTES) return FP_ERR_BAD_SPEAKING;
-        if (!fp_range_ok(file_length, speaking_offset, speaking_length)) return FP_ERR_BAD_BOUNDS;
-        const uint8_t *section = pack + speaking_offset;
+        if (!fp_metadata_ok(source, speaking_offset, speaking_length)) return FP_ERR_BAD_BOUNDS;
+        const uint8_t *section = fp_source_at(source, speaking_offset);
         uint32_t poses = section[1], stages = section[2], gestures = section[3], auto_mask = section[4];
         if (section[0] != FP_SPEAKING_SECTION_VERSION) return FP_ERR_BAD_SPEAKING;
         if (section[5] != 0u || fp_rd16(section + 10u) != 0u) return FP_ERR_BAD_SPEAKING;
@@ -412,8 +599,9 @@ static fp_error_t fp_check_pack(const void *pack_bytes_in, uint32_t pack_bytes,
         for (uint32_t pose = 0; pose < poses; pose++) {
             for (uint32_t stage = 0; stage < stages; stage++) {
                 uint16_t frame = fp_rd16(section + FP_SPEAKING_HEADER_BYTES + (pose * stages + stage) * 2u);
-                if (frame >= frame_count || !fp_full_frame(pack, frame_dir, frame)) return FP_ERR_BAD_SPEAKING;
-                if (pose == 0u && frame != fp_rd16(pack + talk_offset + 4u + stage * 2u)) return FP_ERR_BAD_SPEAKING;
+                if (frame >= frame_count || !fp_full_frame(source, frame_dir, frame)) return FP_ERR_BAD_SPEAKING;
+                if (pose == 0u && frame != fp_rd16(fp_source_at(source, talk_offset + 4u + stage * 2u)))
+                    return FP_ERR_BAD_SPEAKING;
             }
         }
         for (uint32_t i = FP_SPEAKING_HEADER_BYTES + poses * stages * 2u; i < FP_SPEAKING_HEADER_BYTES + frame_bytes; i++) {
@@ -436,26 +624,26 @@ static fp_error_t fp_check_pack(const void *pack_bytes_in, uint32_t pack_bytes,
         return FP_ERR_BAD_SPEAKING;
     }
 
-    uint32_t meta_offset = fp_rd32(pack + FP_HDR_META_OFFSET);
-    uint32_t meta_length = fp_rd32(pack + FP_HDR_META_LENGTH);
+    uint32_t meta_offset = fp_rd32(fp_source_at(source, FP_HDR_META_OFFSET));
+    uint32_t meta_length = fp_rd32(fp_source_at(source, FP_HDR_META_LENGTH));
     if (meta_length > 0u && !fp_range_ok(file_length, meta_offset, meta_length)) return FP_ERR_BAD_BOUNDS;
 
-    uint32_t id_offset = fp_rd32(pack + FP_HDR_ID_STR_OFFSET);
-    uint16_t id_len = fp_rd16(pack + FP_HDR_ID_STR_LEN);
-    uint32_t name_offset = fp_rd32(pack + FP_HDR_NAME_STR_OFFSET);
-    uint16_t name_len = fp_rd16(pack + FP_HDR_NAME_STR_LEN);
-    uint32_t version_offset = fp_rd32(pack + FP_HDR_VERSION_STR_OFFSET);
-    uint16_t version_len = fp_rd16(pack + FP_HDR_VERSION_STR_LEN);
+    uint32_t id_offset = fp_rd32(fp_source_at(source, FP_HDR_ID_STR_OFFSET));
+    uint16_t id_len = fp_rd16(fp_source_at(source, FP_HDR_ID_STR_LEN));
+    uint32_t name_offset = fp_rd32(fp_source_at(source, FP_HDR_NAME_STR_OFFSET));
+    uint16_t name_len = fp_rd16(fp_source_at(source, FP_HDR_NAME_STR_LEN));
+    uint32_t version_offset = fp_rd32(fp_source_at(source, FP_HDR_VERSION_STR_OFFSET));
+    uint16_t version_len = fp_rd16(fp_source_at(source, FP_HDR_VERSION_STR_LEN));
     if (!fp_string_ok(strings_offset, strings_length, id_offset, id_len)) return FP_ERR_BAD_BOUNDS;
     if (!fp_string_ok(strings_offset, strings_length, name_offset, name_len)) return FP_ERR_BAD_BOUNDS;
     if (!fp_string_ok(strings_offset, strings_length, version_offset, version_len)) return FP_ERR_BAD_BOUNDS;
 
     if (info != 0) {
-        info->id = pack + id_offset;
+        info->id = id_len ? fp_source_at(source, id_offset) : pack;
         info->id_len = id_len;
-        info->name = pack + name_offset;
+        info->name = name_len ? fp_source_at(source, name_offset) : pack;
         info->name_len = name_len;
-        info->version = pack + version_offset;
+        info->version = version_len ? fp_source_at(source, version_offset) : pack;
         info->version_len = version_len;
         info->frame_count = (uint16_t)frame_count;
         info->clip_count = (uint16_t)clip_count;
@@ -476,13 +664,25 @@ fp_error_t fp_validate_with_workspace(const void *pack_bytes_in, uint32_t pack_b
     fp_pack_info_t *info, void *workspace, uint32_t workspace_bytes)
 {
     if (workspace && (((uintptr_t)workspace & 7u) || workspace_bytes < sizeof(fp_codec_workspace_t))) return FP_ERR_ARENA;
-    return fp_check_pack(pack_bytes_in, pack_bytes, info, (fp_codec_workspace_t *)workspace, 1);
+    fp_pack_source_t source = {.spans = {{pack_bytes_in, 0, pack_bytes}}, .bytes = pack_bytes};
+    return fp_check_source(&source, info, (fp_codec_workspace_t *)workspace, 1, 0, 0);
 }
 
 FP_EXPORT(fp_inspect_prevalidated)
 fp_error_t fp_inspect_prevalidated(const void *pack_bytes_in, uint32_t pack_bytes, fp_pack_info_t *info)
 {
-    return fp_check_pack(pack_bytes_in, pack_bytes, info, 0, 0);
+    fp_pack_source_t source = {.spans = {{pack_bytes_in, 0, pack_bytes}}, .bytes = pack_bytes};
+    return fp_check_source(&source, info, 0, 0, 0, 0);
+}
+
+fp_error_t fp_validate_source(const fp_pack_source_t *source, fp_pack_info_t *info, void *workspace,
+                              uint32_t workspace_bytes, void *scratch, uint32_t scratch_bytes)
+{
+    if (!workspace || ((uintptr_t)workspace & 7u) || workspace_bytes < sizeof(fp_codec_workspace_t))
+    {
+        return FP_ERR_ARENA;
+    }
+    return fp_check_source(source, info, workspace, 1, scratch, scratch_bytes);
 }
 
 FP_EXPORT(fp_arena_size)
@@ -491,8 +691,8 @@ uint32_t fp_arena_size(void)
     return ((uint32_t)sizeof(fp_player_t) + 15u) & ~15u;
 }
 
-static fp_player_t *fp_bind(void *arena, uint32_t arena_bytes, const void *pack_in,
-                            uint32_t pack_bytes, uint32_t seed, fp_error_t *error, int prove)
+static fp_player_t *fp_bind(void *arena, uint32_t arena_bytes, const fp_pack_source_t *source, uint32_t seed,
+                            fp_error_t *error, int prove)
 {
     fp_error_t local = FP_OK;
     if (error == 0) error = &local;
@@ -506,34 +706,33 @@ static fp_player_t *fp_bind(void *arena, uint32_t arena_bytes, const void *pack_
     }
     fp_player_t *player = (fp_player_t *)arena;
     fp_zero_bytes(player, (uint32_t)sizeof(fp_player_t));
-    *error = fp_check_pack(pack_in, pack_bytes, &player->info, &player->codec_workspace, prove);
+    *error = fp_check_source(source, &player->info, &player->codec_workspace, prove, 0, 0);
     player->decoded_base_frame = -1;
     /* A move pack has no roles to direct; it plays beside its core pack. */
     if (*error == FP_OK && player->info.move) *error = FP_ERR_ARGUMENT;
     if (*error != FP_OK) return 0;
 
-    const uint8_t *pack = (const uint8_t *)pack_in;
-    player->pack = pack;
-    player->pack_bytes = pack_bytes;
+    player->source = *source;
+    player->pack_bytes = source->bytes;
 
     fp_pack_view_t *view = &player->view;
-    uint32_t palette_offset = fp_rd32(pack + FP_HDR_PALETTE_OFFSET);
-    view->palette_count = fp_rd16(pack + FP_HDR_PALETTE_COUNT);
+    uint32_t palette_offset = fp_rd32(fp_source_at(source, FP_HDR_PALETTE_OFFSET));
+    view->palette_count = fp_rd16(fp_source_at(source, FP_HDR_PALETTE_COUNT));
     for (uint32_t i = 0; i < view->palette_count; i++) {
-        view->palette[i] = fp_rd16(pack + palette_offset + i * 2u);
+        view->palette[i] = fp_rd16(fp_source_at(source, palette_offset + i * 2u));
     }
-    view->bg_index = pack[FP_HDR_BG_PALETTE_INDEX];
-    view->frame_dir_offset = fp_rd32(pack + FP_HDR_FRAME_DIR_OFFSET);
-    view->frame_count = fp_rd16(pack + FP_HDR_FRAME_COUNT);
-    view->features = fp_rd16(pack + FP_HDR_FLAGS);
-    view->clip_dir_offset = fp_rd32(pack + FP_HDR_CLIP_DIR_OFFSET);
-    view->clip_count = fp_rd16(pack + FP_HDR_CLIP_COUNT);
-    uint32_t roles_offset = fp_rd32(pack + FP_HDR_ROLES_OFFSET);
-    for (uint32_t i = 0; i < FP_ROLE_COUNT; i++) view->roles[i] = fp_rd16(pack + roles_offset + i * 2u);
-    view->emotion_count = (uint8_t)fp_rd16(pack + FP_HDR_EMOTION_COUNT);
-    uint32_t emotions_offset = fp_rd32(pack + FP_HDR_EMOTIONS_OFFSET);
+    view->bg_index = fp_source_at(source, FP_HDR_BG_PALETTE_INDEX)[0];
+    view->frame_dir_offset = fp_rd32(fp_source_at(source, FP_HDR_FRAME_DIR_OFFSET));
+    view->frame_count = fp_rd16(fp_source_at(source, FP_HDR_FRAME_COUNT));
+    view->features = fp_rd16(fp_source_at(source, FP_HDR_FLAGS));
+    view->clip_dir_offset = fp_rd32(fp_source_at(source, FP_HDR_CLIP_DIR_OFFSET));
+    view->clip_count = fp_rd16(fp_source_at(source, FP_HDR_CLIP_COUNT));
+    uint32_t roles_offset = fp_rd32(fp_source_at(source, FP_HDR_ROLES_OFFSET));
+    for (uint32_t i = 0; i < FP_ROLE_COUNT; i++) view->roles[i] = fp_rd16(fp_source_at(source, roles_offset + i * 2u));
+    view->emotion_count = (uint8_t)fp_rd16(fp_source_at(source, FP_HDR_EMOTION_COUNT));
+    uint32_t emotions_offset = fp_rd32(fp_source_at(source, FP_HDR_EMOTIONS_OFFSET));
     for (uint32_t i = 0; i < view->emotion_count; i++) {
-        const uint8_t *entry = pack + emotions_offset + i * FP_EMOTION_ENTRY_BYTES;
+        const uint8_t *entry = fp_source_at(source, emotions_offset + i * FP_EMOTION_ENTRY_BYTES);
         view->emotions[i].id = entry[0];
         view->emotions[i].enter_clip = fp_rd16(entry + 8);
         view->emotions[i].hold_clip = fp_rd16(entry + 10);
@@ -541,31 +740,31 @@ static fp_player_t *fp_bind(void *arena, uint32_t arena_bytes, const void *pack_
         view->emotions[i].min_hold_ms = fp_rd16(entry + 14);
         view->emotions[i].max_hold_ms = fp_rd16(entry + 16);
     }
-    uint32_t talk_offset = fp_rd32(pack + FP_HDR_TALK_OFFSET);
-    view->talk_stage_count = pack[talk_offset];
+    uint32_t talk_offset = fp_rd32(fp_source_at(source, FP_HDR_TALK_OFFSET));
+    view->talk_stage_count = fp_source_at(source, talk_offset)[0];
     for (uint32_t i = 0; i < view->talk_stage_count; i++) {
-        view->talk_stage_frames[i] = fp_rd16(pack + talk_offset + 4u + i * 2u);
+        view->talk_stage_frames[i] = fp_rd16(fp_source_at(source, talk_offset + 4u + i * 2u));
     }
     view->talk_lut_offset = talk_offset + ((4u + (uint32_t)view->talk_stage_count * 2u + 3u) & ~3u);
-    uint32_t idle_offset = fp_rd32(pack + FP_HDR_IDLE_OFFSET);
-    view->bob_amplitude_px = fp_rd16(pack + idle_offset);
-    view->bob_period_ticks = fp_rd16(pack + idle_offset + 2u);
-    view->micro_gap_min_ticks = fp_rd16(pack + idle_offset + 4u);
-    view->micro_gap_max_ticks = fp_rd16(pack + idle_offset + 6u);
-    uint32_t micro_list_offset = fp_rd32(pack + idle_offset + 8u);
-    view->micro_count = (uint8_t)fp_rd16(pack + idle_offset + 12u);
-    view->fallbacks_enabled = (uint8_t)(pack[idle_offset + 14u] & 1u);
-    view->parallax_safe = (uint8_t)((pack[idle_offset + 14u] & 2u) != 0u);
-    view->max_parallax_px = pack[idle_offset + 15u];
+    uint32_t idle_offset = fp_rd32(fp_source_at(source, FP_HDR_IDLE_OFFSET));
+    view->bob_amplitude_px = fp_rd16(fp_source_at(source, idle_offset));
+    view->bob_period_ticks = fp_rd16(fp_source_at(source, idle_offset + 2u));
+    view->micro_gap_min_ticks = fp_rd16(fp_source_at(source, idle_offset + 4u));
+    view->micro_gap_max_ticks = fp_rd16(fp_source_at(source, idle_offset + 6u));
+    uint32_t micro_list_offset = fp_rd32(fp_source_at(source, idle_offset + 8u));
+    view->micro_count = (uint8_t)fp_rd16(fp_source_at(source, idle_offset + 12u));
+    view->fallbacks_enabled = (uint8_t)(fp_source_at(source, idle_offset + 14u)[0] & 1u);
+    view->parallax_safe = (uint8_t)((fp_source_at(source, idle_offset + 14u)[0] & 2u) != 0u);
+    view->max_parallax_px = fp_source_at(source, idle_offset + 15u)[0];
     for (uint32_t i = 0; i < view->micro_count; i++) {
-        const uint8_t *entry = pack + micro_list_offset + i * FP_MICRO_ENTRY_BYTES;
+        const uint8_t *entry = fp_source_at(source, micro_list_offset + i * FP_MICRO_ENTRY_BYTES);
         view->micro[i].clip = fp_rd16(entry);
         view->micro[i].weight = fp_rd16(entry + 2);
     }
-    view->action_count = (uint8_t)fp_rd16(pack + FP_HDR_OVERLAY_COUNT);
-    uint32_t action_dir = fp_rd32(pack + FP_HDR_OVERLAY_DIR_OFFSET);
+    view->action_count = (uint8_t)fp_rd16(fp_source_at(source, FP_HDR_OVERLAY_COUNT));
+    uint32_t action_dir = fp_rd32(fp_source_at(source, FP_HDR_OVERLAY_DIR_OFFSET));
     for (uint32_t i = 0; i < view->action_count; i++) {
-        const uint8_t *entry = pack + action_dir + i * FP_ACTION_ENTRY_BYTES;
+        const uint8_t *entry = fp_source_at(source, action_dir + i * FP_ACTION_ENTRY_BYTES);
         fp_action_entry_t *action = &view->actions[i];
         action->semantic = entry[0]; action->plane = entry[1]; action->activation = entry[2]; action->priority = entry[3];
         action->clip = fp_rd16(entry + 4u); action->exit_clip = fp_rd16(entry + 6u); action->flags = fp_rd16(entry + 8u);
@@ -578,10 +777,45 @@ static fp_player_t *fp_bind(void *arena, uint32_t arena_bytes, const void *pack_
     }
     for (uint32_t plane = 0; plane < FP_PLANE_COUNT; plane++) player->action_cursors[plane].action = -1;
     player->requested_action=-1;
-    if((view->features&FP_FEATURE_FACIAL_REGIONS)!=0u){uint32_t f=fp_rd32(pack+FP_HDR_FACIAL_OFFSET),dir=fp_rd32(pack+f+52u);view->facial_independent_blink=fp_rd16(pack+f)==2u;view->facial_group_count=pack[f+2u];view->facial_center=pack[f+3u];view->facial_blink_state_mask=fp_rd16(pack+f+4u);for(uint32_t i=0;i<6;i++)view->facial_blink_gaps[i]=fp_rd16(pack+f+8u+i*2u);for(uint32_t i=0;i<5;i++)view->facial_blink_ticks[i]=pack[f+20u+i];view->facial_pose_state_mask=fp_rd16(pack+f+26u);view->facial_bob_state_mask=fp_rd16(pack+f+30u);view->facial_bob_full=pack[f+32u];view->facial_bob_balanced=pack[f+33u];view->facial_bob_period=fp_rd16(pack+f+34u);for(uint32_t i=0;i<8;i++)view->facial_pose_timings[i]=fp_rd16(pack+f+36u+i*2u);for(uint32_t i=0;i<view->facial_group_count;i++){const uint8_t*s=pack+dir+i*FP_FACIAL_GROUP_BYTES;fp_facial_group_t*g=&view->facial_groups[i];g->role=s[0];g->base_frame=fp_rd16(s+2u);for(uint32_t j=0;j<4;j++){g->mouth[j]=s[4u+j];g->eyes[j]=s[8u+j];}for(uint32_t j=0;j<7;j++)g->mouth_frames[j]=fp_rd16(s+12u+j*2u);for(uint32_t j=0;j<5;j++)g->eye_frames[j]=fp_rd16(s+26u+j*2u);}player->facial_group=view->facial_center;player->facial_pose_side=1;player->facial_pose_ticks=view->facial_independent_blink?view->facial_pose_timings[0]:1;player->facial_blink_countdown=1;}
+    if ((view->features & FP_FEATURE_FACIAL_REGIONS) != 0u)
+    {
+        uint32_t offset = fp_rd32(fp_source_at(source, FP_HDR_FACIAL_OFFSET));
+        const uint8_t *section = fp_source_at(source, offset);
+        uint32_t directory = fp_rd32(section + 52u);
+        view->facial_independent_blink = fp_rd16(section) == 2u;
+        view->facial_group_count = section[2];
+        view->facial_center = section[3];
+        view->facial_blink_state_mask = fp_rd16(section + 4u);
+        for (uint32_t i = 0; i < 6u; i++) view->facial_blink_gaps[i] = fp_rd16(section + 8u + i * 2u);
+        for (uint32_t i = 0; i < 5u; i++) view->facial_blink_ticks[i] = section[20u + i];
+        view->facial_pose_state_mask = fp_rd16(section + 26u);
+        view->facial_bob_state_mask = fp_rd16(section + 30u);
+        view->facial_bob_full = section[32];
+        view->facial_bob_balanced = section[33];
+        view->facial_bob_period = fp_rd16(section + 34u);
+        for (uint32_t i = 0; i < 8u; i++) view->facial_pose_timings[i] = fp_rd16(section + 36u + i * 2u);
+        for (uint32_t i = 0; i < view->facial_group_count; i++)
+        {
+            const uint8_t *entry = fp_source_at(source, directory + i * FP_FACIAL_GROUP_BYTES);
+            fp_facial_group_t *group = &view->facial_groups[i];
+            group->role = entry[0];
+            group->base_frame = fp_rd16(entry + 2u);
+            for (uint32_t j = 0; j < 4u; j++)
+            {
+                group->mouth[j] = entry[4u + j];
+                group->eyes[j] = entry[8u + j];
+            }
+            for (uint32_t j = 0; j < 7u; j++) group->mouth_frames[j] = fp_rd16(entry + 12u + j * 2u);
+            for (uint32_t j = 0; j < 5u; j++) group->eye_frames[j] = fp_rd16(entry + 26u + j * 2u);
+        }
+        player->facial_group = view->facial_center;
+        player->facial_pose_side = 1;
+        player->facial_pose_ticks = view->facial_independent_blink ? view->facial_pose_timings[0] : 1;
+        player->facial_blink_countdown = 1;
+    }
 
     if ((view->features & FP_FEATURE_SPEAKING_POSES) != 0u) {
-        const uint8_t *section = pack + fp_rd32(pack + FP_HDR_SPEAKING_OFFSET);
+        const uint8_t *section = fp_source_at(source, fp_rd32(fp_source_at(source, FP_HDR_SPEAKING_OFFSET)));
         uint32_t cells = (uint32_t)section[1] * section[2];
         uint32_t frame_bytes = (cells * 2u + 3u) & ~3u;
         view->speaking_pose_count = section[1];
@@ -624,36 +858,60 @@ FP_EXPORT(fp_player_init)
 fp_player_t *fp_player_init(void *arena, uint32_t arena_bytes, const void *pack_in,
                             uint32_t pack_bytes, uint32_t seed, fp_error_t *error)
 {
-    return fp_bind(arena, arena_bytes, pack_in, pack_bytes, seed, error, 1);
+    fp_pack_source_t source = {.spans = {{pack_in, 0, pack_bytes}}, .bytes = pack_bytes};
+    return fp_bind(arena, arena_bytes, &source, seed, error, 1);
 }
 
 FP_EXPORT(fp_player_init_prevalidated)
 fp_player_t *fp_player_init_prevalidated(void *arena, uint32_t arena_bytes, const void *pack_in,
                                          uint32_t pack_bytes, uint32_t seed, fp_error_t *error)
 {
-    return fp_bind(arena, arena_bytes, pack_in, pack_bytes, seed, error, 0);
+    fp_pack_source_t source = {.spans = {{pack_in, 0, pack_bytes}}, .bytes = pack_bytes};
+    return fp_bind(arena, arena_bytes, &source, seed, error, 0);
 }
 
-/* ---- Clip accessors (read from the mmap'd pack; validation proved bounds) */
+fp_player_t *fp_player_init_source(void *arena, uint32_t arena_bytes, const fp_pack_source_t *source, uint32_t seed,
+                                   fp_error_t *error)
+{
+    return fp_bind(arena, arena_bytes, source, seed, error, 0);
+}
+
+/* ---- Resident clip accessors; validation proved every metadata span. */
 
 uint8_t fp_clip_loop_mode(const fp_player_t *player, uint32_t clip)
 {
-    return player->pack[player->view.clip_dir_offset + clip * FP_CLIP_DIR_ENTRY_BYTES + 6u];
+    return fp_player_at(player, player->view.clip_dir_offset + clip * FP_CLIP_DIR_ENTRY_BYTES + 6u)[0];
 }
 
 uint16_t fp_clip_step_count(const fp_player_t *player, uint32_t clip)
 {
-    return fp_rd16(player->pack + player->view.clip_dir_offset + clip * FP_CLIP_DIR_ENTRY_BYTES + 12u);
+    return fp_rd16(fp_player_at(player, player->view.clip_dir_offset + clip * FP_CLIP_DIR_ENTRY_BYTES + 12u));
 }
 
 fp_clip_step_t fp_clip_step_at(const fp_player_t *player, uint32_t clip, uint32_t step)
 {
-    uint32_t steps_offset = fp_rd32(player->pack + player->view.clip_dir_offset + clip * FP_CLIP_DIR_ENTRY_BYTES + 8u);
-    const uint8_t *entry = player->pack + steps_offset + step * FP_CLIP_STEP_BYTES;
+    uint32_t steps_offset =
+        fp_rd32(fp_player_at(player, player->view.clip_dir_offset + clip * FP_CLIP_DIR_ENTRY_BYTES + 8u));
+    const uint8_t *entry = fp_player_at(player, steps_offset + step * FP_CLIP_STEP_BYTES);
     fp_clip_step_t out;
     out.frame = fp_rd16(entry);
     out.duration_ticks = fp_rd16(entry + 2);
     return out;
+}
+
+uint32_t fp_idle_loop_ticks(const fp_player_t *player)
+{
+    uint32_t clip = player->view.roles[FP_ROLE_IDLE_NEUTRAL], ticks = 0u;
+    for (uint32_t i = 0; i < player->view.action_count; i++) {
+        const fp_action_entry_t *action = &player->view.actions[i];
+        if (action->activation == FP_ACTIVATION_AMBIENT_LOOP && action->plane == FP_PLANE_BASE) {
+            clip = action->clip;
+            break;
+        }
+    }
+    for (uint32_t step = 0; step < fp_clip_step_count(player, clip); step++)
+        ticks += fp_clip_step_at(player, clip, step).duration_ticks;
+    return ticks;
 }
 
 /* ---- Rendering — mirrors player.ts render() -------------------------- */
@@ -662,7 +920,25 @@ static int32_t fp_range(fp_player_t*p,int32_t a,int32_t b){return a+(int32_t)(fp
 static int32_t fp_group_role(const fp_player_t*p,uint8_t role){for(uint32_t i=0;i<p->view.facial_group_count;i++)if(p->view.facial_groups[i].role==role)return(int32_t)i;return p->view.facial_center;}
 static void fp_facial_tick(fp_player_t*p){fp_pack_view_t*v=&p->view;if(!v->facial_group_count)return;uint16_t bit=(uint16_t)(1u<<p->sys_state);if(!fp_facial_compatible(p)){p->facial_group=v->facial_center;p->facial_blink_stage=0;if(v->facial_independent_blink){p->facial_blink_ticks_left=0;p->facial_pose_ticks=v->facial_pose_timings[0];}p->facial_pose_phase=0;return;}if(v->facial_blink_state_mask&bit){if(p->facial_blink_ticks_left>0){if(--p->facial_blink_ticks_left==0){p->facial_blink_stage++;if(p->facial_blink_stage>=5){uint32_t o=(uint32_t)p->animation_profile*2u;p->facial_blink_stage=0;p->facial_blink_countdown=fp_range(p,v->facial_blink_gaps[o],v->facial_blink_gaps[o+1]);}else p->facial_blink_ticks_left=v->facial_blink_ticks[p->facial_blink_stage];}}else if(--p->facial_blink_countdown<=0){p->facial_blink_stage=v->facial_independent_blink?0:1;p->facial_blink_ticks_left=v->facial_blink_ticks[p->facial_blink_stage];}}else{p->facial_blink_stage=0;if(v->facial_independent_blink)p->facial_blink_ticks_left=0;}int center_only=p->action_cursors[1].action>=0&&(v->actions[p->action_cursors[1].action].flags&FP_ACTION_FLAG_CENTER_ONLY);if(center_only||p->animation_profile==FP_PROFILE_REDUCED||!(v->facial_pose_state_mask&bit)){p->facial_group=v->facial_center;p->facial_pose_phase=0;if(v->facial_independent_blink)p->facial_pose_ticks=v->facial_pose_timings[0];return;}if(v->facial_independent_blink){int ax=p->tilt_x<0?-p->tilt_x:p->tilt_x,ay=p->tilt_y<0?-p->tilt_y:p->tilt_y;if(ax>=50||ay>=50){uint8_t role=ax>=ay?(p->tilt_x<0?1u:3u):(p->tilt_y<0?2u:4u);p->facial_group=fp_group_role(p,role);p->facial_pose_phase=role;p->facial_pose_ticks=v->facial_pose_timings[role];return;}if(--p->facial_pose_ticks>0)return;p->facial_pose_phase=(p->facial_pose_phase+1u)%5u;p->facial_group=fp_group_role(p,p->facial_pose_phase);p->facial_pose_ticks=v->facial_pose_timings[p->facial_pose_phase];return;}if(p->tilt_x<=-50||p->tilt_x>=50){p->facial_group=fp_group_role(p,p->tilt_x<0?2u:4u);p->facial_pose_phase=0;return;}if(--p->facial_pose_ticks>0)return;uint32_t b=p->animation_profile==FP_PROFILE_FULL?0u:4u;if(p->facial_pose_phase==0){p->facial_pose_side=-p->facial_pose_side;p->facial_pose_phase=1;p->facial_group=fp_group_role(p,p->facial_pose_side<0?1u:3u);p->facial_pose_ticks=5;}else if(p->facial_pose_phase==1){p->facial_pose_phase=2;p->facial_group=fp_group_role(p,p->facial_pose_side<0?2u:4u);p->facial_pose_ticks=fp_range(p,v->facial_pose_timings[b+2],v->facial_pose_timings[b+3]);}else if(p->facial_pose_phase==2){p->facial_pose_phase=3;p->facial_group=fp_group_role(p,p->facial_pose_side<0?1u:3u);p->facial_pose_ticks=5;}else{p->facial_pose_phase=0;p->facial_group=v->facial_center;p->facial_pose_ticks=fp_range(p,v->facial_pose_timings[b],v->facial_pose_timings[b+1]);}}
 static int32_t fp_facial_offset_y(const fp_player_t*p){const fp_pack_view_t*v=&p->view;if(p->facial_forced_bob>=0)return p->facial_forced_bob;if(!fp_facial_compatible(p)||p->animation_profile==FP_PROFILE_REDUCED||!(v->facial_bob_state_mask&(1u<<p->sys_state)))return 0;int32_t a=p->animation_profile==FP_PROFILE_FULL?v->facial_bob_full:v->facial_bob_balanced;if(!a||!v->facial_bob_period)return 0;int32_t q=p->bob_tick%v->facial_bob_period;return(q*4>=v->facial_bob_period&&q*4<v->facial_bob_period*3)?a:0;}
-static void fp_dense(fp_player_t*p,uint16_t*target,uint16_t frame,int32_t ox,int32_t oy){uint32_t o=fp_rd32(p->pack+p->view.frame_dir_offset+(uint32_t)frame*FP_FRAME_DIR_ENTRY_BYTES);uint32_t n=fp_rd32(p->pack+p->view.frame_dir_offset+(uint32_t)frame*FP_FRAME_DIR_ENTRY_BYTES+4u);uint8_t c=p->pack[p->view.frame_dir_offset+(uint32_t)frame*FP_FRAME_DIR_ENTRY_BYTES+8u];const uint8_t*d=fp_decode_resource(p->pack+o,n,c,p->info.width,&p->codec_workspace,&n);if(!d)return;uint32_t w=d[2],h=d[3];for(uint32_t q=0;q<w*h;q++){int32_t x=d[0]+(int32_t)(q%w)+ox,y=d[1]+(int32_t)(q/w)+oy;if(x>=0&&x<p->info.width&&y>=0&&y<p->info.height)target[y*p->info.width+x]=p->view.palette[d[4+q]];}}
+static void fp_dense(fp_player_t *player, uint16_t *target, uint16_t frame, int32_t ox, int32_t oy)
+{
+    const uint8_t *entry =
+        fp_player_at(player, player->view.frame_dir_offset + (uint32_t)frame * FP_FRAME_DIR_ENTRY_BYTES);
+    uint32_t length = fp_rd32(entry + 4u);
+    const uint8_t *encoded = fp_player_resource(player, frame);
+    if (!encoded) return;
+    const uint8_t *pixels =
+        fp_decode_resource(encoded, length, entry[8], player->info.width, &player->codec_workspace, &length);
+    if (!pixels) return;
+    uint32_t width = pixels[2], height = pixels[3];
+    for (uint32_t i = 0; i < width * height; i++)
+    {
+        int32_t x = pixels[0] + (int32_t)(i % width) + ox;
+        int32_t y = pixels[1] + (int32_t)(i / width) + oy;
+        if (x >= 0 && x < player->info.width && y >= 0 && y < player->info.height)
+            target[y * player->info.width + x] = player->view.palette[pixels[4u + i]];
+    }
+}
 
 /* Draw a complete base frame at a whole-pixel offset; off-canvas pixels are dropped. */
 static void fp_draw_base(fp_player_t *player, uint16_t *target, const uint8_t *frame, uint8_t frame_codec,
@@ -671,8 +947,8 @@ static void fp_draw_base(fp_player_t *player, uint16_t *target, const uint8_t *f
     const uint16_t *palette = player->view.palette;
     const int32_t width = player->info.width, height = player->info.height;
     if (frame_codec == FP_CODEC_INDEX8_FULL_RLE) {
-        uint32_t frame_length = fp_rd32(player->pack + player->view.frame_dir_offset +
-                                        frame_index * FP_FRAME_DIR_ENTRY_BYTES + 4u);
+        uint32_t frame_length =
+            fp_rd32(fp_player_at(player, player->view.frame_dir_offset + frame_index * FP_FRAME_DIR_ENTRY_BYTES + 4u));
         int32_t source_x = 0, source_y = 0;
         for (uint32_t at = 0; at < frame_length; at += 2u) {
             uint32_t run = frame[at];
@@ -798,6 +1074,33 @@ static int fp_effects_idle(const fp_player_t *player)
     return 1;
 }
 
+static int fp_resources_ready(fp_player_t *player, uint16_t frame)
+{
+    if (!fp_player_resource(player, frame)) return 0;
+    if (fp_facial_compatible(player))
+    {
+        const fp_facial_group_t *group = &player->view.facial_groups[player->facial_group];
+        uint32_t mouth = player->phase == FP_PHASE_TALK ? (uint32_t)player->talk_stage : 0u;
+        if (mouth >= FP_FACIAL_MOUTH_STAGES) mouth = FP_FACIAL_MOUTH_STAGES - 1u;
+        if (!fp_player_resource(player, group->mouth_frames[mouth])) return 0;
+        if (!player->view.facial_independent_blink || player->facial_blink_ticks_left > 0 ||
+            player->facial_forced_bob >= 0)
+        {
+            if (!fp_player_resource(player, group->eye_frames[player->facial_blink_stage])) return 0;
+        }
+    }
+    for (uint32_t plane = 1; plane < FP_PLANE_COUNT; plane++)
+    {
+        const fp_action_cursor_t *cursor = &player->action_cursors[plane];
+        if (cursor->action >= 0)
+        {
+            uint16_t resource = fp_clip_step_at(player, cursor->clip, cursor->step).frame;
+            if (!fp_player_resource(player, resource)) return 0;
+        }
+    }
+    return 1;
+}
+
 void fp_render(fp_player_t *player)
 {
     uint32_t frame_index = (uint32_t)fp_actions_frame(player);
@@ -827,9 +1130,10 @@ void fp_render(fp_player_t *player)
         player->dirty_rect.height = 0u;
         return;
     }
-    const uint8_t *entry = player->pack + player->view.frame_dir_offset + frame_index * FP_FRAME_DIR_ENTRY_BYTES;
+    const uint8_t *entry = fp_player_at(player, player->view.frame_dir_offset + frame_index * FP_FRAME_DIR_ENTRY_BYTES);
     uint8_t frame_codec = entry[8];
-    const uint8_t *frame = player->pack + fp_rd32(entry);
+    const uint8_t *frame = fp_player_resource(player, (uint16_t)frame_index);
+    if (!frame) return;
     if (frame_codec == FP_CODEC_INDEX8_FULL_ZLIB) {
         if (player->decoded_base_frame != (int32_t)frame_index) {
             /* Validated immutable pack; corruption must never overrun. */
@@ -1006,8 +1310,49 @@ FP_EXPORT(fp_tick)
 void fp_tick(fp_player_t *player)
 {
     if (player == 0 || player->magic != FP_PLAYER_MAGIC) return;
+    if (!player->source.frame)
+    {
+        fp_facial_tick(player);
+        fp_director_tick(player);
+        fp_render(player);
+        player->tick_committed = 1u;
+        return;
+    }
+    /* Snapshot only inputs and director state, never pixels or codec state.
+     * A miss retries the same choice next tick, with any fresh device inputs. */
+    enum
+    {
+        state_bytes = offsetof(fp_player_t, tick_committed) - offsetof(fp_player_t, sys_state)
+    };
+    uint8_t saved[state_bytes];
+    uint8_t *state = (uint8_t *)&player->sys_state;
+    for (uint32_t i = 0; i < state_bytes; i++) saved[i] = state[i];
     fp_facial_tick(player);
     fp_director_tick(player);
+    uint16_t frame = (uint16_t)fp_actions_frame(player);
+    if (fp_facial_compatible(player)) frame = player->view.facial_groups[player->facial_group].base_frame;
+    const fp_action_cursor_t *base = &player->action_cursors[FP_PLANE_BASE];
+    uint16_t clip = base->action >= 0                                           ? base->clip
+                    : player->phase != FP_PHASE_TALK && player->clip_index >= 0 ? (uint16_t)player->clip_index
+                                                                                : FP_ACTION_NO_CLIP;
+    uint16_t step = base->action >= 0 ? base->step : (uint16_t)player->clip_step;
+    int ready = !player->source.begin || player->source.begin(player->source.context, clip, step, frame);
+    if (ready) ready = fp_resources_ready(player, frame);
+    if (ready)
+    {
+        fp_render(player);
+    }
+    else
+    {
+        for (uint32_t i = 0; i < state_bytes; i++) state[i] = saved[i];
+    }
+    if (player->source.end) player->source.end(player->source.context);
+    player->tick_committed = (uint8_t)ready;
+}
+
+uint8_t fp_tick_committed(const fp_player_t *player)
+{
+    return player && player->magic == FP_PLAYER_MAGIC ? player->tick_committed : 0u;
 }
 
 FP_EXPORT(fp_framebuffer)
@@ -1065,6 +1410,28 @@ int16_t fp_active_action(const fp_player_t *player, fp_plane_t plane)
 {
     if (player == 0 || player->magic != FP_PLAYER_MAGIC || plane < FP_PLANE_BASE || plane >= FP_PLANE_COUNT) return -1;
     return player->action_cursors[plane].action;
+}
+
+FP_EXPORT(fp_action_name)
+const char *fp_action_name(const fp_player_t *player, int16_t action, uint16_t *length)
+{
+    static const char prefix[] = "action.";
+    const uint32_t prefix_len = sizeof(prefix) - 1u;
+    if (length) *length = 0;
+    if (player == 0 || player->magic != FP_PLAYER_MAGIC || action < 0 || action >= (int16_t)player->view.action_count)
+        return 0;
+    uint32_t clip = player->view.actions[action].clip;
+    const uint8_t *entry = fp_player_at(player, player->view.clip_dir_offset + clip * FP_CLIP_DIR_ENTRY_BYTES);
+    const char *name = (const char *)fp_player_at(player, fp_rd32(entry));
+    uint32_t name_len = fp_rd16(entry + 4u);
+    uint32_t matched = 0;
+    while (matched < prefix_len && matched < name_len && name[matched] == prefix[matched]) matched++;
+    if (matched == prefix_len) {
+        name += prefix_len;
+        name_len -= prefix_len;
+    }
+    if (length) *length = (uint16_t)name_len;
+    return name;
 }
 
 FP_EXPORT(fp_motion_capabilities)

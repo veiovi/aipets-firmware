@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "bsp/esp-bsp.h"
+#include "driver/gpio.h"
 #include "pet_display.h"
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
@@ -17,6 +18,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "frame_player.h"
+#include "pet_atmosphere.h"
 #include "pet_audio.h"
 #include "pet_battery.h"
 #include "pet_diagnostics.h"
@@ -43,6 +45,8 @@
 #include "face_core.h"
 #include "pet_slot_store.h"
 #include "pet_slot_protection.h"
+#include "pet_sound_bank.h"
+#include "pet_story_events.h"
 #endif
 
 typedef enum
@@ -55,7 +59,8 @@ typedef enum
     CONTROL_OTA,
     CONTROL_SWITCH,
     CONTROL_KEEP_VOLUME,
-    CONTROL_KEEP_BRIGHTNESS
+    CONTROL_KEEP_BRIGHTNESS,
+    CONTROL_KEEP_STYLE
 } control_kind_t;
 typedef struct
 {
@@ -78,17 +83,30 @@ typedef enum
     AUDIO_LISTEN_CUE_DONE,
     AUDIO_TAP_RETRY,
     AUDIO_PET,
-    AUDIO_VOLUME
+    AUDIO_VOLUME,
+    AUDIO_NOTICE,
+    AUDIO_BLESSING,
+    AUDIO_STORY_EVENT,
+    AUDIO_TALK /* The talk button (talk_button_poll): stream 1 while held, 0 once let go. */
 } audio_kind_t;
 typedef struct
 {
     audio_kind_t kind;
     uint32_t stream, sequence, duration, generation;
     esp_err_t result;
-    pet_synced_config_v2_t config;
-    pet_speech_preference_t speech;
-    /* AUDIO_ERROR: the reason typed on the face, or NULL. */
+    union
+    {
+        pet_synced_config_v2_t config;  /* AUDIO_CONFIG */
+        pet_speech_preference_t speech; /* AUDIO_SPEECH */
+        char blessing[PET_STORY_BLESSING_ID_BYTES + 1]; /* AUDIO_BLESSING: its id */
+    };
+    /* AUDIO_ERROR: the reason typed on the face, or NULL; AUDIO_NOTICE: the line. */
     const char *line;
+    /* AUDIO_TAP: when the screen was touched. The audio task can be behind,
+     * so a double tap is measured between touches, not between events. */
+    int64_t touched_us;
+    /* AUDIO_BLESSING: the blessing takes the owner's words (story-blessings-v2). */
+    bool speak;
 } audio_event_t;
 typedef struct
 {
@@ -96,6 +114,8 @@ typedef struct
     size_t length;
     pet_pack_verified_manifest_t manifest;
     pet_face_gender_t gender;
+    const fp_pack_source_t *source;
+    fp_pack_info_t info;
 } prepared_t;
 static QueueHandle_t s_commands, s_audio_events;
 static SemaphoreHandle_t s_audio_lock;
@@ -114,8 +134,10 @@ static prepared_t s_prepared[2];
 static int s_active_slot = -1;
 #if CONFIG_PET_POCKET_TERMINAL
 static const char *TAG = "pet_pocket";
-/* The three installed pets and the slot on screen (-1: none). */
+/* The installed pet and the slot on screen (-1: none). */
 static pet_slot_store_t s_slots;
+static fp_stream_t *s_stream;
+static SemaphoreHandle_t s_media_lock;
 static int s_shown_slot = -1;
 /* The store failed to reopen after a journal write failed; retried every 15 s. */
 static bool s_store_lost;
@@ -149,14 +171,15 @@ static bool pocket_unlinked(unsigned slot);
 #define TAP_SWITCH_WAIT_US 15000000
 /* A rebind's answer is due well before a new socket's hello would be. */
 #define REBIND_TIMEOUT_US 8000000
-/* The swipe the control task has not taken yet: 1 next, -1 previous, 0 none.
- * A swipe made meanwhile replaces it, so swipes made while control is busy
- * move one pet once it is free, never one pet per swipe. */
+/* The switch the control task has not taken yet (the deck's pet picker, still
+ * called a swipe here): 1 next, -1 previous, 0 none. One asked for meanwhile
+ * replaces it, so switches asked for while control is busy move one pet once
+ * it is free, never one pet per tap. */
 static atomic_int s_swipe;
 /* When the control task's current pass began (ms, never 0); 0 while it waits
  * for a command. A cloud step can hold it for seconds on a slow link. */
 static atomic_uint s_control_busy_since;
-/* A swipe after control has been busy this long says it can't switch yet. */
+/* A switch after control has been busy this long says it can't switch yet. */
 #define CONTROL_BUSY_NOTICE_MS 1000u
 /* The levels the owner hears and sees now (the menu's volume and brightness):
  * applied at every activation and reported as they are, before they are kept. */
@@ -202,7 +225,9 @@ static pet_replace_control_t *s_pet;
 static pet_firmware_bootloader_t s_boot_profile;
 static bool s_boot_health_decided;
 static bool s_single_boot_healthy;
+#if !CONFIG_PET_POCKET_TERMINAL
 static int64_t s_boot_guard_next;
+#endif
 static bool single_ready(void);
 static bool single_readers_detached(void *unused);
 /* A tap that arrived during a control step; guarded by s_audio_lock. */
@@ -219,12 +244,27 @@ static atomic_bool s_turn_grace;
  * already in flight are dropped quietly instead of forcing revalidation.
  * Guarded by s_audio_lock. */
 static uint32_t s_stopped_output;
+/* The answer the owner talks over (speech-pause-listen-v1): its turn's input
+ * stream while a listen, the current turn, holds it; 0 when none. Its reply
+ * stays s_output_stream, held, until the listen ends. Guarded by
+ * s_audio_lock. */
+static uint32_t s_held_answer;
 #if CONFIG_PET_POCKET_TERMINAL
 /* Nonzero while the listening cue plays; the microphone opens after it.
  * Guarded by s_audio_lock. */
 static uint32_t s_listen_token;
+/* When the last tap touched the screen, for a double tap (pet_answer_tap).
+ * Guarded by s_audio_lock. */
+static int64_t s_last_tap_us;
 static esp_timer_handle_t s_wake_timer;
+/* The talk button is held, and this hold has listened (handle_talk).
+ * Guarded by s_audio_lock. */
+static bool s_talk_held, s_talk_listened;
 #endif
+/* The blessing the current turn's recording is the owner's words for
+ * (story-blessings-v2, the Pocket's), or empty. Every turn starts without one.
+ * Guarded by s_audio_lock. */
+static char s_turn_blessing[PET_STORY_BLESSING_ID_BYTES + 1];
 
 bool pet_vnext_independent_control(void)
 {
@@ -249,7 +289,7 @@ static bool queue_audio(const audio_event_t *event)
 }
 static void tapped(void)
 {
-    const audio_event_t event = {.kind = AUDIO_TAP};
+    const audio_event_t event = {.kind = AUDIO_TAP, .touched_us = esp_timer_get_time()};
     queue_audio(&event);
 }
 #if CONFIG_PET_POCKET_TERMINAL
@@ -265,6 +305,56 @@ static void wake_cue(void *unused)
 {
     (void)unused;
     pet_sfx_play(PET_SFX_WAKE);
+}
+/* The BOOT button (GPIO 0, low while pressed) is the talk button
+ * (handle_talk), polled every 20 ms: two equal reads debounce it, a press and
+ * a release are reported, and a hold repeats every 250 ms, so a pet that was
+ * busy listens once it is free. It arms once released after boot, so holding
+ * BOOT at power-on still enters the download mode without talking. */
+#define TALK_BUTTON_POLL_US 20000
+#define TALK_BUTTON_REPEAT_US 250000
+static void talk_button_poll(void *unused)
+{
+    (void)unused;
+    static bool armed, held, last;
+    static int64_t reported_us;
+    const bool down = gpio_get_level(GPIO_NUM_0) == 0;
+    if (down != last)
+    {
+        last = down;
+        return;
+    }
+    if (!armed)
+    {
+        armed = !down;
+        return;
+    }
+    const int64_t now = esp_timer_get_time();
+    const bool repeat = held && down && now - reported_us >= TALK_BUTTON_REPEAT_US;
+    if (down == held && !repeat)
+        return;
+    const audio_event_t event = {.kind = AUDIO_TALK, .stream = down};
+    if (queue_audio(&event))
+    {
+        held = down;
+        reported_us = now;
+    }
+}
+static esp_err_t start_talk_button(void)
+{
+    const gpio_config_t button = {
+        .pin_bit_mask = 1ULL << GPIO_NUM_0,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    const esp_timer_create_args_t poll = {.callback = talk_button_poll, .name = "pet_talk_btn"};
+    esp_timer_handle_t timer = NULL;
+    esp_err_t result = gpio_config(&button);
+    if (result == ESP_OK)
+        result = esp_timer_create(&poll, &timer);
+    if (result == ESP_OK)
+        result = esp_timer_start_periodic(timer, TALK_BUTTON_POLL_US);
+    return result;
 }
 #endif
 static void settings_opened(void)
@@ -328,6 +418,13 @@ static bool brightness_requested(uint8_t brightness, bool save)
         bsp_display_brightness_set(brightness);
     return true;
 }
+/* LVGL context: the menu's style the owner picked. The deck switches once it
+ * is queued; the control task keeps it. */
+static bool style_requested(uint8_t style)
+{
+    const control_command_t command = {.kind = CONTROL_KEEP_STYLE, .value = style};
+    return style < PET_MENU_STYLES && xQueueSend(s_commands, &command, 0) == pdTRUE;
+}
 #else
 static void return_requested(void)
 {
@@ -345,22 +442,56 @@ static bool restart_requested(void)
     const control_command_t command = {.kind = CONTROL_RESTART};
     return xQueueSend(s_commands, &command, 0) == pdTRUE;
 }
+/* A network just stored over USB or on the Wi-Fi page joins without a restart. */
+static bool join_wifi_requested(void)
+{
+    return pet_network_use_stored_wifi() == ESP_OK;
+}
+/* Control task, inside a management reply: a network an owner sent from Studio.
+ * It is saved for later beside the one in use, and auto-join picks it when it is
+ * the strongest saved network in reach. The answer rides on the next request. */
+static bool wifi_received(const pet_wifi_admin_command_t *command)
+{
+    size_t length = strlen(command->password);
+    bool hex = length == 64;
+    for (size_t i = 0; hex && i < length; ++i) hex = isxdigit((unsigned char)command->password[i]);
+    const char *code = command->action != PET_WIFI_ADMIN_ADD ? "UNSUPPORTED_ACTION" :
+        length < 8 || (length > 63 && !hex) ? "PASSWORD_INVALID" :
+        pet_config_save_wifi(command->ssid, command->password) != ESP_OK ? "SAVE_FAILED" : NULL;
+    /* A new password for the primary or fallback applies to the next attempt, not only after a restart. */
+    if (!code) pet_network_refresh_wifi();
+    pet_network_wifi_admin_result(command->operation_id, command->ssid, code ? "failed" : "saved", code, 0);
+    return true;
+}
 #if CONFIG_PET_POCKET_TERMINAL
-/* LVGL context: hand the swipe to the control task and never block. While a
- * cloud step holds that task, say so at once instead of looking stuck. */
-static void pet_swiped(int direction)
+/* LVGL context: the deck's pet picker asks for the next (+1) or previous pet.
+ * Hand it to the control task and never block. While a cloud step holds that
+ * task, say so at once instead of looking stuck. */
+static bool switch_requested(int direction)
 {
     unsigned busy_since = atomic_load(&s_control_busy_since);
     if (busy_since && (unsigned)(esp_timer_get_time() / 1000) - busy_since >= CONTROL_BUSY_NOTICE_MS)
         pet_face_announce("> busy, can't switch yet");
     if (atomic_exchange(&s_swipe, direction > 0 ? 1 : -1))
-        return; /* The waiting swipe's command is already queued. */
+        return true; /* The waiting switch's command is already queued. */
     const control_command_t command = {.kind = CONTROL_SWITCH};
-    if (xQueueSend(s_commands, &command, 0) != pdTRUE)
-        atomic_store(&s_swipe, 0);
+    if (xQueueSend(s_commands, &command, 0) == pdTRUE)
+        return true;
+    atomic_store(&s_swipe, 0);
+    return false;
+}
+/* LVGL context: a swipe on the pet opens a story screen over it. A turn in
+ * progress carries on behind it. */
+static void face_swiped(pet_face_swipe_t swipe)
+{
+    pet_onboarding_open_screen(swipe == PET_FACE_SWIPE_RIGHT  ? PET_ONBOARDING_BLESSINGS
+                               : swipe == PET_FACE_SWIPE_LEFT ? PET_ONBOARDING_CHARACTER
+                                                              : PET_ONBOARDING_STORY);
+    pet_sfx_play(PET_SFX_SETTINGS_OPEN);
 }
 /* LVGL context: a long press pets the pet, and with a gateway that tells
- * stories the pet then tells one (begin_story). It never opens the microphone. */
+ * stories the pet then tells one (begin_story), or in story mode pauses it.
+ * It never opens the microphone. */
 static void face_gesture(uint8_t gesture)
 {
     if (gesture == FC_GESTURE_SPIN_CW)
@@ -368,6 +499,83 @@ static void face_gesture(uint8_t gesture)
         const audio_event_t event = {.kind = AUDIO_PET};
         queue_audio(&event);
     }
+}
+/* LVGL context: the owner uses a blessing (the BLESSINGS screen's USE). The
+ * audio task starts its turn when the voice is free, and says so when not. */
+static bool blessing_requested(const char *id, bool speak)
+{
+    audio_event_t event = {.kind = AUDIO_BLESSING, .speak = speak};
+    if (!id || strlen(id) >= sizeof(event.blessing))
+        return false;
+    strcpy(event.blessing, id);
+    return queue_audio(&event);
+}
+/* Network task: the sound loop under the next story turn (story-game-v1), a
+ * built-in or the sound bank's. The cue is an atomic store, so this task never
+ * waits on audio. While the voice is off no reply follows, and a cue would
+ * only arm a loop for the next pet's ordinary reply. */
+static void story_atmosphere(const char *name)
+{
+    ESP_LOGI(TAG, "story atmosphere: %s", name ? name : "none");
+    if (atomic_load(&s_voice_allowed))
+        pet_atmosphere_cue_name(name);
+}
+/* Network task: a game cue (sound-bank-v1) for the next reply, which plays the
+ * cues first. Not while the voice is off, as story_atmosphere. */
+static void story_sound(const char *id)
+{
+    if (atomic_load(&s_voice_allowed) && !pet_atmosphere_queue_sound(id))
+        ESP_LOGW(TAG, "story sound %s not played", id);
+}
+/* Playback task: the reply's cues have played, and its speech goes on unless
+ * the owner holds it; the gateway sends it again. */
+static void sounds_played(uint32_t stream)
+{
+    if (!pet_audio_playback_held())
+        pet_network_output_pause(stream, false);
+}
+/* The story frame shows while the pet on screen is the session's pet and it
+ * is in story mode. */
+static void story_frame_update(void)
+{
+    pet_face_set_story_frame(pet_network_story_mode() && !atomic_load(&s_voice_paused));
+}
+/* Network task: the session's pet's story, for the story screen and the frame. */
+static void story_state_received(const char *face_id, const pet_story_state_t *state)
+{
+    pet_onboarding_set_story_state(face_id, state);
+    /* Pausing story mode also ends a story loop still holding the speaker. */
+    if (!state->story)
+        pet_atmosphere_cue(PET_ATMOSPHERE_NONE);
+    story_frame_update();
+}
+/* Network task: a milestone's event (story-event-v1), shown once its speech
+ * has drained. One whose animation is not ready leaves the milestone told, and
+ * the device is done with it at once (story-reaction-v1); a cue taken ends
+ * through pet_story_events. */
+static void story_event(const char *id)
+{
+    const audio_event_t event = {.kind = AUDIO_STORY_EVENT};
+    if (!atomic_load(&s_voice_allowed) || !pet_story_events_cue(id))
+    {
+        ESP_LOGI(TAG, "story event %s: narration only", id);
+        pet_network_story_event_ended(id);
+    }
+    else if (!queue_audio(&event))
+        pet_story_events_uncue();
+}
+/* A story event ends now: a cue is dropped, and an event on screen gives the
+ * screen back to the pet. True when one was on screen. Under s_audio_lock. */
+static bool end_story_event(void)
+{
+    if (!pet_story_events_uncue())
+        return false;
+    if (pet_display_lock(-1) == ESP_OK)
+    {
+        pet_face_pack_stop_event(); /* Its done ends it in the cache. */
+        pet_display_unlock();
+    }
+    return true;
 }
 #endif
 
@@ -386,6 +594,7 @@ static void quiesce_audio(void)
         pet_audio_playback_cancel();
     }
 #if CONFIG_PET_POCKET_TERMINAL
+    end_story_event();
     if (s_listen_token)
     {
         s_listen_token = 0;
@@ -407,6 +616,7 @@ static void quiesce_audio(void)
     atomic_store(&s_turn_grace, false);
     s_input_stream = s_output_stream = 0;
     s_stopped_output = 0;
+    s_held_answer = 0;
 #if CONFIG_PET_POCKET_TERMINAL
     if (s_face_started && !atomic_load(&s_tap_pending))
 #else
@@ -482,9 +692,11 @@ static bool prepare_pack(unsigned slot, const void *pack, size_t bytes, const pe
         !info.approved || !pet_face_id_matches(manifest->face_id, info.id, info.id_len, imported) ||
         info.version_len != strlen(manifest->version) || memcmp(info.version, manifest->version, info.version_len))
         return false;
-    s_prepared[slot] =
-        (prepared_t){pack, bytes, *manifest,
-                     info.gender < PET_FACE_GENDER_COUNT ? (pet_face_gender_t)info.gender : PET_FACE_GENDER_NEUTRAL};
+    s_prepared[slot] = (prepared_t){.bytes = pack,
+                                    .length = bytes,
+                                    .manifest = *manifest,
+                                    .gender = info.gender < PET_FACE_GENDER_COUNT ? (pet_face_gender_t)info.gender
+                                                                                  : PET_FACE_GENDER_NEUTRAL};
     return true;
 }
 static bool prepare(void *unused, unsigned slot, const void *pack, size_t bytes,
@@ -520,6 +732,8 @@ static void connected(bool ready)
     if (ready)
         atomic_store(&s_handshake_pending, false);
 #if CONFIG_PET_POCKET_TERMINAL
+    /* A hello or an accepted rebind may end story mode. */
+    story_frame_update();
     atomic_store(&s_rebinding, false);
     /* A session answering for a pet no longer on screen: its voice stays off. */
     if (ready && atomic_load(&s_voice_paused))
@@ -630,9 +844,19 @@ static esp_err_t audio_start(uint32_t stream, uint32_t rate)
         s_output_sequence = 0;
         s_stopped_output = 0;
         s_output_skipped = 0;
+        /* It drops an answer held under the listen; the gateway has already. */
+        s_held_answer = 0;
         atomic_store(&s_turn_active, true);
+#if CONFIG_PET_POCKET_TERMINAL
+        end_story_event(); /* A new reply ends a story event. */
+#endif
         pet_face_set_state(PET_FACE_SPEAKING);
         result = pet_audio_playback_start(stream, rate, VNEXT_SPEECH_BOOST, PET_SPEECH_MOUTH_FULL_FRAME_AUTHORED);
+#if CONFIG_PET_POCKET_TERMINAL
+        /* The story's cues play first; the gateway holds the speech meanwhile. */
+        if (result == ESP_OK && pet_audio_playback_hold_for_sounds(sounds_played))
+            pet_network_output_pause(stream, true);
+#endif
     }
 #if CONFIG_PET_POCKET_TERMINAL
     /* An answer still arriving for the previous pet, or before a rebind is
@@ -653,9 +877,12 @@ static esp_err_t audio_chunk(uint32_t stream, uint32_t sequence, const uint8_t *
     esp_err_t result = ESP_ERR_INVALID_STATE;
     if (atomic_load(&s_voice_allowed) && stream == s_output_stream && sequence == s_output_sequence)
     {
-        /* Room for this frame and the end marker (pet_audio_playback_finish). */
+        /* Room for this frame and the end marker (pet_audio_playback_finish).
+         * A held reply takes the frames still in flight without waiting: the
+         * gateway sends no more until it plays on. */
         for (unsigned waited = 0;
-             pet_audio_is_playing() && !pet_audio_playback_queue_healthy() && waited < SPEAKER_ROOM_WAIT_MS;
+             pet_audio_is_playing() && !pet_audio_playback_held() && !pet_audio_playback_queue_healthy() &&
+             waited < SPEAKER_ROOM_WAIT_MS;
              waited += SPEAKER_ROOM_POLL_MS)
             vTaskDelay(pdMS_TO_TICKS(SPEAKER_ROOM_POLL_MS));
         result = pet_audio_playback_enqueue(stream, sequence, pcm, bytes);
@@ -734,6 +961,18 @@ static void session_error(const char *code, const char *message, bool recoverabl
         revalidate("rebind refused");
         return;
     }
+    /* A story the cloud could not load or restart, or a blessing it could not
+     * use: speech carries on and the face says so calmly. The gateway's idle
+     * that follows ends a refused blessing's turn. */
+    const char *calm = !strcmp(code, PET_STORY_UNAVAILABLE)      ? "> story unavailable"
+                       : !strcmp(code, PET_BLESSING_UNAVAILABLE) ? "> blessing unavailable"
+                                                                 : NULL;
+    if (calm)
+    {
+        const audio_event_t event = {.kind = AUDIO_NOTICE, .line = calm};
+        queue_audio(&event);
+        return;
+    }
 #endif
     const bool no_voice =
         !strcmp(code, "NO_SPEECH") || !strcmp(code, "STT_EMPTY") || !strcmp(code, "CARTESIA_STT_EMPTY");
@@ -790,7 +1029,14 @@ static bool activate(void *unused, unsigned slot, const pet_control_context_t *c
 #endif
     if (pet_display_lock(-1) != ESP_OK)
         goto done;
-    esp_err_t result = pet_face_pack_use_external(c->face_id, s_prepared[slot].bytes, s_prepared[slot].length);
+    esp_err_t result;
+#if CONFIG_PET_POCKET_TERMINAL
+    result = s_prepared[slot].source
+                 ? pet_face_pack_use_source(c->face_id, s_prepared[slot].source, &s_prepared[slot].info)
+                 : pet_face_pack_use_external(c->face_id, s_prepared[slot].bytes, s_prepared[slot].length);
+#else
+    result = pet_face_pack_use_external(c->face_id, s_prepared[slot].bytes, s_prepared[slot].length);
+#endif
     pet_display_unlock();
     if (result != ESP_OK)
         goto done;
@@ -803,7 +1049,7 @@ static bool activate(void *unused, unsigned slot, const pet_control_context_t *c
             .tapped = tapped,
             .settings_opened = settings_opened,
 #if CONFIG_PET_POCKET_TERMINAL
-            .pet_swiped = pet_swiped,
+            .swiped = face_swiped,
             .gesture_requested = face_gesture,
 #endif
         };
@@ -956,12 +1202,27 @@ static bool connect_brain(const pet_control_context_t *cloud)
                                                .session_error = session_error,
                                                .config_v2_received = config_received,
                                                .speech_preference_received = speech_received,
-                                               .ota_update = ota_received};
+                                               .ota_update = ota_received,
+#if CONFIG_PET_POCKET_TERMINAL
+                                               .story_log = pet_onboarding_set_story_log,
+                                               .story_state = story_state_received,
+                                               .story_list = pet_onboarding_set_story_list,
+                                               .story_atmosphere = story_atmosphere,
+                                               .story_events = pet_story_events_want,
+                                               .story_event = story_event,
+                                               .sound_bank = pet_sound_bank_want,
+                                               .story_sound = story_sound,
+#endif
+    };
     atomic_store(&s_brain_reconnect, false);
     pet_network_set_brain_token(s_brain_token);
 #if CONFIG_PET_POCKET_TERMINAL
     /* The pet on screen is being admitted: its session's answer may enable voice. */
     atomic_store(&s_voice_paused, false);
+    /* A rebind or a new socket ends a story event. */
+    xSemaphoreTake(s_audio_lock, portMAX_DELAY);
+    end_story_event();
+    xSemaphoreGive(s_audio_lock);
     /* Over the open session: already this binding's, or moved to it without a
      * new socket (session-rebind-v1). Otherwise a new socket, as before. */
     if (pet_network_bound_to(cloud) && !renewed)
@@ -1017,6 +1278,10 @@ typedef enum
     SEND_INPUT_START,
     SEND_INPUT_END,
     SEND_STORY,
+    SEND_STORY_PAUSE,
+    SEND_PAUSE,
+    SEND_RESUME,
+    SEND_BLESSING,
     SEND_CONFIG,
     SEND_SPEECH
 } send_kind_t;
@@ -1026,6 +1291,9 @@ typedef struct
     uint32_t stream, sequence, duration, generation;
     bool same;
     char ai_pet_id[sizeof(((pet_control_config_t *)0)->ai_pet_id)];
+    char blessing[PET_STORY_BLESSING_ID_BYTES + 1];
+    /* SEND_CANCEL: the answer held under the listen, cancelled after it; 0: none. */
+    uint32_t answer;
 } audio_send_t;
 /* A tap during a control step waits for it, then listens (wait_for_control).
  * A step is one cloud call, usually a few seconds; one that keeps control
@@ -1053,11 +1321,29 @@ static void free_voice(void)
     else
         pet_runtime_release(&s_resources, PET_RESOURCE_VOICE);
 }
-static void abandon_turn(void)
+/* The answer held under the listen (speech-pause-listen-v1) ends with it: its
+ * playback stops and its late frames are dropped quietly. Returns its turn,
+ * for input.cancel after the listen's; 0 when none was held. */
+static uint32_t drop_held_answer(void)
 {
+    const uint32_t answer = s_held_answer;
+    if (!answer)
+        return 0;
+    pet_audio_playback_cancel();
+    s_stopped_output = s_output_stream;
+    s_output_stream = 0;
+    s_held_answer = 0;
+    return answer;
+}
+/* The turn ends without an answer, and an answer held under its listen with
+ * it (drop_held_answer). */
+static uint32_t abandon_turn(void)
+{
+    const uint32_t answer = drop_held_answer();
     s_input_stream = 0;
     close_turn();
     pet_face_set_state(PET_FACE_IDLE);
+    return answer;
 }
 /* A listen that ended without being sent (the microphone's send queue
  * overflowed while the socket stalled, or the codec failed) says so instead
@@ -1079,6 +1365,8 @@ static void request_turn(audio_send_t *send, send_kind_t kind)
 {
     *send = (audio_send_t){.kind = kind, .stream = s_input_stream, .generation = atomic_load(&s_generation)};
     strlcpy(send->ai_pet_id, s_applied.config.ai_pet_id, sizeof(send->ai_pet_id));
+    if (kind == SEND_INPUT_START)
+        strlcpy(send->blessing, s_turn_blessing, sizeof(send->blessing));
 }
 /* Voice is claimed: a turn on a new input stream, never 0. */
 static void start_turn(void)
@@ -1089,6 +1377,7 @@ static void start_turn(void)
         ++s_next_input_stream;
     s_input_stream = s_next_input_stream;
     s_output_stream = 0;
+    s_turn_blessing[0] = 0;
     atomic_store(&s_turn_active, true);
 }
 /* Voice is claimed. Show listening at once; the microphone follows. */
@@ -1097,6 +1386,9 @@ static void begin_listening(audio_send_t *send)
     start_turn();
     pet_face_set_state(PET_FACE_LISTENING);
 #if CONFIG_PET_POCKET_TERMINAL
+    /* The microphone ends a story event; one an answer held under it cued waits for that answer. */
+    if (!s_held_answer)
+        end_story_event();
     /* The listening cue plays first; its completion opens the microphone. */
     uint32_t token = (esp_random() & 0x7fffffffu) | 1u;
     if (pet_sfx_play_listen(token) == ESP_OK)
@@ -1116,6 +1408,64 @@ static void begin_story(audio_send_t *send)
     start_turn();
     request_turn(send, SEND_STORY);
 }
+/* Voice is claimed. The owner uses a blessing: a turn like begin_story's. */
+static void begin_blessing(audio_send_t *send, const char *blessing)
+{
+    start_turn();
+    request_turn(send, SEND_BLESSING);
+    strlcpy(send->blessing, blessing, sizeof(send->blessing));
+}
+/* Voice is claimed. The owner uses a blessing that takes their words: a
+ * listen like a tap's, whose recording is for the blessing. */
+static void begin_spoken_blessing(audio_send_t *send, const char *blessing)
+{
+    begin_listening(send);
+    strlcpy(s_turn_blessing, blessing, sizeof(s_turn_blessing));
+    /* Without a listening cue the turn's start is already asked for. */
+    if (send->kind == SEND_INPUT_START)
+        strlcpy(send->blessing, blessing, sizeof(send->blessing));
+    pet_face_announce("> speak your blessing");
+}
+/* The owner taps the pet's answer to talk over it (speech-pause-listen-v1):
+ * it is held, at the gateway too, and a listen starts as a tap's does when
+ * idle. The answer waits under the listen (s_held_answer): it plays on if
+ * nothing is said (play_answer_on), and the next reply drops it. Voice stays
+ * claimed. */
+static void listen_over_answer(audio_send_t *send)
+{
+    const uint32_t answer = s_output_stream;
+    pet_network_output_pause(answer, true);
+    s_held_answer = s_input_stream;
+    begin_listening(send);
+    s_output_stream = answer; /* The held reply's frames still in flight come on it. */
+}
+/* Nothing was said over the held answer: the listen was cancelled before its
+ * microphone opened, or the gateway heard no speech. The answer's turn is
+ * current again, and the answer plays on from where it stopped. */
+static void play_answer_on(audio_send_t *send)
+{
+    s_input_stream = s_held_answer;
+    s_held_answer = 0;
+    pet_audio_playback_hold(false);
+    pet_face_set_state(PET_FACE_SPEAKING);
+    *send = (audio_send_t){.kind = SEND_RESUME, .stream = s_output_stream};
+}
+/* A listen ends before its microphone opens: one over a held answer lets it
+ * play on, and any other turn ends. */
+static void cancel_listen(audio_send_t *send)
+{
+    if (s_held_answer)
+        play_answer_on(send);
+    else
+        abandon_turn();
+}
+/* The listening cue stops, and the microphone never opens. */
+static void drop_listen_cue(audio_send_t *send)
+{
+    s_listen_token = 0;
+    pet_sfx_cancel();
+    cancel_listen(send);
+}
 #endif
 static void clear_pending_tap(void)
 {
@@ -1124,6 +1474,16 @@ static void clear_pending_tap(void)
     s_tap_pending_until = 0;
 #if CONFIG_PET_POCKET_TERMINAL
     s_tap_connecting = false;
+#endif
+}
+/* A tap waiting for the session or a cloud step is withdrawn. */
+static void withdraw_pending_tap(void)
+{
+    clear_pending_tap();
+    if (!atomic_load(&s_turn_active))
+        pet_face_set_state(PET_FACE_IDLE);
+#if CONFIG_PET_POCKET_TERMINAL
+    pet_face_announce("> cancelled");
 #endif
 }
 /* A listening attempt that has not opened the microphone yet. */
@@ -1135,6 +1495,31 @@ static bool listening_soon(void)
 #endif
     return atomic_load(&s_tap_pending);
 }
+#if CONFIG_PET_POCKET_TERMINAL
+/* A cued story event shows once the speech has drained, never while the
+ * microphone is open or about to open, nor during another turn. Under
+ * s_audio_lock. */
+static void play_story_event(void)
+{
+    const void *pack = NULL;
+    size_t bytes = 0;
+    char sound[PET_SOUND_ID_BYTES + 1];
+    if (pet_audio_is_playing() || pet_audio_is_capturing() || listening_soon() || atomic_load(&s_turn_active) ||
+        !pet_story_events_take(&pack, &bytes, sound))
+        return;
+    esp_err_t shown = ESP_ERR_INVALID_STATE;
+    if (pet_display_lock(-1) == ESP_OK)
+    {
+        shown = pet_face_pack_play_event(pack, bytes, pet_story_events_done);
+        pet_display_unlock();
+    }
+    if (shown != ESP_OK)
+        pet_story_events_done();
+    /* Its stinger starts with the animation (sound-bank-v1). */
+    else if (sound[0] && !pet_audio_play_story_sound(sound))
+        ESP_LOGW(TAG, "story event stinger %s not played", sound);
+}
+#endif
 
 #if CONFIG_PET_POCKET_TERMINAL
 /* The open session is moving to the pet on screen: a swipe or a selection
@@ -1153,6 +1538,7 @@ static bool switching_pets(void)
 static void pause_voice(bool same_pet)
 {
     atomic_store(&s_voice_paused, true);
+    story_frame_update();
     atomic_store(&s_voice_allowed, false);
     atomic_store(&s_gateway_connected, false);
     xSemaphoreTake(s_audio_lock, portMAX_DELAY);
@@ -1162,6 +1548,7 @@ static void pause_voice(bool same_pet)
         pet_audio_capture_stop();
         pet_audio_playback_cancel();
     }
+    end_story_event();
     /* With its audio stopped, the pet is idle. A face left SPEAKING or
      * LISTENING without playback or capture reads to pet_diagnostics as a
      * stall, and its recovery replaces the socket the switch keeps. */
@@ -1182,10 +1569,14 @@ static void pause_voice(bool same_pet)
     if (s_output_stream)
         s_stopped_output = s_output_stream;
     s_input_stream = s_output_stream = 0;
+    const uint32_t answer = s_held_answer;
+    s_held_answer = 0;
     atomic_fetch_add(&s_generation, 1);
     xSemaphoreGive(s_audio_lock);
     if (cancel)
         pet_network_cancel(cancel);
+    if (answer)
+        pet_network_cancel(answer);
 }
 #endif
 
@@ -1205,25 +1596,94 @@ static void wait_for_control(void)
 #endif
 }
 
-static void handle_tap(audio_send_t *send)
+#if CONFIG_PET_POCKET_TERMINAL
+/* A tap on the answer in story mode, with a gateway that holds speech
+ * (speech-pause-v1), holds it at once (pet_answer_tap). With a gateway that
+ * keeps it while the owner talks (speech-pause-listen-v1) a listen starts
+ * over it; otherwise the next tap lets it play on, and a held answer plays on
+ * whatever the mode. False when the tap stops it as before: a double tap, or
+ * an answer whose last audio is already draining. */
+static bool hold_or_play_on(audio_send_t *send, int64_t since_last_tap_us)
 {
+    const bool holdable = pet_network_story_mode() && pet_network_can_pause_speech();
+    switch (pet_answer_tap(holdable, pet_audio_playback_held(), since_last_tap_us))
+    {
+    case PET_ANSWER_HOLD:
+        if (pet_network_can_listen_over_speech())
+        {
+            if (!pet_audio_playback_hold_to_listen())
+                return false;
+            listen_over_answer(send);
+            return true;
+        }
+        if (!pet_audio_playback_hold(true))
+            return false;
+        *send = (audio_send_t){.kind = SEND_PAUSE, .stream = s_output_stream};
+        pet_face_announce("> paused");
+        return true;
+    case PET_ANSWER_PLAY_ON:
+        pet_audio_playback_hold(false);
+        *send = (audio_send_t){.kind = SEND_RESUME, .stream = s_output_stream};
+        pet_face_announce("> playing");
+        return true;
+    case PET_ANSWER_STOP:
+        break;
+    }
+    return false;
+}
+#endif
+
+/* The answer stops. The gateway stops whatever it is producing on any cancel.
+ * A story event the answer cued ends after it (finish_send). */
+static void stop_answer(audio_send_t *send)
+{
+    const uint32_t stream = s_input_stream;
+    pet_audio_playback_cancel();
+    s_stopped_output = s_output_stream;
+    s_output_stream = 0;
+    abandon_turn();
+    *send = (audio_send_t){.kind = SEND_CANCEL, .stream = stream};
+}
+
+static void handle_tap(audio_send_t *send, int64_t touched_us)
+{
+#if CONFIG_PET_POCKET_TERMINAL
+    const int64_t since_last_tap_us = touched_us - s_last_tap_us;
+    s_last_tap_us = touched_us;
+#else
+    (void)touched_us;
+#endif
     if (atomic_load(&s_tap_pending))
     {
         /* A second tap while waiting for a control step withdraws the first. */
-        clear_pending_tap();
-        if (!atomic_load(&s_turn_active))
-            pet_face_set_state(PET_FACE_IDLE);
-#if CONFIG_PET_POCKET_TERMINAL
-        pet_face_announce("> cancelled");
-#endif
+        withdraw_pending_tap();
         return;
     }
     pet_face_state_t face = pet_face_get_state();
     bool listen_pending = false;
 #if CONFIG_PET_POCKET_TERMINAL
     listen_pending = s_listen_token != 0;
+    /* A double tap stops an answer held under a listen, as it stops any
+     * answer, and ends the listen; the listen's input, once started, is
+     * cancelled first. */
+    if (s_held_answer && (listen_pending || pet_audio_is_capturing()) && since_last_tap_us < PET_TAP_DOUBLE_US)
+    {
+        const uint32_t listen = listen_pending ? 0 : s_input_stream;
+        if (listen_pending)
+        {
+            s_listen_token = 0;
+            pet_sfx_cancel();
+        }
+        pet_audio_capture_stop();
+        const uint32_t answer = abandon_turn();
+        *send = (audio_send_t){.kind = SEND_CANCEL, .stream = answer};
+        if (listen)
+            *send = (audio_send_t){.kind = SEND_CANCEL, .stream = listen, .answer = answer};
+        return;
+    }
 #endif
-    switch (pet_tap_action(pet_audio_is_capturing(), listen_pending, pet_audio_is_playing(),
+    /* An answer held under a listen waits: a tap goes to the listen. */
+    switch (pet_tap_action(pet_audio_is_capturing(), listen_pending, pet_audio_is_playing() && !s_held_answer,
                            atomic_load(&s_turn_active) && face == PET_FACE_THINKING, face == PET_FACE_SPEAKING))
     {
     case PET_TAP_STOP_CAPTURE:
@@ -1232,9 +1692,7 @@ static void handle_tap(audio_send_t *send)
     case PET_TAP_CANCEL_LISTENING:
 #if CONFIG_PET_POCKET_TERMINAL
         /* A second tap during the listening cue: the microphone never opens. */
-        s_listen_token = 0;
-        pet_sfx_cancel();
-        abandon_turn();
+        drop_listen_cue(send);
 #endif
         break;
     case PET_TAP_IGNORE_WAITING:
@@ -1242,13 +1700,11 @@ static void handle_tap(audio_send_t *send)
         break;
     case PET_TAP_STOP_ANSWER:
     {
-        /* The gateway stops whatever it is producing on any cancel. */
-        uint32_t stream = s_input_stream;
-        pet_audio_playback_cancel();
-        s_stopped_output = s_output_stream;
-        s_output_stream = 0;
-        abandon_turn();
-        *send = (audio_send_t){.kind = SEND_CANCEL, .stream = stream};
+#if CONFIG_PET_POCKET_TERMINAL
+        if (hold_or_play_on(send, since_last_tap_us))
+            break;
+#endif
+        stop_answer(send);
         break;
     }
     case PET_TAP_START_LISTENING:
@@ -1260,11 +1716,72 @@ static void handle_tap(audio_send_t *send)
     }
 }
 
+#if CONFIG_PET_POCKET_TERMINAL
+static void handle_audio(const audio_event_t *event, audio_send_t *send);
+/* The talk button: hold to talk, release to send (pet_talk_action). A press
+ * that can't talk yet is a tap: it says why, or waits for the session or a
+ * cloud step, and letting go withdraws that wait, so the microphone never
+ * opens after the button is released. Called with s_audio_lock held. */
+static void handle_talk(audio_send_t *send, bool held, bool allowed)
+{
+    const bool pressed = held && !s_talk_held;
+    s_talk_held = held;
+    if (pressed)
+        s_talk_listened = false;
+    if (atomic_load(&s_tap_pending))
+    {
+        if (!held)
+            withdraw_pending_tap();
+        return;
+    }
+    if (!allowed)
+    {
+        const audio_event_t tap = {.kind = AUDIO_TAP, .touched_us = esp_timer_get_time()};
+        if (pressed)
+            handle_audio(&tap, send);
+        return;
+    }
+    const pet_face_state_t face = pet_face_get_state();
+    switch (pet_talk_action(held, s_talk_listened, pet_audio_is_capturing(), s_listen_token != 0,
+                            (pet_audio_is_playing() && !s_held_answer) || face == PET_FACE_SPEAKING,
+                            atomic_load(&s_turn_active) && face == PET_FACE_THINKING))
+    {
+    case PET_TALK_LISTEN:
+        if (pet_runtime_claim(&s_resources, PET_RESOURCE_VOICE))
+            begin_listening(send);
+        else if (pet_runtime_owns(&s_resources, PET_RESOURCE_CONTROL))
+            wait_for_control();
+        else
+            break; /* Voice is busy: the next repeat tries again. */
+        s_talk_listened = true;
+        break;
+    case PET_TALK_STOP_ANSWER:
+        stop_answer(send);
+        break;
+    case PET_TALK_SEND:
+        pet_audio_capture_stop();
+        break;
+    case PET_TALK_CANCEL_LISTENING:
+        drop_listen_cue(send);
+        break;
+    case PET_TALK_NONE:
+        break;
+    }
+}
+#endif
+
 /* Called with s_audio_lock held. */
 static void handle_audio(const audio_event_t *event, audio_send_t *send)
 {
     pet_diagnostics_note_app_event(event->kind, "vnext", 0);
     pet_diagnostics_note_streams(s_input_stream, s_output_stream);
+#if CONFIG_PET_POCKET_TERMINAL
+    /* A tap or a long press ends a story event on screen, which takes the
+     * touch. A cue still waiting for the speech stays: a tap that holds the
+     * answer or lets it play on keeps the milestone's event. */
+    if ((event->kind == AUDIO_TAP || event->kind == AUDIO_PET) && pet_story_events_showing() && end_story_event())
+        return;
+#endif
     bool allowed = atomic_load(&s_voice_allowed) && pet_network_is_ready() && s_audio_started;
     if (!atomic_load(&s_turn_active) &&
         brain_remaining((uint64_t)esp_timer_get_time() / 1000) <= 0)
@@ -1272,6 +1789,13 @@ static void handle_audio(const audio_event_t *event, audio_send_t *send)
         allowed = false;
         atomic_store(&s_brain_reconnect, true);
     }
+#if CONFIG_PET_POCKET_TERMINAL
+    if (event->kind == AUDIO_TALK)
+    {
+        handle_talk(send, event->stream != 0, allowed);
+        return;
+    }
+#endif
     if (event->kind == AUDIO_STATE && allowed)
     {
         if (event->stream)
@@ -1294,7 +1818,7 @@ static void handle_audio(const audio_event_t *event, audio_send_t *send)
     }
     else if (event->kind == AUDIO_TAP && allowed)
     {
-        handle_tap(send);
+        handle_tap(send, event->touched_us);
 #if CONFIG_PET_POCKET_TERMINAL
     }
     else if (event->kind == AUDIO_TAP && s_face_started)
@@ -1421,7 +1945,7 @@ static void handle_audio(const audio_event_t *event, audio_send_t *send)
             if (event->result == ESP_OK)
                 request_turn(send, SEND_INPUT_START);
             else
-                abandon_turn();
+                cancel_listen(send);
         }
 #endif
     }
@@ -1441,15 +1965,18 @@ static void handle_audio(const audio_event_t *event, audio_send_t *send)
         }
         else
         {
-            abandon_turn();
+            const uint32_t answer = abandon_turn();
             listen_failed(event->result);
-            *send = (audio_send_t){.kind = SEND_CANCEL, .stream = event->stream};
+            *send = (audio_send_t){.kind = SEND_CANCEL, .stream = event->stream, .answer = answer};
         }
     }
     else if (event->kind == AUDIO_PLAYBACK_DONE && event->stream == s_output_stream && allowed)
     {
         close_turn();
         pet_face_set_state(PET_FACE_IDLE);
+#if CONFIG_PET_POCKET_TERMINAL
+        play_story_event();
+#endif
     }
 #if CONFIG_PET_POCKET_TERMINAL
     else if ((event->kind == AUDIO_CONFIG || event->kind == AUDIO_SPEECH) && s_audio_started &&
@@ -1490,6 +2017,14 @@ static void handle_audio(const audio_event_t *event, audio_send_t *send)
     }
     else if (event->kind == AUDIO_ERROR && s_audio_started)
     {
+#if CONFIG_PET_POCKET_TERMINAL
+        /* No speech heard over the held answer: it plays on, quietly. */
+        if (event->stream && s_held_answer)
+        {
+            play_answer_on(send);
+            return;
+        }
+#endif
         clear_pending_tap();
 #if CONFIG_PET_POCKET_TERMINAL
         if (s_listen_token)
@@ -1507,6 +2042,10 @@ static void handle_audio(const audio_event_t *event, audio_send_t *send)
         if (event->line)
             pet_face_announce(event->line);
 #endif
+        /* Any other error ends an answer held under the listen, at the gateway too. */
+        const uint32_t answer = drop_held_answer();
+        if (answer)
+            *send = (audio_send_t){.kind = SEND_CANCEL, .stream = answer};
     }
     else if (event->kind == AUDIO_GESTURE && s_face_started && !atomic_load(&s_turn_active))
     {
@@ -1519,6 +2058,32 @@ static void handle_audio(const audio_event_t *event, audio_send_t *send)
 #endif
     }
 #if CONFIG_PET_POCKET_TERMINAL
+    else if (event->kind == AUDIO_PET && s_face_started && allowed && pet_network_story_mode())
+    {
+        /* In story mode a long press pauses the story: no turn, and a reply
+         * that is playing carries on. */
+        pet_face_touch_reaction();
+        pet_sfx_play(PET_SFX_GESTURE_POP);
+        *send = (audio_send_t){.kind = SEND_STORY_PAUSE};
+    }
+    else if (event->kind == AUDIO_NOTICE && s_face_started)
+        pet_face_announce(event->line);
+    else if (event->kind == AUDIO_STORY_EVENT && allowed)
+        play_story_event();
+    else if (event->kind == AUDIO_BLESSING && s_face_started)
+    {
+        /* Guarded as a long press's story is: a ready session that plays
+         * story games (and takes the owner's words, for one that does), and
+         * the voice free. */
+        if (!allowed || !(event->speak ? pet_network_can_speak_blessing() : pet_network_can_blessing()))
+            pet_face_announce("> not ready, try again");
+        else if (atomic_load(&s_turn_active) || !pet_runtime_claim(&s_resources, PET_RESOURCE_VOICE))
+            pet_face_announce("> busy, try again");
+        else if (event->speak)
+            begin_spoken_blessing(send, event->blessing);
+        else
+            begin_blessing(send, event->blessing);
+    }
     else if (event->kind == AUDIO_PET && s_face_started && !atomic_load(&s_turn_active))
     {
         bool petted = pet_face_touch_reaction();
@@ -1565,7 +2130,19 @@ static void keep_mouth_offset(const pet_synced_config_v2_t *c)
 static void finish_send(const audio_send_t *send, const audio_event_t *event)
 {
     if (send->kind == SEND_CANCEL)
+    {
         pet_network_cancel(send->stream);
+        if (send->answer)
+            pet_network_cancel(send->answer);
+#if CONFIG_PET_POCKET_TERMINAL
+        /* A story event the answer cued ends after the cancel, so the
+         * gateway, which ends the turn on it, never speaks the pet's reaction
+         * to it (story-reaction-v1). */
+        xSemaphoreTake(s_audio_lock, portMAX_DELAY);
+        end_story_event();
+        xSemaphoreGive(s_audio_lock);
+#endif
+    }
     else if (send->kind == SEND_CONFIG)
     {
         if (send->same)
@@ -1576,8 +2153,9 @@ static void finish_send(const audio_send_t *send, const audio_event_t *event)
         pet_network_speech_profile_result(&event->speech, send->same);
     else if (send->kind == SEND_INPUT_START)
     {
-        esp_err_t announced = pet_network_input_start(send->stream, send->ai_pet_id);
+        esp_err_t announced = pet_network_input_start(send->stream, send->ai_pet_id, send->blessing);
         bool cancel = false;
+        uint32_t answer = 0;
         xSemaphoreTake(s_audio_lock, portMAX_DELAY);
         if (send->generation == atomic_load(&s_generation) && s_input_stream == send->stream &&
             atomic_load(&s_turn_active) && !pet_audio_is_capturing())
@@ -1586,25 +2164,29 @@ static void finish_send(const audio_send_t *send, const audio_event_t *event)
             {
                 /* The socket did not take the turn's start (a stalled uplink):
                  * say so, then reconnect. */
-                abandon_turn();
+                answer = abandon_turn();
                 listen_failed(announced == ESP_ERR_INVALID_STATE ? ESP_ERR_INVALID_STATE : ESP_ERR_TIMEOUT);
                 revalidate("listen start failed");
             }
             /* Speech that started meanwhile wins; this listening attempt ends. */
             else if (pet_audio_capture_start(send->stream) != ESP_OK)
             {
-                abandon_turn();
+                answer = abandon_turn();
                 cancel = true;
             }
         }
         xSemaphoreGive(s_audio_lock);
         if (cancel)
             pet_network_cancel(send->stream);
+        if (answer)
+            pet_network_cancel(answer);
     }
 #if CONFIG_PET_POCKET_TERMINAL
-    else if (send->kind == SEND_STORY)
+    else if (send->kind == SEND_STORY || send->kind == SEND_BLESSING)
     {
-        esp_err_t asked = pet_network_story(send->stream, send->ai_pet_id);
+        esp_err_t asked = send->kind == SEND_STORY
+                              ? pet_network_story(send->stream, send->ai_pet_id)
+                              : pet_network_blessing(send->stream, send->blessing, send->ai_pet_id);
         if (asked == ESP_OK)
             return;
         xSemaphoreTake(s_audio_lock, portMAX_DELAY);
@@ -1618,6 +2200,11 @@ static void finish_send(const audio_send_t *send, const audio_event_t *event)
         }
         xSemaphoreGive(s_audio_lock);
     }
+    else if (send->kind == SEND_STORY_PAUSE && pet_network_story_request("story.pause", NULL) != ESP_OK)
+        pet_face_announce("> offline, try again");
+    else if ((send->kind == SEND_PAUSE || send->kind == SEND_RESUME) &&
+             pet_network_output_pause(send->stream, send->kind == SEND_PAUSE) != ESP_OK)
+        ESP_LOGW(TAG, "output.%s not sent", send->kind == SEND_PAUSE ? "pause" : "resume");
 #endif
     else if (send->kind == SEND_INPUT_END)
     {
@@ -1625,17 +2212,20 @@ static void finish_send(const audio_send_t *send, const audio_event_t *event)
         if (ended == ESP_OK)
             return;
         bool cancel = false;
+        uint32_t answer = 0;
         xSemaphoreTake(s_audio_lock, portMAX_DELAY);
         if (send->generation == atomic_load(&s_generation) && s_input_stream == send->stream &&
             atomic_load(&s_turn_active))
         {
-            abandon_turn();
+            answer = abandon_turn();
             listen_failed(ended);
             cancel = true;
         }
         xSemaphoreGive(s_audio_lock);
         if (cancel)
             pet_network_cancel(send->stream);
+        if (answer)
+            pet_network_cancel(answer);
     }
 }
 
@@ -1823,6 +2413,7 @@ static void publish_status(int64_t retry_not_before)
         status.pet_linked = status.has_pet && !pocket_unlinked((unsigned)s_shown_slot);
         if (status.has_pet)
         {
+            strlcpy(status.pet_name, s_shown_name, sizeof(status.pet_name));
             strlcpy(status.build_id, s_slots.inventory.state.slots[s_shown_slot].pack.build_id,
                     sizeof(status.build_id));
             strlcpy(status.pack_name, s_prepared[0].manifest.face_id, sizeof(status.pack_name));
@@ -2115,6 +2706,7 @@ static uint64_t firmware_now_ms(void *unused)
 }
 static void independent_health_guard(void)
 {
+#if !CONFIG_PET_POCKET_TERMINAL
     /* Even missing identity, failed receipt NVS or a failed PSRAM allocation
      * must not make an unproven PENDING app immortal. This reads only qualified
      * boot evidence; a normal reset delegates rollback to the bootloader. */
@@ -2135,9 +2727,10 @@ static void independent_health_guard(void)
             esp_restart();
         }
     }
+#endif
 }
 /* The single-slot machine the pet worker runs: the single-pet store's, or on a
- * Pocket Terminal the three-pet inventory's `operation`. */
+ * Pocket Terminal the one-pet inventory's `operation`. */
 static const pet_replace_journal_t *pet_machine(void)
 {
 #if CONFIG_PET_POCKET_TERMINAL
@@ -2145,6 +2738,16 @@ static const pet_replace_journal_t *pet_machine(void)
         return &s_slots.machine;
 #endif
     return &s_single.state;
+}
+/* New firmware that still has to prove itself. A Pocket updates over USB and
+ * has no such check. */
+static bool boot_unproven(void)
+{
+#if CONFIG_PET_POCKET_TERMINAL
+    return false;
+#else
+    return s_fw_lifecycle && !s_boot_health_decided;
+#endif
 }
 /* Conversation first: control leaves the microphone free for
  * CONVERSATION_GRACE_MS after a turn, so a follow-up tap listens at once
@@ -2154,8 +2757,7 @@ static bool conversation_grace(uint64_t now_ms)
 {
     if (!atomic_load(&s_turn_grace))
         return false;
-    if ((s_fw_lifecycle && !s_boot_health_decided) ||
-        (uint32_t)now_ms - (uint32_t)atomic_load(&s_turn_ended_ms) >= CONVERSATION_GRACE_MS)
+    if (boot_unproven() || (uint32_t)now_ms - (uint32_t)atomic_load(&s_turn_ended_ms) >= CONVERSATION_GRACE_MS)
     {
         atomic_store(&s_turn_grace, false);
         return false;
@@ -2176,6 +2778,7 @@ static void management_step(uint64_t now)
         pet_network_management_response(buffer + 8192, result.bytes);
     if (result.status == 401 || result.status == 403)
         revalidate("management credential rejected");
+    memset(buffer, 0, 16384); /* the reply may have carried a Wi-Fi password */
     free(buffer);
 }
 
@@ -2438,23 +3041,11 @@ static void independent_control_loop(void)
     }
 }
 #if CONFIG_PET_POCKET_TERMINAL
-/* ---- Pocket Terminal: three installed pets --------------------------------
- * The pet on screen comes from local flash at boot, before Wi-Fi, enrollment
- * or cloud, and a swipe shows the next installed pet. A pet is shown from a
- * RAM copy of its slot, hashed against its record as it is copied
- * (pet_slot_store.h); its frames are validated again only when this
- * firmware's validator is newer than the one that proved them.
- *
- * Once paired, the v2 pet worker runs unchanged on the inventory's
- * `operation` (the three-slot contract): a website installation writes the
- * inventory's target, a slot neither on screen nor bound, and its activation
- * shows and binds the new pet. Only the bound pet talks, and only while it is
- * on screen. Another pet the owner swipes to stays on screen offline, and once
- * the swipe settles the device asks the cloud to select it: a signed cloud
- * pet the cloud accepts becomes the bound pet and talks with its own voice
- * and memory. The firmware worker polls and reports this device, but reports
- * its installed pets as unprotected, so no firmware update is accepted until
- * OTA protection covers every slot. */
+/* ---- Pocket Terminal: one installed pet -----------------------------------
+ * Boot hashes the pack through driver reads, then keeps runtime metadata,
+ * speech and immediate reactions in RAM. Optional animation windows load on
+ * the media task. Every binding is detached and that worker drained before
+ * the shared buffer or its flash source can change. */
 #define SELECTION_SETTLE_US 1000000
 static int64_t s_selection_save_at;
 static uint8_t s_swipe_sound;
@@ -2474,10 +3065,9 @@ static bool s_select_authenticated;
  * again only once the pet on screen or the cloud's binding has changed. A
  * swipe always asks. */
 static char s_select_refused_build[37], s_select_refused_revision[81];
-/* The copy the pet on screen is drawn from: one slot's capacity in PSRAM,
- * allocated once, so showing any installed pet never needs a new allocation. */
+/* One fixed resident/cache buffer, shared with story events in its unused tail. */
 static uint8_t *s_shown_pack;
-/* The slot whose verified bytes the copy holds; -1 while it holds anything else. */
+/* The slot whose verified source the buffer holds; -1 while detached. */
 static int s_copy_slot = -1;
 static bool s_pocket_boot_healthy;
 
@@ -2508,23 +3098,59 @@ static bool pocket_inventory_writable(void)
         return false;
     return !s_pet || !s_pet->cloud.has_operation || s_pet->cloud.operation.phase == PET_CLOUD_QUEUED;
 }
-/* Newer validator rules than the ones that proved this pack: check it once. */
-static bool revalidate_slot(unsigned slot, const void *pack, size_t bytes)
+/* fp_stream_open already proved the new revision, including residency. */
+static void record_validation(unsigned slot)
 {
-    fp_pack_info_t info = {0};
-    fp_error_t result = pet_face_pack_validate(pack, (uint32_t)bytes, &info);
-    if (result != FP_OK || !info.approved)
-    {
-        ESP_LOGE(TAG, "pet slot %u fails validator %u: %s", slot, FP_VALIDATOR_REVISION,
-                 result == FP_OK ? "unapproved" : fp_error_string(result));
-        return false;
-    }
+    if (s_slots.inventory.state.slots[slot].validator_revision == FP_VALIDATOR_REVISION) return;
     pet_slot_inventory_t next = s_slots.inventory.state;
     next.slots[slot].validator_revision = FP_VALIDATOR_REVISION;
-    /* The proof holds for this boot even when it cannot be recorded now. */
     if (!pocket_inventory_writable() || pet_slot_store_commit(&s_slots, &next) != ESP_OK)
         ESP_LOGW(TAG, "pet slot %u validator revision not recorded", slot);
+}
+
+static uint32_t story_reserve(void)
+{
+    return PET_STORY_EVENT_BYTES + fp_validation_workspace_size();
+}
+
+static bool prepare_stream(const pet_pack_verified_manifest_t *manifest, bool imported)
+{
+    const fp_pack_info_t *info = fp_stream_info(s_stream);
+    const fp_pack_source_t *source = fp_stream_source(s_stream);
+    if (!manifest || !info || !info->approved || info->pack_bytes != manifest->bytes ||
+        !pet_face_id_matches(manifest->face_id, info->id, info->id_len, imported) ||
+        info->version_len != strlen(manifest->version) || memcmp(info->version, manifest->version, info->version_len))
+        return false;
+    s_prepared[0] = (prepared_t){.bytes = source->spans[0].bytes,
+                                 .length = source->bytes,
+                                 .manifest = *manifest,
+                                 .source = source,
+                                 .info = *info,
+                                 .gender = info->gender < PET_FACE_GENDER_COUNT ? (pet_face_gender_t)info->gender
+                                                                                : PET_FACE_GENDER_NEUTRAL};
     return true;
+}
+
+/* Display detached first; never wait for flash while holding its lock. */
+static void drain_stream(void)
+{
+    fp_stream_cancel(s_stream);
+    xSemaphoreTake(s_media_lock, portMAX_DELAY);
+    s_stream = NULL;
+    xSemaphoreGive(s_media_lock);
+}
+
+static void media_task(void *unused)
+{
+    (void)unused;
+    for (;;)
+    {
+        xSemaphoreTake(s_media_lock, portMAX_DELAY);
+        if (fp_stream_step(s_stream) < 0) atomic_store(&s_runtime_fault, true);
+        xSemaphoreGive(s_media_lock);
+        pet_atmosphere_prepare();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
 /* "Lavender dragon" -> "LAVENDER_DRAGON": the pet's name as a terminal host. */
 static void terminal_name(const uint8_t *name, size_t length, char *out, size_t capacity)
@@ -2537,7 +3163,7 @@ static void terminal_name(const uint8_t *name, size_t length, char *out, size_t 
     }
     out[n] = 0;
 }
-/* The copy is about to hold another pet: the one it holds stops talking and
+/* The buffer is about to hold another pet: the one it holds stops talking and
  * nothing draws from it until the next binding. The screen keeps its last
  * frame meanwhile. */
 static bool hold_shown(bool keep_session)
@@ -2552,10 +3178,13 @@ static bool hold_shown(bool keep_session)
     bool held = pet_display_lock(-1) == ESP_OK;
     if (held)
     {
-        pet_face_pack_hold_external();
+        pet_face_pack_hold_external(); /* It ends a story event on screen. */
         pet_display_unlock();
+        drain_stream();
         memset(&s_prepared[0], 0, sizeof(s_prepared[0]));
         s_copy_slot = -1;
+        /* Story events' packs live in the copy's tail: they go with it. */
+        pet_story_events_region(NULL, 0);
     }
     xSemaphoreGive(s_audio_lock);
     return held;
@@ -2563,33 +3192,34 @@ static bool hold_shown(bool keep_session)
 /* Show an installed pet, without network. Control task only. */
 static bool show_slot(unsigned slot, bool keep_session)
 {
-    const void *pack = s_shown_pack;
-    size_t bytes = 0;
-    fp_pack_info_t info = {0};
-    if (!pack || !hold_shown(keep_session))
-        return false;
+    if (!s_shown_pack || !hold_shown(keep_session)) return false;
     int64_t started = esp_timer_get_time();
-    esp_err_t loaded = pet_slot_store_load(&s_slots, slot, s_shown_pack, PET_LAYOUT_THREE_SLOT_PACK_BYTES, &bytes);
+    fp_stream_t *stream = NULL;
+    esp_err_t loaded =
+        pet_slot_store_stream(&s_slots, slot, false, s_shown_pack, PET_POCKET_BUFFER_BYTES, story_reserve(), &stream);
     if (loaded != ESP_OK)
     {
         ESP_LOGE(TAG, "pet slot %u not shown: %s", slot, esp_err_to_name(loaded));
         return false;
     }
-    ESP_LOGI(TAG, "pet slot %u copied and hashed: %u bytes in %lld ms", slot, (unsigned)bytes,
-             (long long)((esp_timer_get_time() - started) / 1000));
-    (void)started; /* Only logged. */
-    s_copy_slot = (int)slot;
-    if (s_slots.inventory.state.slots[slot].validator_revision != FP_VALIDATOR_REVISION &&
-        !revalidate_slot(slot, pack, bytes))
-        return false;
-    pet_pack_verified_manifest_t manifest = {.bytes = (uint32_t)bytes};
-    if (fp_inspect_prevalidated(pack, (uint32_t)bytes, &info) != FP_OK || info.id_len >= PET_FACE_ID_MAX ||
-        info.version_len >= sizeof(manifest.version))
-        return false;
+    fp_pack_info_t info = *fp_stream_info(stream);
+    pet_pack_verified_manifest_t manifest = {.bytes = info.pack_bytes};
+    if (!info.approved || info.id_len >= PET_FACE_ID_MAX || info.version_len >= sizeof(manifest.version)) return false;
     memcpy(manifest.face_id, info.id, info.id_len);
     memcpy(manifest.version, info.version, info.version_len);
-    if (!prepare_pack(0, pack, bytes, &manifest, true, false))
+    xSemaphoreTake(s_media_lock, portMAX_DELAY);
+    s_stream = stream;
+    xSemaphoreGive(s_media_lock);
+    if (!prepare_stream(&manifest, false))
+    {
+        drain_stream();
         return false;
+    }
+    record_validation(slot);
+    s_copy_slot = (int)slot;
+    ESP_LOGI(TAG, "pet slot %u hashed: %lu bytes, resident %lu in %lld ms", slot, (unsigned long)info.pack_bytes,
+             (unsigned long)fp_stream_resident_bytes(stream), (long long)((esp_timer_get_time() - started) / 1000));
+    (void)started;
     /* A waiting tap reads the name on the audio task. */
     xSemaphoreTake(s_audio_lock, portMAX_DELAY);
     terminal_name(info.name, info.name_len, s_shown_name, sizeof(s_shown_name));
@@ -2599,12 +3229,17 @@ static bool show_slot(unsigned slot, bool keep_session)
     if (!activate(NULL, 0, &context, false))
     {
         ESP_LOGE(TAG, "pet slot %u did not start", slot);
+        hold_shown(false);
         return false;
     }
     /* An installed pet is at home without a network: it idles, and only the
      * connection indicator reflects being offline. */
     pet_face_set_state(PET_FACE_IDLE);
     s_shown_slot = (int)slot;
+    /* The copy's unused tail holds story events' packs (pet_story_events.h). */
+    uint32_t tail_bytes = 0;
+    void *tail = fp_stream_tail(s_stream, &tail_bytes);
+    pet_story_events_region(tail, tail_bytes);
     atomic_store(&s_runtime_fault, false);
     pet_battery_set_enabled(false);
     pet_face_show();
@@ -2625,6 +3260,7 @@ static bool persist_selection(void)
 }
 static void pocket_show_active(void)
 {
+    if (s_stream && !hold_shown(false)) return;
     esp_err_t opened = pet_slot_store_open(&s_slots);
     if (opened != ESP_OK)
     {
@@ -2634,7 +3270,7 @@ static void pocket_show_active(void)
     }
     if (!s_shown_pack)
         s_shown_pack =
-            heap_caps_aligned_alloc(16, PET_LAYOUT_THREE_SLOT_PACK_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            heap_caps_aligned_alloc(16, PET_POCKET_BUFFER_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_shown_pack)
     {
         ESP_LOGE(TAG, "no PSRAM for the pet on screen");
@@ -2734,30 +3370,8 @@ static pet_fw_storage_t pocket_health(void *unused)
             return PET_FW_STORAGE_RECOVERY;
     return PET_FW_STORAGE_SETUP;
 }
-/* A pet drawn with audio this boot, latched by pocket_tick: the open menu can
- * cover the pet screen, not undo that proof. */
-static bool s_pet_drawn;
-/* New firmware proves itself before the updater confirms it and so ends the
- * automatic rollback: with any pet installed, one must have been drawn with
- * audio and the runtime must not have faulted. A live UI is still required.
- * Only a store whose sole occupied slot is mid-installation is recovery. */
-static pet_fw_storage_t pocket_firmware_health(void *unused)
-{
-    pet_fw_storage_t health = pocket_health(unused);
-    if (health == PET_FW_STORAGE_NONE)
-        return health;
-    if (health == PET_FW_STORAGE_PACK || s_pet_drawn)
-        return atomic_load(&s_runtime_fault) ? PET_FW_STORAGE_NONE : PET_FW_STORAGE_PACK;
-    if (!s_slots.open || !s_slots.inventory.ready)
-        return PET_FW_STORAGE_NONE;
-    for (unsigned i = 0; i < PET_SLOT_COUNT; i++)
-        if (s_slots.inventory.state.slots[i].state == PET_SLOT_READY)
-            return PET_FW_STORAGE_NONE;
-    return health;
-}
-/* Every slot, each proved by its signed record (pet_slot_protection.h). A pet
- * placed over USB has none: protection stays unknown and firmware updates
- * are refused until a cloud installation replaces that pet. The last
+/* The pet is proved by its signed record (pet_slot_protection.h). A pet
+ * placed over USB has none, so its reported protection stays unknown. The last
  * successful proof answers until the inventory, account or partition table
  * changes; flash actions ask for a fresh one. */
 static pet_firmware_protection_t s_protection;
@@ -2786,7 +3400,7 @@ static void pocket_protection(void *unused, bool fresh, pet_firmware_protection_
     strlcpy(s_protection_account, account, sizeof(s_protection_account));
     strlcpy(s_protection_partition, s_slots.partition_sha256, sizeof(s_protection_partition));
 }
-/* As single_compatible, on the three-pet layout. */
+/* A current authenticated capability poll and the exact physical USB layout. */
 static bool pocket_compatible(void *unused, const pet_release_v2_t *release)
 {
     (void)unused;
@@ -2794,19 +3408,20 @@ static bool pocket_compatible(void *unused, const pet_release_v2_t *release)
     if (!s_firmware || !s_firmware->authenticated || !s_firmware->next_poll_ms || now >= s_firmware->next_poll_ms ||
         !pet_setup_control_ready() || !pet_network_wifi_is_ready() || !atomic_load(&s_identity_ready))
         return false;
-    pet_firmware_boot_state_t boot;
-    if (!s_slots.open || !CONFIG_PET_VNEXT_FIRMWARE_EPOCH || !pet_firmware_image_bootloader_matches(&s_boot_profile) ||
-        !pet_firmware_image_boot_state(&boot) ||
-        !pet_ota_selection_is(&boot.selection, boot.running_slot, PET_OTA_STATE_VALID) ||
-        boot.layout.id != s_slots.layout.id || strcmp(boot.partition_sha256, s_slots.partition_sha256))
+    pet_flash_layout_t layout;
+    char partition_sha256[65];
+    if (!s_slots.open || !release || release->pack.bytes > PET_POCKET_MAX_PACK_BYTES ||
+        !CONFIG_PET_VNEXT_FIRMWARE_EPOCH || pet_flash_layout_read(&layout, partition_sha256) != ESP_OK ||
+        layout.id != PET_LAYOUT_ONE_10M || layout.id != s_slots.layout.id ||
+        strcmp(partition_sha256, s_slots.partition_sha256))
         return false;
-    pet_firmware_requirements_t observed = {.layout = boot.layout,
+    pet_firmware_requirements_t observed = {.layout = layout,
                                             .firmware_epoch = CONFIG_PET_VNEXT_FIRMWARE_EPOCH,
                                             .formats = 6,
                                             .codecs = 0xff,
                                             .imported_release = true,
                                             .bootloader = s_boot_profile};
-    strcpy(observed.partition_sha256, boot.partition_sha256);
+    strcpy(observed.partition_sha256, partition_sha256);
     if (!pet_release_v2_compatible(release, &observed))
         return false;
     const pet_replace_pack_t *replacement = release->has_replacement_target ? &release->replacement_target : NULL;
@@ -2820,30 +3435,24 @@ static bool pocket_compatible(void *unused, const pet_release_v2_t *release)
     }
     return true;
 }
-/* A downloaded pet is checked in the copy the screen draws from, never from
- * flash (pet_slot_store.h). The pet on screen holds its frame meanwhile and is
- * copied back afterwards. */
+/* Install proof uses bounded driver reads and the same resident budget as
+ * boot. No renderer or media worker can reach the target while it is proved. */
 static bool pocket_verify(void *unused, const pet_release_v2_t *release)
 {
     (void)unused;
-    if (!s_shown_pack || !pocket_compatible(NULL, release))
-        return false;
-    int shown = s_shown_slot;
-    size_t bytes = 0;
+    if (!s_shown_pack || !pocket_compatible(NULL, release) || !hold_shown(false)) return false;
+    fp_stream_t *stream = NULL;
     bool ok = false;
-    if (!hold_shown(false))
-        return false;
-    if (pet_slot_store_load_target(&s_slots, s_shown_pack, PET_LAYOUT_THREE_SLOT_PACK_BYTES, &bytes) == ESP_OK)
+    int target = s_slots.inventory.state.target;
+    if (target >= 0 && pet_slot_store_stream(&s_slots, (unsigned)target, true, s_shown_pack, PET_POCKET_BUFFER_BYTES,
+                                             story_reserve(), &stream) == ESP_OK)
     {
-        uint32_t size = fp_validation_workspace_size();
-        void *workspace = heap_caps_aligned_alloc(16, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        ok = workspace && pet_release_v2_validate_pack(release, s_shown_pack, bytes, workspace, size, NULL);
-        heap_caps_free(workspace);
+        uint32_t scratch_bytes = 0;
+        void *scratch = fp_stream_tail(stream, &scratch_bytes);
+        ok = pet_release_v2_validate_source(release, fp_stream_source(stream), fp_stream_info(stream), scratch,
+                                            scratch_bytes);
     }
-    if (!ok)
-        ESP_LOGE(TAG, "downloaded pet failed verification");
-    if (shown >= 0 && !show_slot((unsigned)shown, false))
-        ESP_LOGE(TAG, "pet slot %d could not return after verification", shown);
+    if (!ok) ESP_LOGE(TAG, "downloaded pet failed verification");
     return ok;
 }
 /* The cloud's binding is the conversation. It talks only on screen: after an
@@ -2878,15 +3487,13 @@ static bool pocket_activate(void *unused, const pet_control_context_t *cloud)
         return true;
     if ((s_shown_slot != bound || s_copy_slot != bound) && !show_slot((unsigned)bound, true))
         return false;
-    /* The copy was hashed against the slot's record, which holds this release. */
+    /* The source was hashed against the slot's record, which holds this release. */
     pet_pack_verified_manifest_t manifest = {.bytes = release.pack.bytes};
     strcpy(manifest.account_id, release.account_id);
     strcpy(manifest.project_id, release.project_id);
     strcpy(manifest.face_id, release.face_id);
     strcpy(manifest.version, release.version);
-    if (!prepare_pack(0, s_shown_pack, release.pack.bytes, &manifest, true, release.imported) ||
-        !activate(NULL, 0, cloud, true))
-        return false;
+    if (!prepare_stream(&manifest, release.imported) || !activate(NULL, 0, cloud, true)) return false;
     atomic_store(&s_runtime_fault, false);
     pet_battery_set_enabled(false);
     pet_face_show();
@@ -2917,9 +3524,7 @@ static bool pocket_unlinked(unsigned slot)
            !strcmp(s_select_refused_build, s_slots.inventory.state.slots[slot].pack.build_id) &&
            !strcmp(s_select_refused_revision, s_pet->cloud.context.binding.revision);
 }
-/* Before the installer writes its target, nothing may hold that slot. The
- * screen only holds a copy, of another pet; if the owner swiped to the pet
- * being replaced, the inventory's own choice shows instead. */
+/* Before writing the target, detach its renderer and drain its flash reader. */
 static bool pocket_detach(void *unused)
 {
     (void)unused;
@@ -2927,8 +3532,7 @@ static bool pocket_detach(void *unused)
     int target = inventory->target;
     if (target < 0)
         return false;
-    if (target != s_shown_slot)
-        return true;
+    if (target != s_shown_slot && !s_stream) return true;
     s_selection_save_at = 0;
     if (inventory->active >= 0 && inventory->active != target && show_slot((unsigned)inventory->active, false))
         return true;
@@ -2977,7 +3581,7 @@ static bool pocket_remove(void *unused, const pet_replace_pack_t *pack)
         s_select_moment = SELECT_AFTER_SWIPE;
         return true;
     }
-    freeze(NULL);
+    if (!hold_shown(false)) return false;
     xSemaphoreTake(s_audio_lock, portMAX_DELAY);
     bool detached = pet_display_lock(-1) == ESP_OK;
     if (detached)
@@ -3095,7 +3699,7 @@ static void pocket_start_workers(pet_firmware_control_config_t *firmware, pet_re
     if (!s_firmware)
     {
         s_firmware = heap_caps_calloc(1, sizeof(*s_firmware), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (s_firmware && !pet_firmware_control_init(s_firmware, firmware, &s_fw_receipt))
+        if (s_firmware && !pet_firmware_control_init(s_firmware, firmware, NULL))
         {
             free(s_firmware);
             s_firmware = NULL;
@@ -3114,9 +3718,8 @@ static void pocket_start_workers(pet_firmware_control_config_t *firmware, pet_re
 /* The workers' configuration; they start once the device is paired. */
 static pet_firmware_control_config_t s_pocket_firmware;
 static pet_replace_control_config_t s_pocket_pet;
-static int64_t s_pocket_next_status, s_pocket_next_allocate, s_pocket_next_reopen, s_pocket_next_store_reopen;
-/* A failed journal write leaves the store refusing commits: reopen it as
- * single_reopen does. The pet on screen is a RAM copy and keeps showing. */
+static int64_t s_pocket_next_status, s_pocket_next_allocate, s_pocket_next_store_reopen;
+/* Reopen only after all readers of the store and its source context drain. */
 static bool pocket_reopen(void)
 {
     if (!pet_runtime_owns(&s_resources, PET_RESOURCE_CONTROL))
@@ -3127,27 +3730,37 @@ static bool pocket_reopen(void)
         s_pet->manifest_ready = s_pet->verified = false;
         s_pet->next_poll_ms = 0;
     }
+    int shown = s_shown_slot;
+    if (!hold_shown(false)) return false;
     const pet_slot_readers_t readers = {.freeze = freeze, .detach = pocket_detach};
     bool ok = pet_slot_store_open(&s_slots) == ESP_OK && pet_slot_store_attach_installer(&s_slots, &readers) == ESP_OK;
     if (s_firmware)
         s_firmware->next_poll_ms = 0;
+    if (ok && shown >= 0 && s_slots.inventory.state.slots[shown].state == PET_SLOT_READY)
+        ok = show_slot((unsigned)shown, false);
     return ok;
+}
+/* The dedicated sound bank is downloaded between pet installations. */
+static bool pocket_bank_writable(void)
+{
+    const pet_slot_inventory_t *inventory = &s_slots.inventory.state;
+    return s_slots.open && s_slots.inventory.ready && s_pet && !s_pet->cloud.has_operation && inventory->target < 0 &&
+           !pet_firmware_control_blocks_pet(s_firmware);
 }
 static void pocket_control_start(void)
 {
     pocket_show_active();
+    pet_sound_bank_open(s_slots.open);
     /* Each worker pass claims control itself (independent_updates). */
     const pet_slot_readers_t readers = {.freeze = freeze, .detach = pocket_detach};
     if (s_slots.open && pet_slot_store_attach_installer(&s_slots, &readers) != ESP_OK)
         ESP_LOGE(TAG, "pet installer did not start");
-    pet_firmware_receipt_open_nvs(&s_fw_receipt); /* Failure must not stop the pets or networking. */
     s_pocket_firmware = (pet_firmware_control_config_t){.http = {s_origin, s_id, s_credential},
                                                         .keys = &s_trust,
                                                         .key_count = s_trust_count,
                                                         .firmware_epoch = CONFIG_PET_VNEXT_FIRMWARE_EPOCH,
                                                         .bootloader = s_boot_profile,
                                                         .protection = pocket_protection,
-                                                        .health = pocket_firmware_health,
                                                         .freeze = freeze,
                                                         .restart = firmware_restart,
                                                         .now_ms = firmware_now_ms};
@@ -3165,23 +3778,15 @@ static void pocket_control_start(void)
                                                   .now_ms = firmware_now_ms};
     strcpy(s_pocket_pet.boot_id, s_pocket_firmware.boot_id);
     s_pocket_next_status = s_pocket_next_allocate = 0;
-    s_pocket_next_reopen = s_pocket_next_store_reopen = 15000000;
+    s_pocket_next_store_reopen = 15000000;
 }
 /* One pass of the control task, between commands. */
 static void pocket_tick(int64_t now)
 {
-    independent_health_guard();
-    if (!s_pet_drawn && s_shown_slot >= 0 && s_audio_started && pet_face_pack_ready())
-        s_pet_drawn = true;
     if (atomic_load(&s_identity_ready) && now >= s_pocket_next_allocate)
     {
         pocket_start_workers(&s_pocket_firmware, &s_pocket_pet);
         s_pocket_next_allocate = now + 15000000;
-    }
-    if (!s_fw_receipt.loaded && now >= s_pocket_next_reopen)
-    {
-        pet_firmware_receipt_open_nvs(&s_fw_receipt);
-        s_pocket_next_reopen = now + 15000000;
     }
     /* A swipe is saved once it settles, and at once before a queued
      * installation picks its target, so the target is never the pet on screen.
@@ -3218,6 +3823,16 @@ static void pocket_tick(int64_t now)
         s_select_moment = SELECT_AFTER_RECONNECT;
     s_select_authenticated = authenticated;
     pocket_select((uint64_t)now / 1000);
+    /* Story events' animations download between turns, without holding
+     * control: a tap listens at once. So does the sound bank, when no event
+     * is due. */
+    if (atomic_load(&s_identity_ready) && pet_setup_control_ready() && pet_network_wifi_is_ready() &&
+        !atomic_load(&s_turn_active) && !pet_audio_is_playing() && !pet_audio_is_capturing())
+    {
+        const pet_control_http_t http = {.origin = s_origin, .device_id = s_id, .credential = s_credential};
+        if (!pet_story_events_step(&http, (uint64_t)now / 1000) && pocket_bank_writable())
+            pet_sound_bank_step(&http, s_pet->chunk, sizeof(s_pet->chunk), (uint64_t)now / 1000);
+    }
     if (now >= s_pocket_next_status)
     {
         if (!atomic_load(&s_identity_ready) && pet_setup_identity(s_id, s_credential))
@@ -3233,7 +3848,7 @@ static void pocket_command(control_command_t *command)
 {
     if (command->kind == CONTROL_SWITCH)
     {
-        /* The latest swipe: those made since this command was queued replaced it. */
+        /* The latest switch: those asked for since this command was queued replaced it. */
         int direction = atomic_exchange(&s_swipe, 0);
         if (direction)
             pocket_switch(direction);
@@ -3256,6 +3871,11 @@ static void pocket_command(control_command_t *command)
         if (pet_config_store_brightness(command->value) != ESP_OK)
             ESP_LOGW(TAG, "brightness not saved");
     }
+    else if (command->kind == CONTROL_KEEP_STYLE)
+    {
+        if (pet_config_store_menu_style(command->value) != ESP_OK)
+            ESP_LOGW(TAG, "menu style not saved");
+    }
     else if (command->kind == CONTROL_RESTART)
     {
         persist_selection();
@@ -3273,7 +3893,7 @@ static void pocket_command(control_command_t *command)
     }
     else if (command->kind == CONTROL_OTA)
     {
-        pet_network_ota_status(command->ota->release_id, "failed", 0, "OTA_V2_REQUIRED");
+        pet_network_ota_status(command->ota->release_id, "failed", 0, "FIRMWARE_UPDATE_USB_REQUIRED");
         pet_enrollment_clear(command->ota, sizeof(*command->ota));
         free(command->ota);
     }
@@ -3511,6 +4131,8 @@ esp_err_t pet_vnext_start(const pet_config_t *wifi, const char *origin)
             s_trust_count = 1;
     }
 #if CONFIG_PET_POCKET_TERMINAL
+    if (!pet_story_events_init(pet_network_story_event_ended))
+        ESP_LOGW(TAG, "no PSRAM for story events: they stay narration");
     atomic_store(&s_volume_now, s_wifi.volume <= 100 ? s_wifi.volume : 100);
     atomic_store(&s_brightness_now, s_wifi.brightness < PET_BRIGHTNESS_MIN ? PET_BRIGHTNESS_MIN
                                     : s_wifi.brightness > 100              ? 100
@@ -3520,6 +4142,10 @@ esp_err_t pet_vnext_start(const pet_config_t *wifi, const char *origin)
     s_commands = xQueueCreate(8, sizeof(control_command_t));
     s_audio_events = xQueueCreate(16, sizeof(audio_event_t));
     s_audio_lock = xSemaphoreCreateMutex();
+#if CONFIG_PET_POCKET_TERMINAL
+    s_media_lock = xSemaphoreCreateMutex();
+    if (!s_media_lock) return ESP_ERR_NO_MEM;
+#endif
     if (!s_commands || !s_audio_events || !s_audio_lock)
         return ESP_ERR_NO_MEM;
     const pet_onboarding_control_t controls = {
@@ -3528,9 +4154,14 @@ esp_err_t pet_vnext_start(const pet_config_t *wifi, const char *origin)
         .return_to_pet = return_requested,
         .retry_sync = retry_requested,
         .restart = restart_requested,
+        .join_wifi = join_wifi_requested,
 #if CONFIG_PET_POCKET_TERMINAL
         .volume = volume_requested,
         .brightness = brightness_requested,
+        .switch_pet = switch_requested,
+        .story = pet_network_story_request,
+        .use_blessing = blessing_requested,
+        .style = style_requested,
 #endif
     };
     pet_onboarding_bind_control(&controls);
@@ -3540,6 +4171,7 @@ esp_err_t pet_vnext_start(const pet_config_t *wifi, const char *origin)
     const pet_network_callbacks_t management = {
         .config_v2_received = config_received,
         .speech_preference_received = speech_received,
+        .wifi_admin_received = wifi_received,
     };
     result = pet_network_start_management(&management);
     if (result != ESP_OK)
@@ -3565,8 +4197,16 @@ esp_err_t pet_vnext_start(const pet_config_t *wifi, const char *origin)
         pet_battery_set_enabled(true);
     if (pet_diagnostics_start(recover) != ESP_OK)
         return ESP_FAIL;
+#if CONFIG_PET_POCKET_TERMINAL
+    if (xTaskCreate(media_task, "pet_media", 4096, NULL, 2, NULL) != pdPASS) return ESP_ERR_NO_MEM;
+#endif
     if (xTaskCreate(audio_task, "pet_vnext_audio", 8192, NULL, 5, NULL) != pdPASS ||
         xTaskCreate(control_task, "pet_vnext_sync", 24576, NULL, 3, NULL) != pdPASS)
         return ESP_ERR_NO_MEM;
+#if CONFIG_PET_POCKET_TERMINAL
+    /* Without it the screen still talks. */
+    if (start_talk_button() != ESP_OK)
+        ESP_LOGW(TAG, "talk button unavailable");
+#endif
     return ESP_OK;
 }

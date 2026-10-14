@@ -52,6 +52,11 @@ static bool parse(const cJSON *root, pet_usb_wifi_request_t *out)
         out->action = PET_USB_WIFI_SAVED;
         return cJSON_GetArraySize(root) == 5;
     }
+    if (!strcmp(action, "forget"))
+    {
+        out->action = PET_USB_WIFI_FORGET;
+        return cJSON_GetArraySize(root) == 5;
+    }
     const char *password = string(root, "password");
     if (strcmp(action, "save") || cJSON_GetArraySize(root) != 6 || !text_valid(password, 64, true)) return false;
     size_t length = strlen(password);

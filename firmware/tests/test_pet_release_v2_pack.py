@@ -11,7 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 MBED = Path(os.environ.get("IDF_PATH", "")) / "components/mbedtls/mbedtls"
 
 
-def minimal_pack(canvas=240, codec=5, approved=True, bad_resource=False, pet_id="big-sal", move=False):
+def minimal_pack(canvas=240, codec=5, approved=True, bad_resource=False, pet_id="big-sal", move=False,
+                 optional_frames=0):
     """Independent minimal format fixture, not production artwork/compiler. A
     move pack has no roles, talk table or idle section and plays 60 ticks once."""
     pack = bytearray(128)
@@ -24,33 +25,50 @@ def minimal_pack(canvas=240, codec=5, approved=True, bad_resource=False, pet_id=
     def dword(at, value):
         struct.pack_into("<I", pack, at, value)
     palette = append(b"\0\0\xff\xff")
-    frames = append(bytes(24))
-    clips = append(bytes(16))
-    steps = append(struct.pack("<HH", 0, 60 if move else 8))
-    roles = 0 if move else append(struct.pack("<8H", 0, *([65535] * 7)))
-    talk = 0 if move else append(bytes([1, 0, 0, 0]) + bytes(108))
-    idle = 0 if move else append(bytes(16))
-    identity = pet_id.encode("ascii")
-    assert 1 <= len(identity) <= 64
-    strings = append(identity + b"Examplefixture-240-v2idle")
+    frames = append(bytes(12 * (2 + optional_frames)))
     raw = bytes(canvas * canvas)
     encoded = zlib.compress(raw) if codec == 5 else raw
     first = append(encoded)
     # Even an unreachable second frame must pass structural/frame decoding.
     second = append(zlib.compress(bytes([3 if bad_resource else 1]) * (canvas * canvas)) if codec == 5
                     else bytes([3 if bad_resource else 1]) * (canvas * canvas))
+    payload_end = len(pack)
+    optional = [append(bytes([i % 2]) * (canvas * canvas)) for i in range(optional_frames)]
+    clips = append(bytes(16 * (2 if optional_frames else 1)))
+    steps = append(struct.pack("<HH", 0, 60 if move else 8))
+    optional_steps = append(b"".join(struct.pack("<HH", i + 2, 4) for i in range(optional_frames)))
+    roles = 0 if move else append(struct.pack("<8H", 0, *([65535] * 7)))
+    talk = 0 if move else append(bytes([1, 0, 0, 0]) + bytes(108))
+    idle = 0 if move else append(bytes(16))
+    if optional_frames:
+        word(idle + 4, 1)
+        word(idle + 6, 2)
+        dword(idle + 8, append(struct.pack("<HH", 1, 1)))
+        word(idle + 12, 1)
+    identity = pet_id.encode("ascii")
+    assert 1 <= len(identity) <= 64
+    strings = append(identity + b"Examplefixture-240-v2idle")
     for index, offset in enumerate([first, second]):
         dword(frames + index*12, offset)
-        dword(frames + index*12 + 4, (second-first) if index == 0 else len(pack)-second)
+        dword(frames + index*12 + 4, (second-first) if index == 0 else payload_end-second)
         pack[frames + index*12 + 8] = codec
     dword(clips, strings + len(identity) + 21)
     word(clips + 4, 4)
     pack[clips + 6] = 0 if move else 2
     dword(clips + 8, steps)
     word(clips + 12, 1)
+    for i, offset in enumerate(optional):
+        dword(frames + (i + 2) * 12, offset)
+        dword(frames + (i + 2) * 12 + 4, canvas * canvas)
+    if optional_frames:
+        dword(clips + 16, strings + len(identity) + 21)
+        word(clips + 20, 4)
+        dword(clips + 24, optional_steps)
+        word(clips + 28, optional_frames)
     pack[:8] = b"AIPFRAME"
     for offset, value in [(8, 2 if canvas == 240 else 1), (10, 128), (12, canvas), (14, canvas),
-                          (28, int(approved) | (64 if move else 0)), (30, 33), (36, 2), (44, 2), (46, 1),
+                          (28, int(approved) | (64 if move else 0)), (30, 33), (36, 2),
+                          (44, 2 + optional_frames), (46, 2 if optional_frames else 1),
                           (104, len(identity)), (106, 7), (108, 14)]:
         word(offset, value)
     for offset, value in [(16, len(pack)), (32, palette), (40, frames), (48, clips), (52, roles),
@@ -100,7 +118,9 @@ class PetReleaseV2PackTests(unittest.TestCase):
             check(minimal_pack(), True, True, 33)
             check(minimal_pack(bad_resource=True), False, False, 32)
             damaged = minimal_pack()
-            damaged[-1] ^= 1
+            frame_dir = struct.unpack_from("<I", damaged, 40)[0]
+            offset, length = struct.unpack_from("<II", damaged, frame_dir + 12)
+            damaged[offset + length - 1] ^= 1
             check(damaged, False, False, 32)
             # Even after repairing the outer CRC and expected hash, the zlib
             # checksum is validated for every resource.

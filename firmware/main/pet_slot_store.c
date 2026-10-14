@@ -8,10 +8,14 @@
 #include "pet_flash_layout_esp.h"
 
 /* A slot's install area: its pack area and, after it, its signed record. */
-#define SLOT_INSTALL_BYTES (PET_LAYOUT_THREE_SLOT_PACK_BYTES + PET_REPLACE_MANIFEST_BYTES)
+#define SLOT_INSTALL_BYTES (PET_LAYOUT_ONE_SLOT_PACK_BYTES + PET_REPLACE_MANIFEST_BYTES)
 
-/* A 3 MB copy is split into slices so it never holds a core for long. */
+/* Copies and streamed hashes yield between bounded flash-driver reads. */
 #define COPY_SLICE_BYTES 0x10000u
+/* A flash read into PSRAM borrows an internal buffer as large as the read, up
+ * to 16 KiB (esp_flash_read). Streamed reads stay small so TLS and audio, which
+ * need internal memory at the same moments, still find it. */
+#define STREAM_READ_BYTES 1024u
 
 static bool journal_read(void *context, unsigned sector, uint8_t *record)
 {
@@ -37,15 +41,16 @@ static bool journal_replace(void *context, unsigned sector, const uint8_t *recor
 /* `bytes` of the pet store at `offset`, copied through the flash driver (see
  * pet_slot_store_t) and hashed as they arrive. */
 static esp_err_t copy_verified(const pet_slot_store_t *s, uint32_t offset, size_t bytes, const char *expected,
-                               uint8_t *copy)
+                               uint8_t *copy, bool full_copy)
 {
     mbedtls_sha256_context sha;
     mbedtls_sha256_init(&sha);
     esp_err_t error = mbedtls_sha256_starts(&sha, 0) ? ESP_FAIL : ESP_OK;
     for (size_t at = 0; error == ESP_OK && at < bytes; at += COPY_SLICE_BYTES) {
         size_t length = bytes - at < COPY_SLICE_BYTES ? bytes - at : COPY_SLICE_BYTES;
-        error = esp_partition_read(s->store, offset + at, copy + at, length);
-        if (error == ESP_OK && mbedtls_sha256_update(&sha, copy + at, length)) error = ESP_FAIL;
+        uint8_t *piece = copy + (full_copy ? at : 0);
+        error = esp_partition_read(s->store, offset + at, piece, length);
+        if (error == ESP_OK && mbedtls_sha256_update(&sha, piece, length)) error = ESP_FAIL;
         vTaskDelay(1);
     }
     uint8_t digest[32];
@@ -63,7 +68,7 @@ esp_err_t pet_slot_store_open(pet_slot_store_t *s)
     memset(s, 0, sizeof(*s));
     esp_err_t error = pet_flash_layout_read(&s->layout, s->partition_sha256);
     if (error != ESP_OK) return error;
-    if (s->layout.id != PET_LAYOUT_THREE_3P5M || s->layout.pet_slots != PET_SLOT_COUNT) return ESP_ERR_INVALID_STATE;
+    if (s->layout.id != PET_LAYOUT_ONE_10M || s->layout.pet_slots != PET_SLOT_COUNT) return ESP_ERR_INVALID_STATE;
     s->journal = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x41, "pet_journal");
     s->store = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x43, "pet_store");
     if (!s->journal || !s->store || s->journal->address != s->layout.journal_offset || s->journal->size != 0x10000 ||
@@ -80,10 +85,10 @@ esp_err_t pet_slot_store_load(pet_slot_store_t *s, unsigned slot, void *buffer, 
     if (!s || !s->open || slot >= PET_SLOT_COUNT || !buffer || !bytes) return ESP_ERR_INVALID_ARG;
     const pet_slot_t *record = &s->inventory.state.slots[slot];
     uint32_t pack_offset = 0, manifest_offset = 0;
-    if (record->state != PET_SLOT_READY || !record->pack.bytes || record->pack.bytes > PET_LAYOUT_THREE_SLOT_PACK_BYTES ||
+    if (record->state != PET_SLOT_READY || !record->pack.bytes || record->pack.bytes > PET_POCKET_MAX_PACK_BYTES ||
         !pet_flash_layout_slot(&s->layout, slot, &pack_offset, &manifest_offset)) return ESP_ERR_INVALID_STATE;
     if (record->pack.bytes > capacity) return ESP_ERR_INVALID_SIZE;
-    esp_err_t error = copy_verified(s, pack_offset, record->pack.bytes, record->pack.sha256, buffer);
+    esp_err_t error = copy_verified(s, pack_offset, record->pack.bytes, record->pack.sha256, buffer, true);
     if (error == ESP_OK) *bytes = record->pack.bytes;
     return error;
 }
@@ -135,17 +140,20 @@ static pet_journal_result_t machine_commit(void *context, const pet_replace_t *n
 bool pet_slot_store_prepare_replacement(pet_slot_store_t *s, const pet_replace_pack_t *incoming,
                                         const pet_replace_pack_t *replacement)
 {
-    if (!s || !s->open || !s->inventory.ready || !incoming) return false;
+    if (!s || !s->open || !s->inventory.ready || !incoming ||
+        incoming->bytes > PET_POCKET_MAX_PACK_BYTES) return false;
     s->has_replacement_target = false;
-    if (!replacement) return true; /* Legacy/new-pet allocation is unchanged. */
     const pet_slot_inventory_t *inv = &s->inventory.state;
+    /* A new pet replaces the one in slot 0 (pet_slot_inventory_apply). */
+    if (!replacement)
+        return true;
     if (inv->target >= 0) {
         /* A retry uses its already durable slot, never a different recovery's. */
         const pet_replace_pack_t *pending = &inv->operation.target;
         return pending->bytes == incoming->bytes && !strcmp(pending->build_id,incoming->build_id) &&
             !strcmp(pending->sha256,incoming->sha256);
     }
-    if (pet_slot_inventory_find(inv,replacement) < 0) return false;
+    if (pet_slot_inventory_find(inv,replacement) != 0) return false;
     s->replacement_target = *replacement; s->replacement_incoming = *incoming;
     s->has_replacement_target = true;
     return true;
@@ -157,7 +165,7 @@ static bool target_offset(const pet_slot_store_t *s, uint32_t offset, size_t byt
     int target = s->inventory.state.target;
     uint32_t pack_offset = 0, record_offset = 0;
     if (target < 0 || !pet_flash_layout_slot(&s->layout, (unsigned)target, &pack_offset, &record_offset) ||
-        record_offset != pack_offset + PET_LAYOUT_THREE_SLOT_PACK_BYTES ||
+        record_offset != pack_offset + PET_LAYOUT_ONE_SLOT_PACK_BYTES ||
         offset > SLOT_INSTALL_BYTES || bytes > SLOT_INSTALL_BYTES - offset) return false;
     *at = (size_t)pack_offset + offset;
     return true;
@@ -223,12 +231,65 @@ esp_err_t pet_slot_store_load_target(pet_slot_store_t *s, void *buffer, size_t c
     bool complete = (m->phase == PET_REPLACE_DOWNLOADING && m->downloaded_bytes == m->target.bytes) ||
         m->phase == PET_REPLACE_VERIFIED || m->phase == PET_REPLACE_ACTIVATING;
     uint32_t pack_offset = 0, record_offset = 0;
-    if (target < 0 || !complete || !m->target.bytes || m->target.bytes > PET_LAYOUT_THREE_SLOT_PACK_BYTES ||
+    if (target < 0 || !complete || !m->target.bytes || m->target.bytes > PET_POCKET_MAX_PACK_BYTES ||
         !pet_flash_layout_slot(&s->layout, (unsigned)target, &pack_offset, &record_offset))
         return ESP_ERR_INVALID_STATE;
     if (m->target.bytes > capacity) return ESP_ERR_INVALID_SIZE;
     s->writer.detached = s->writer.resume_checked = false;
-    esp_err_t error = copy_verified(s, pack_offset, m->target.bytes, m->target.sha256, buffer);
+    esp_err_t error = copy_verified(s, pack_offset, m->target.bytes, m->target.sha256, buffer, true);
     if (error == ESP_OK) *bytes = m->target.bytes;
     return error;
+}
+
+static int source_read(void *context, uint32_t offset, void *out, uint32_t bytes)
+{
+    const pet_slot_source_t *source = context;
+    if (offset > source->bytes || bytes > source->bytes - offset) return 0;
+    for (uint32_t copied = 0; copied < bytes;)
+    {
+        uint32_t chunk = bytes - copied;
+        if (chunk > STREAM_READ_BYTES) chunk = STREAM_READ_BYTES;
+        if (esp_partition_read(source->partition, source->offset + offset + copied, (uint8_t *)out + copied, chunk) !=
+            ESP_OK)
+            return 0;
+        copied += chunk;
+        if (copied == bytes || copied % COPY_SLICE_BYTES == 0) vTaskDelay(1);
+    }
+    return 1;
+}
+
+esp_err_t pet_slot_store_stream(pet_slot_store_t *s, unsigned slot, bool target, void *buffer, uint32_t capacity,
+                                uint32_t minimum_tail, fp_stream_t **stream)
+{
+    if (stream) *stream = NULL;
+    if (!s || !s->open || slot >= PET_SLOT_COUNT || !buffer || capacity < COPY_SLICE_BYTES || !stream)
+        return ESP_ERR_INVALID_ARG;
+    const pet_slot_t *record = &s->inventory.state.slots[slot];
+    const pet_replace_pack_t *pack = &record->pack;
+    bool prove = record->validator_revision != FP_VALIDATOR_REVISION;
+    if (target)
+    {
+        const pet_replace_t *operation = &s->inventory.state.operation;
+        bool complete =
+            (operation->phase == PET_REPLACE_DOWNLOADING && operation->downloaded_bytes == operation->target.bytes) ||
+            operation->phase == PET_REPLACE_VERIFIED || operation->phase == PET_REPLACE_ACTIVATING;
+        if (!s->installer || !complete || s->inventory.state.target != (int)slot) return ESP_ERR_INVALID_STATE;
+        pack = &operation->target;
+        prove = true;
+        s->writer.detached = s->writer.resume_checked = false;
+    }
+    else if (record->state != PET_SLOT_READY)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint32_t offset = 0, manifest = 0;
+    if (!pack->bytes || pack->bytes > PET_POCKET_MAX_PACK_BYTES ||
+        !pet_flash_layout_slot(&s->layout, slot, &offset, &manifest))
+        return ESP_ERR_INVALID_STATE;
+    esp_err_t error = copy_verified(s, offset, pack->bytes, pack->sha256, buffer, false);
+    if (error != ESP_OK) return error;
+    s->source = (pet_slot_source_t){s->store, offset, pack->bytes};
+    fp_error_t checked =
+        fp_stream_open(buffer, capacity, pack->bytes, source_read, &s->source, prove, minimum_tail, stream);
+    return checked == FP_OK ? ESP_OK : checked == FP_ERR_ARENA ? ESP_ERR_NO_MEM : ESP_ERR_INVALID_CRC;
 }

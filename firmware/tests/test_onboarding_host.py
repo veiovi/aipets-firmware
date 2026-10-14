@@ -52,6 +52,7 @@ class OnboardingHostTests(unittest.TestCase):
                     "-I", str(ROOT / "main"),
                     str(ROOT / "tests/onboarding_host/ui_test.c"),
                     str(ROOT / "main/pet_enrollment.c"), str(ROOT / "main/pet_menu_font.c"),
+                    str(ROOT / "main/pet_menu_woodland_font.c"),
                     str(ROOT / "main/pet_menu_icons.c"), *objects, "-lm", "-o", str(binary)], check=True)
                 subprocess.run([str(binary)], check=True)
 

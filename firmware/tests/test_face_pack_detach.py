@@ -41,7 +41,7 @@ class FacePackDetachTests(unittest.TestCase):
                 "-I", str(ROOT / "components/face_core/include"), "-I", str(MBED / "include"), "-I", str(MBED / "library"),
                 str(ROOT / "tests/face_pack_host/pack_test.c"),
                 str(ROOT / "main/pet_face_expression.c"),
-                *[str(frame / "src" / p) for p in ["frame_player.c", "frame_director.c", "frame_actions.c", "frame_codec.c", "frame_display.c"]],
+                *[str(frame / "src" / p) for p in ["frame_player.c", "frame_director.c", "frame_actions.c", "frame_codec.c", "frame_display.c", "frame_stream.c"]],
                 str(frame / "vendor/miniz/miniz_tinfl.c"), str(MBED / "library/sha256.c"), str(MBED / "library/platform_util.c"),
                 *objects, "-lm", "-o", str(binary)], check=True)
             for canvas in (120, 240):
@@ -61,6 +61,11 @@ class FacePackDetachTests(unittest.TestCase):
                     result = subprocess.run([str(binaries["pocket"]), "luna", str(side), str(height)],
                         input=minimal_pack(canvas=240, codec=5, pet_id="luna"), capture_output=True)
                     self.assertEqual(result.returncode, 0, result.stderr.decode())
+            # A story event over the pet: the synthetic, unapproved fuzz seed, which idles in an ambient loop.
+            event = ROOT / "tests/fixtures/frame-player-fuzz/v2-features.aipetframes"
+            result = subprocess.run([str(binaries["pocket"]), "luna", "360", "360", str(event)],
+                input=minimal_pack(canvas=240, codec=5, pet_id="luna"), capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
 
 
 if __name__ == "__main__":

@@ -1,5 +1,8 @@
 #include "pet_firmware_image.h"
 #include <string.h>
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+#endif
 #include "esp_app_desc.h"
 #include "esp_flash.h"
 #include "esp_flash_encrypt.h"
@@ -10,11 +13,7 @@
 
 static bool security_supported(void)
 {
-#if CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
-    return !esp_flash_encryption_enabled()&&!esp_secure_boot_enabled();
-#else
-    return false; /* Never silently ship a dual-slot updater without rollback. */
-#endif
+    return !esp_flash_encryption_enabled() && !esp_secure_boot_enabled();
 }
 static bool application(const esp_partition_t *p,uint32_t app_size)
 {
@@ -43,7 +42,16 @@ static bool hash_image(const esp_partition_t *p,char hex[65],uint32_t *bytes,con
     esp_image_metadata_t metadata={0};
     const esp_partition_pos_t position={.offset=p->address,.size=p->size};
     esp_app_desc_t description;
-    if(esp_image_verify(ESP_IMAGE_VERIFY_SILENT,&position,&metadata)!=ESP_OK||!metadata.image.hash_appended||
+#if CONFIG_PET_POCKET_TERMINAL
+    /* The bootloader already verified the running factory app. Metadata
+     * reads only headers; esp_image_verify would map every segment, unsafe
+     * with PSRAM XIP during a concurrent settings write. Hash below uses
+     * only the serialized flash driver. */
+    esp_err_t inspected = esp_image_get_metadata(&position, &metadata);
+#else
+    esp_err_t inspected = esp_image_verify(ESP_IMAGE_VERIFY_SILENT, &position, &metadata);
+#endif
+    if(inspected!=ESP_OK||!metadata.image.hash_appended||
        !metadata.image_len||metadata.image_len>p->size||
        esp_ota_get_partition_description(p,&description)!=ESP_OK||
        !memchr(description.project_name,0,sizeof(description.project_name))||strcmp(description.project_name,"aipet_firmware")||
@@ -70,6 +78,9 @@ bool pet_firmware_image_running(char sha[65],uint32_t *bytes)
 bool pet_firmware_image_boot_state(pet_firmware_boot_state_t *out)
 {
     if(!out)return false;
+#if !CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+    return false; /* OTA layouts still require the qualified rollback bootloader. */
+#endif
     memset(out,0,sizeof(*out));out->selection.active=-1;
     pet_firmware_boot_state_t s={0};uint8_t raw[2][PET_OTA_RECORD_BYTES];
     if(!security_supported()||pet_flash_layout_read(&s.layout,s.partition_sha256)!=ESP_OK||s.layout.id<PET_LAYOUT_SINGLE_2M)return false;

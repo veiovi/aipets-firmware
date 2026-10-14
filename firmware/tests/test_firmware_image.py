@@ -11,9 +11,15 @@ MBED = Path(os.environ.get("IDF_PATH", "")) / "components/mbedtls/mbedtls"
 @unittest.skipUnless((MBED / "library/sha256.c").exists(), "Set IDF_PATH for pinned crypto")
 class FirmwareImageTests(unittest.TestCase):
     def test_inactive_slot_flash_adapter(self):
+        self._run(0)
+
+    def test_usb_running_hash_reads_without_image_mapping(self):
+        self._run(1)
+
+    def _run(self, pocket):
         with tempfile.TemporaryDirectory(prefix="pet-firmware-image-") as directory:
             binary = str(Path(directory) / "image")
-            subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
+            subprocess.run([os.environ.get("CC", "cc"), "-std=c11", f"-DCONFIG_PET_POCKET_TERMINAL={pocket}", "-Wall", "-Wextra", "-Werror",
                 "-fsanitize=address,undefined", '-DMBEDTLS_CONFIG_FILE="pet_test_mbedtls.h"',
                 "-DCONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=1", "-I", str(ROOT / "tests/firmware_host"),
                 "-I", str(ROOT / "tests/replacement_host"), "-I", str(ROOT / "tests/onboarding_host/include"),

@@ -59,6 +59,19 @@ bool pet_control_http_firmware_range(const pet_control_http_t *http,pet_control_
 bool pet_control_http_pet_range(const pet_control_http_t *http,pet_control_download_t *download,
                                  const char *operation_id,const char *sha256,uint32_t pack_bytes,
                                  uint32_t offset,void *response,size_t bytes,pet_control_http_result_t *result);
+/* Story events (story-event-v1): a range of the event pack with this sha256
+ * and size, at most 250 KiB, from /v2/device/story-events/<sha256> on the
+ * pinned origin, with the device's credential as a pet pack's. Each range
+ * uses a connection of its own; the cache asks for a whole pack at once. */
+bool pet_control_http_event_range(const pet_control_http_t *http, const char *sha256, uint32_t pack_bytes,
+                                  uint32_t offset, void *response, size_t bytes, pet_control_http_result_t *result);
+/* The sound bank (sound-bank-v1): a range of at most 64 KiB of the bank with
+ * this sha256 and size, at most PET_SOUND_BANK_MAX_BYTES, from /v2/device/sound-bank/<sha256> on
+ * the pinned origin, with the device's credential as a pet pack's. The ranges
+ * of one bank share `download`'s connection. */
+bool pet_control_http_sound_bank_range(const pet_control_http_t *http, pet_control_download_t *download,
+                                       const char *sha256, uint32_t bank_bytes, uint32_t offset, void *response,
+                                       size_t bytes, pet_control_http_result_t *result);
 /* Right after a successful range is durably written: adds the time since
  * that range returned to the operation's flash-write total. */
 void pet_control_download_wrote(pet_control_download_t *download);

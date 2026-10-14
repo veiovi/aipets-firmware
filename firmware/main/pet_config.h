@@ -23,6 +23,10 @@
 #define PET_BRIGHTNESS_DEFAULT 100
 #define PET_BRIGHTNESS_MIN 10
 #define PET_SHAKE_SENSITIVITY_DEFAULT 75
+/* The menu's looks, as the deck's STYLE card picks them (pet_onboarding.c). */
+#define PET_MENU_STYLE_TERMINAL 0
+#define PET_MENU_STYLE_WOODLAND 1
+#define PET_MENU_STYLES 2
 
 typedef struct {
     char ssid[PET_SSID_MAX];
@@ -65,6 +69,7 @@ typedef struct {
     uint8_t volume;
     uint8_t brightness;
     uint8_t shake_sensitivity;
+    uint8_t menu_style; /* PET_MENU_STYLE_*, kept on the device only */
     uint16_t recording_timeout_seconds;
     pet_animation_profile_t animation_profile;
     char face_id[PET_FACE_ID_MAX];
@@ -95,6 +100,13 @@ esp_err_t pet_config_store_wifi(const char *ssid, const char *password);
 /* Explicit credentials: an empty password selects an open network, never recall. */
 esp_err_t pet_config_store_wifi_explicit(const char *ssid, const char *password);
 esp_err_t pet_config_store_wifi_fallback(const char *ssid, const char *password);
+/* A network to keep for later, such as one sent from the cloud: it joins the
+ * saved list, and the primary and fallback stay. A saved network of the same
+ * name, primary and fallback included, takes the new password. */
+esp_err_t pet_config_save_wifi(const char *ssid, const char *password);
+/* The primary and fallback networks only, without the rest of the settings.
+ * Each buffer holds PET_SSID_MAX or PET_PASSWORD_MAX bytes; missing ones are empty. */
+esp_err_t pet_config_load_wifi(char *ssid, char *password, char *fallback_ssid, char *fallback_password);
 esp_err_t pet_config_restore_wifi_fallback(void);
 esp_err_t pet_config_forget_wifi(const char *ssid);
 esp_err_t pet_config_set_wifi_priority(const char *ssid, uint8_t priority);
@@ -113,6 +125,7 @@ esp_err_t pet_config_recall_wifi(const char *ssid, char *password,
                                  size_t capacity);
 esp_err_t pet_config_store_volume(uint8_t volume);
 esp_err_t pet_config_store_brightness(uint8_t brightness);
+esp_err_t pet_config_store_menu_style(uint8_t style);
 esp_err_t pet_config_store_shake_sensitivity(uint8_t sensitivity);
 esp_err_t pet_config_store_face_profiles(const pet_face_profiles_t *profiles);
 bool pet_config_recording_timeout_valid(uint16_t seconds);

@@ -3,14 +3,16 @@
 Firmware for [AI Pets](https://aipets.com): a little animated companion that
 lives on an ESP32-S3 touch board and talks with you.
 
-- Up to three pets live on the device. Swipe left or right to switch.
+- One installed pet, with an animation pack up to 10,739,712 bytes.
 - Tap to talk. The device records your question and plays the pet's spoken
   answer. Speech recognition, the pet's personality, memory and voice run on
   the backend it is linked to, not on the ESP32.
 - Swipe down for the control deck: Wi-Fi, volume, brightness, linking, a system
   log and the open-source notices. Swipe up to leave it.
 - Long press to pet the pet. On a backend that offers stories, the pet then
-  tells you what is happening in its own world, and you answer by voice.
+  starts or pauses a story. Story screens show character progress, blessings
+  and the current adventure; compatible backends can add animated events,
+  atmosphere loops and sound cues.
 - Shake the device for a reaction.
 - Pets are `.aipetframes` animation packs. You can make your own
   ([pet packs](docs/pet-packs.md)).
@@ -24,21 +26,34 @@ lives on an ESP32-S3 touch board and talks with you.
 | [Waveshare ESP32-S3-Touch-LCD-1.54](https://github.com/waveshareteam/ESP32-S3-Touch-LCD-1.54) | `waveshare-esp32-s3-touch-lcd-1.54` | 1.54" LCD, 240 × 240, ST7789 (SPI) | CST816S | 16 MB / 8 MB |
 
 All three have microphones and a speaker codec (ES7210 and ES8311) and a
-QMI8658 motion sensor. Another ESP32-S3 board with 16 MB flash and 8 MB PSRAM
-can be added: see [porting](docs/porting.md).
+QMI8658 motion sensor. These exact models are the supported build targets;
+other ESP32 boards and similarly named Waveshare models are not interchangeable.
+See [porting](docs/porting.md) to add another board.
+
+## Current source
+
+The current source uses firmware epoch **8** (`aipet-8.0.0-240`) and the
+`one-pet-10m-v5` partition layout: one factory application, one pet and a
+dedicated 2 MiB story sound bank. **Firmware updates use USB only.** Signed
+pet and sound content can still arrive over Wi-Fi from a compatible backend.
+
+This is a source update, not a new binary release. Older release downloads
+use an older layout; do not mix their flashing instructions with this source.
+Read the [migration instructions](docs/getting-started.md#flash-and-migrate)
+and [changelog](CHANGELOG.md) before updating an existing device.
 
 ## Three ways to start
 
 1. **Install from aipets.com.** Connect the board by USB, sign in at
    [aipets.com](https://aipets.com) in Chrome or Edge, open **Devices** and use
-   **Install or update firmware**. The page installs the build for the board
-   you connect.
+   **Install or update firmware**. Select and verify the exact board model.
+   The hosted installer has its own release schedule and may not yet offer
+   this source revision.
 2. **Build it yourself** with ESP-IDF 5.5.3 and flash it with esptool:
-   [getting started](docs/getting-started.md). Each GitHub release of this
-   repository also has ready-made images for every board.
+   [getting started](docs/getting-started.md). Use only board-matched images
+   and the installation metadata that accompanies them.
 3. **Connect it to your own backend** by building with your backend's address
-   and release key: [backend settings](docs/backend.md). A self-hosted AI Pets
-   backend for Docker is coming soon.
+   and release key: [backend settings](docs/backend.md).
 
 ## Linking a device
 
@@ -67,8 +82,8 @@ and enter the four-character code that aipets.com shows under **Devices**.
 | `firmware/tools` | USB pet install images, menu previews, menu assets, partition layouts |
 | `tools` | Firmware build, release packaging and sound tools |
 
-The device↔cloud wire format is defined by the `device-protocol` package of the
-AI Pets cloud backend, which will be published with the self-hosted backend.
+For backend integration, the firmware's HTTP and session parsers describe
+the protocol it accepts; see [backend settings](docs/backend.md).
 
 ## License
 

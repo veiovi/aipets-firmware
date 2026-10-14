@@ -21,7 +21,7 @@ esp_err_t pet_face_pack_identity(const char *id, pet_face_gender_t *gender_out);
 esp_err_t pet_face_pack_current_id(char *id, size_t capacity);
 /* Validation scratch is temporary PSRAM, never the caller's task stack. */
 fp_error_t pet_face_pack_validate(const void *bytes, uint32_t length, fp_pack_info_t *info);
-/* Verified remote pack only: caller owns/pins the mapping for the entire player
+/* Verified remote pack only: caller owns/pins the RAM for the entire player
  * lifetime. Call under the display lock; replaces the active binding if live.
  * No network/download/signature authority is inferred by this renderer API. */
 /* Register an installed pack for display. The caller must already have
@@ -29,6 +29,10 @@ fp_error_t pet_face_pack_validate(const void *bytes, uint32_t length, fp_pack_in
  * inspects the structure, identity and approval, so it is fast enough to run
  * under the display lock. */
 esp_err_t pet_face_pack_use_external(const char *id,const void *pack,size_t bytes);
+/* The caller proved this exact source with fp_stream_open and holds its
+ * resident metadata/resources and pinned windows until hold/release. No I/O. */
+esp_err_t pet_face_pack_use_source(const char *id, const fp_pack_source_t *source, const fp_pack_info_t *info);
+
 /* Under the display lock, after draining external catalog/network readers:
  * remove every renderer/catalog reference before the owner unmaps or overwrites
  * external bytes. Idempotent; retains the independent canvas allocation. A new
@@ -39,6 +43,18 @@ void pet_face_pack_release_external(void);
  * next pet_face_pack_use_external, so no emergency face shows in between.
  * A later release ends the hold. */
 void pet_face_pack_hold_external(void);
+/* Story events (story-event-v1), under the display lock while the pet's
+ * external pack is bound: `pack`, an event's frame pack, plays in place of the
+ * pet, its idle loop three times (about 6 s) whatever the pet's state or
+ * input, then the pet's pack is bound again. The caller checked these bytes in
+ * full and keeps them until `done`, called once when the event ends: by
+ * itself, by pet_face_pack_stop_event, or when the pet's binding is held,
+ * released or replaced. Approval is not asked: an event pack is a compiler
+ * candidate, and the session's sha256 is its authority. The face ID stays the
+ * pet's. */
+esp_err_t pet_face_pack_play_event(const void *pack, size_t bytes, void (*done)(void));
+/* Under the display lock: ends a story event now, and the pet shows again. */
+void pet_face_pack_stop_event(void);
 
 /* Evaluation is always called at 30 Hz. visible controls only the expensive
  * display expansion; clocks, input edges, and clip ownership keep moving. */

@@ -43,7 +43,7 @@ int main(void)
     memset(&v, 0, sizeof(v)); v.id = (pet_layout_id_t)999;
     assert(!pet_flash_layout_allows_legacy_ota(&v));
     assert(!pet_flash_layout_select(0, &v)); assert(!pet_flash_layout_select(UINT32_MAX, &v));
-    assert(!pet_flash_layout_known((pet_layout_id_t)-1, &v)); assert(!pet_flash_layout_known((pet_layout_id_t)7, &v));
+    assert(!pet_flash_layout_known((pet_layout_id_t)-1, &v)); assert(!pet_flash_layout_known((pet_layout_id_t)9, &v));
 
     /* Pocket Terminal: three 3 MB slots behind two 3.5 MiB firmware copies. */
     pet_flash_layout_t three, parsed;

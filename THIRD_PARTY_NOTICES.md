@@ -10,13 +10,17 @@ AI Pets name, logo and characters are covered by [TRADEMARKS.md](TRADEMARKS.md).
 | Component | Where | License |
 | --- | --- | --- |
 | Share Tech Mono, © 2012 Carrois Type Design, Ralph du Carrois, Reserved Font Name "Share" | `firmware/third_party/share-tech-mono/` (font and `OFL.txt`); its converted glyphs in `firmware/main/pet_menu_font.c` | [SIL Open Font License 1.1](firmware/third_party/share-tech-mono/OFL.txt) |
+| Jersey 10, Jersey 15 and Jersey 20, © 2023 The Soft Type Project Authors | `firmware/third_party/jersey/` (fonts and `OFL.txt`); their converted glyphs in `firmware/main/pet_menu_woodland_font.c` | [SIL Open Font License 1.1](firmware/third_party/jersey/OFL.txt) |
+| Jacquard 12, © 2023 The Soft Type Project Authors | `firmware/third_party/jacquard-12/` (font and `OFL.txt`); its converted glyphs in `firmware/main/pet_menu_woodland_font.c` | [SIL Open Font License 1.1](firmware/third_party/jacquard-12/OFL.txt) |
 | miniz 3.1.2 (inflate only, hardened), © 2013–2014 RAD Game Tools and Valve Software, © 2010–2014 Rich Geldreich and Tenacious Software LLC | `firmware/components/frame_player/vendor/miniz/` | MIT ([LICENSE](firmware/components/frame_player/vendor/miniz/LICENSE)) |
 | UISFX 0.4.0 sounds: `connect`, `start`, `stop`, `complete`, `cancel`, `retry`, `error`, `gesture_shake`, `gesture_pop` | `firmware/main/sfx/` ([sources](firmware/main/sfx/manifest.json)) | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | Waveshare ESP32-S3-Touch-LCD-1.85B board support | `vendor/waveshare` (git submodule, pinned commit) | Apache-2.0 |
 
-The menu font's copyright notice and license are compiled into every firmware
+The menu fonts' copyright notices and license are compiled into every firmware
 image and shown on the device's **ABOUT** page. `pet_menu_font.c` is a Modified
-Version of the font, so it does not use the Reserved Font Name.
+Version of Share Tech Mono, so it does not use the Reserved Font Name. Jersey
+and Jacquard 12, the faces of the menu's WOODLAND style, have no Reserved Font
+Name.
 
 ## Fetched at build time and linked into the firmware
 

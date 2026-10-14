@@ -87,7 +87,7 @@ static bool parse_layout(const cJSON *object,pet_firmware_requirements_t *out)
     bool found=false;
     /* Firmware is built for one physical layout, single-pet or three-pet;
      * a release for another layout never matches the device's table. */
-    for(unsigned id=PET_LAYOUT_SINGLE_2M;id<=PET_LAYOUT_THREE_3P5M;++id)
+    for(unsigned id=PET_LAYOUT_SINGLE_2M;id<=PET_LAYOUT_TWO_4M;++id)
         if(equal(object,"id",pet_flash_layout_name((pet_layout_id_t)id))){
             found=pet_flash_layout_known((pet_layout_id_t)id,&out->layout);break;
         }
@@ -148,7 +148,8 @@ bool pet_firmware_release_verify(const cJSON *envelope,const pet_pack_trust_key_
         parse_layout(field(payload,"layout"),&parsed.requirements)&&parse_renderer(field(payload,"renderer"),&parsed.requirements)&&
         parse_bootloader(field(payload,"bootloader"),&parsed.requirements.bootloader)&&
         (uint64_t)parsed.bytes*100<=(uint64_t)parsed.requirements.layout.app_slot_bytes*85&&
-        (parsed.requirements.layout.pet_slots!=PET_LAYOUT_THREE_SLOTS||parsed.requirements.firmware_epoch>=3); /* As the cloud. */
+        (parsed.requirements.firmware_epoch >= (parsed.requirements.layout.id == PET_LAYOUT_TWO_4M ? 6u :
+            pet_flash_layout_is_pocket(&parsed.requirements.layout) ? 3u : 1u)); /* As the cloud. */
     cJSON_Delete(payload);if(ok)*out=parsed;return ok;
 }
 static bool protects(const pet_firmware_release_t *release,const pet_firmware_protected_pack_t *pack)
@@ -168,7 +169,7 @@ static bool protects(const pet_firmware_release_t *release,const pet_firmware_pr
 static bool protects_all(const pet_firmware_release_t *release,const pet_flash_layout_t *physical,
                          const pet_firmware_protection_t *p)
 {
-    const unsigned slots=physical->pet_slots==PET_LAYOUT_THREE_SLOTS?PET_LAYOUT_THREE_SLOTS:0,count=p->installed_count;
+    const unsigned slots=pet_flash_layout_is_pocket(physical)?physical->pet_slots:0,count=p->installed_count;
     if(count>slots||count+p->active.requirements.present+p->interrupted.requirements.present>(slots?slots:2)||
        !protects(release,&p->active.requirements)||!protects(release,&p->interrupted.requirements))return false;
     for(unsigned i=0;i<count;++i)

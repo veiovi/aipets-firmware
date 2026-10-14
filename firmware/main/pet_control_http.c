@@ -9,6 +9,7 @@
 #include "esp_timer.h"
 #include "pet_deadline_transport.h"
 #include "pet_replace.h"
+#include "pet_session_wire.h"
 
 static const char *TAG="pet_download";
 typedef struct {
@@ -43,6 +44,25 @@ static bool pet_path(const char *path)
     return path[n+14]>='1'&&path[n+14]<='5'&&strchr("89ab",path[n+19]);
 }
 
+/* `prefix` and a sha256 in lowercase hex. */
+static bool hashed_path(const char *path, const char *prefix)
+{
+    const size_t n = strlen(prefix);
+    return !strncmp(path, prefix, n) && strlen(path) == n + 64 && strspn(path + n, "0123456789abcdef") == 64;
+}
+
+/* A story event's pack (story-event-v1): /v2/device/story-events/<sha256>. */
+static bool event_path(const char *path)
+{
+    return hashed_path(path, "/v2/device/story-events/");
+}
+
+/* The sound bank (sound-bank-v1): /v2/device/sound-bank/<sha256>. */
+static bool sound_bank_path(const char *path)
+{
+    return hashed_path(path, "/v2/device/sound-bank/");
+}
+
 static esp_err_t header_event(esp_http_client_event_t *event)
 {
     headers_t *h=event->user_data;
@@ -68,7 +88,9 @@ static bool valid_endpoint(const pet_control_http_t *h,const char *path)
 {
     if(!h||!h->origin||!h->device_id||!h->credential||!path||
        strncmp(h->origin,"https://",8)||!h->origin[8]||strlen(h->origin)>=128||
-       (strncmp(path,"/v1/device/",11)&&!firmware_path(path)&&!pet_path(path))||strlen(path)>1700)return false;
+       (strncmp(path,"/v1/device/",11)&&!firmware_path(path)&&!pet_path(path)&&!event_path(path)&&
+        !sound_bank_path(path))||
+       strlen(path)>1700)return false;
     for(const char *p=h->origin+8;*p;++p)
         if(!((*p>='a'&&*p<='z')||(*p>='0'&&*p<='9')||*p=='-'||*p=='.'||*p==':'))return false;
     if(strlen(h->device_id)!=36||strncmp(h->device_id,"pet-",4)||
@@ -291,6 +313,39 @@ bool pet_control_http_pet_range(const pet_control_http_t *h,pet_control_download
     return request(h,path,NULL,&range,offset,response,bytes,result,false);
 }
 
+bool pet_control_http_event_range(const pet_control_http_t *h, const char *sha, uint32_t total, uint32_t offset,
+                                  void *response, size_t bytes, pet_control_http_result_t *result)
+{
+    char path[96];
+    if (result)
+        *result = (pet_control_http_result_t){.retry_seconds = 30};
+    if (!sha || strlen(sha) != 64 || !total || total > PET_STORY_EVENT_BYTES || offset >= total || !bytes ||
+        bytes > total - offset)
+        return false;
+    snprintf(path, sizeof(path), "/v2/device/story-events/%s", sha);
+    if (!event_path(path))
+        return false;
+    range_request_t range = {.sha256 = sha, .bytes = total};
+    return request(h, path, NULL, &range, offset, response, bytes, result, false);
+}
+
+bool pet_control_http_sound_bank_range(const pet_control_http_t *h, pet_control_download_t *download, const char *sha,
+                                       uint32_t total, uint32_t offset, void *response, size_t bytes,
+                                       pet_control_http_result_t *result)
+{
+    char path[96];
+    if (result)
+        *result = (pet_control_http_result_t){.retry_seconds = 30};
+    if (!sha || strlen(sha) != 64 || !total || total > PET_SOUND_BANK_MAX_BYTES || offset >= total || !bytes ||
+        bytes > PET_REPLACE_CHECKPOINT_BYTES || bytes > total - offset)
+        return false;
+    snprintf(path, sizeof(path), "/v2/device/sound-bank/%s", sha);
+    if (!sound_bank_path(path))
+        return false;
+    range_request_t range = {.sha256 = sha, .bytes = total, .download = download};
+    return request(h, path, NULL, &range, offset, response, bytes, result, false);
+}
+
 void pet_control_download_wrote(pet_control_download_t *d)
 {if(d&&d->returned_us){d->write_us+=esp_timer_get_time()-d->returned_us;d->returned_us=0;}}
 
@@ -304,7 +359,8 @@ void pet_control_download_end(pet_control_download_t *d,bool complete)
     if(!d->url[0])return;
     (void)complete; /* Read only by the log line. */
     ESP_LOGI(TAG,"%s download %s: %lu of %lu bytes in %lu ms; ranges %lu, connections %lu, reused %lu, failed %lu, "
-        "fallback %s; connect %lu ms, transfer %lu ms, write %lu ms",strstr(d->url,"/firmware/")?"firmware":"pet",
+        "fallback %s; connect %lu ms, transfer %lu ms, write %lu ms",
+        strstr(d->url,"/firmware/")?"firmware":strstr(d->url,"/sound-bank/")?"sound bank":"pet",
         complete?"complete":"stopped",(unsigned long)d->bytes,(unsigned long)d->total,
         (unsigned long)((esp_timer_get_time()-d->started_us)/1000),(unsigned long)d->ranges,(unsigned long)d->connections,
         (unsigned long)d->reused,(unsigned long)d->failed,d->independent?"yes":"no",(unsigned long)(d->connect_us/1000),

@@ -1,5 +1,6 @@
 #include "pet_config.h"
 #include "pet_enrollment.h"
+#include "pet_session_wire.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -268,6 +269,9 @@ esp_err_t pet_config_load(pet_config_t *config)
         brightness >= PET_BRIGHTNESS_MIN && brightness <= 100) {
         config->brightness = brightness;
     }
+    uint8_t menu_style = 0;
+    if (err == ESP_OK && nvs_get_u8(nvs, "menu_style", &menu_style) == ESP_OK && menu_style < PET_MENU_STYLES)
+        config->menu_style = menu_style;
     uint8_t shake_sensitivity = 0;
     if (err == ESP_OK && nvs_get_u8(nvs, "shake_sens", &shake_sensitivity) == ESP_OK &&
         shake_sensitivity <= 100) {
@@ -570,6 +574,50 @@ esp_err_t pet_config_store_wifi_fallback(const char *ssid, const char *password)
     return err;
 }
 
+esp_err_t pet_config_load_wifi(char *ssid, char *password, char *fallback_ssid, char *fallback_password)
+{
+    ssid[0] = password[0] = fallback_ssid[0] = fallback_password[0] = 0;
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("aipet", NVS_READONLY, &nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    if (err != ESP_OK) return err;
+    err = read_string(nvs, "ssid", ssid, PET_SSID_MAX);
+    if (err == ESP_OK) err = read_string(nvs, "password", password, PET_PASSWORD_MAX);
+    if (err == ESP_OK) err = read_string(nvs, "ssid_alt", fallback_ssid, PET_SSID_MAX);
+    if (err == ESP_OK) err = read_string(nvs, "password_alt", fallback_password, PET_PASSWORD_MAX);
+    nvs_close(nvs);
+    return err;
+}
+
+esp_err_t pet_config_save_wifi(const char *ssid, const char *password)
+{
+    if (!ssid || !password || !ssid[0] || strlen(ssid) >= PET_SSID_MAX ||
+        strlen(password) >= PET_PASSWORD_MAX) return ESP_ERR_INVALID_ARG;
+    char primary[PET_SSID_MAX];
+    char primary_password[PET_PASSWORD_MAX];
+    char fallback[PET_SSID_MAX];
+    char fallback_password[PET_PASSWORD_MAX];
+    esp_err_t err = pet_config_load_wifi(primary, primary_password, fallback, fallback_password);
+    nvs_handle_t nvs = 0;
+    if (err == ESP_OK) err = nvs_open("aipet", NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        /* The primary and the fallback stay first in the saved list: a forget rebuilds them from there. */
+        bool is_primary = !strcmp(primary, ssid);
+        bool is_fallback = !strcmp(fallback, ssid);
+        const char *ssids[] = {ssid, fallback, primary};
+        const char *passwords[] = {password, is_fallback ? password : fallback_password,
+                                   is_primary ? password : primary_password};
+        err = remember_wifi(nvs, ssids, passwords, sizeof(ssids) / sizeof(ssids[0]));
+        if (err == ESP_OK && is_primary) err = nvs_set_str(nvs, "password", password);
+        if (err == ESP_OK && is_fallback) err = nvs_set_str(nvs, "password_alt", password);
+        if (err == ESP_OK) err = nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    memset(primary_password, 0, sizeof(primary_password));
+    memset(fallback_password, 0, sizeof(fallback_password));
+    return err;
+}
+
 esp_err_t pet_config_restore_wifi_fallback(void)
 {
     nvs_handle_t nvs;
@@ -826,6 +874,12 @@ esp_err_t pet_config_store_brightness(uint8_t brightness)
         return ESP_ERR_INVALID_ARG;
     }
     return store_u8("brightness", brightness);
+}
+
+esp_err_t pet_config_store_menu_style(uint8_t style)
+{
+    if (style >= PET_MENU_STYLES) return ESP_ERR_INVALID_ARG;
+    return store_u8("menu_style", style);
 }
 
 esp_err_t pet_config_store_shake_sensitivity(uint8_t sensitivity)

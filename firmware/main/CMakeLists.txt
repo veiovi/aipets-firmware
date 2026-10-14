@@ -4,9 +4,10 @@ if(CONFIG_PET_VNEXT_ENROLLMENT)
         "pet_asset_store.c" "pet_control_wire.c" "pet_control_http.c" "pet_usb_wifi.c"
         "pet_pack_verify.c" "pet_release_v2.c" "pet_release_v2_pack.c" "pet_release_v2_protection.c" "pet_firmware_release.c" "pet_firmware_receipt.c" "pet_firmware_receipt_nvs.c" "pet_firmware_wire.c" "pet_firmware_image.c" "pet_ota_selection.c" "pet_firmware_control.c"
         "pet_replace.c" "pet_replace_journal.c" "pet_replace_writer.c" "pet_replace_wire.c" "pet_replace_receipt.c" "pet_replace_control.c"
-        "pet_single_store.c")
+        "pet_single_store.c" "pet_sound_bank.c")
     if(CONFIG_PET_POCKET_TERMINAL)
-        list(APPEND pet_vnext_sources "pet_slot_inventory.c" "pet_slot_store.c" "pet_slot_protection.c")
+        list(APPEND pet_vnext_sources "pet_slot_inventory.c" "pet_slot_store.c" "pet_slot_protection.c"
+            "pet_story_events.c")
     endif()
 endif()
 
@@ -15,6 +16,7 @@ idf_component_register(
     SRCS
         ${pet_vnext_sources}
         "app_main.c"
+        "pet_atmosphere.c"
         "pet_audio.c"
         "pet_audio_board.c"
         "pet_battery.c"
@@ -26,6 +28,7 @@ idf_component_register(
         "pet_deadline_transport.c"
         "pet_onboarding.c"
         "pet_menu_font.c"
+        "pet_menu_woodland_font.c"
         "pet_menu_icons.c"
         "pet_diagnostics.c"
         "pet_display.c"
@@ -70,6 +73,17 @@ idf_component_register(
         "sfx/face_swipe_4.pcm"
         "sfx/gesture_shake.pcm"
         "sfx/gesture_pop.pcm"
+        # The story's sound loops (atmospheres/README.md).
+        "atmospheres/calm.adpcm"
+        "atmospheres/forest.adpcm"
+        "atmospheres/water.adpcm"
+        "atmospheres/night.adpcm"
+        "atmospheres/cave.adpcm"
+        "atmospheres/storm.adpcm"
+        "atmospheres/danger.adpcm"
+        "atmospheres/battle.adpcm"
+        "atmospheres/magic.adpcm"
+        "atmospheres/victory.adpcm"
     REQUIRES
         esp_app_format
         esp_event

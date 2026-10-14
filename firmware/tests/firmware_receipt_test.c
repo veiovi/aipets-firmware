@@ -18,6 +18,23 @@ static pet_firmware_release_t release(void)
 }
 static void states(void)
 {
+    for (unsigned id = PET_LAYOUT_THREE_3P5M; id <= PET_LAYOUT_TWO_4M; ++id)
+    {
+        fixture_t f = {.cut = -1};
+        pet_firmware_receipt_io_t io = {read_record, write_record, &f};
+        pet_firmware_receipt_store_t store;
+        pet_firmware_release_t candidate = release();
+        assert(pet_flash_layout_known((pet_layout_id_t)id, &candidate.requirements.layout));
+        candidate.requirements.firmware_epoch = 6;
+        char previous[65];
+        hash_fill(previous, 'b');
+        assert(pet_firmware_receipt_open(&store, &io));
+        pet_firmware_receipt_t next = store.value;
+        assert(pet_firmware_receipt_begin(&next, &candidate, operation, previous, boot, 0x3b0000));
+        assert(pet_firmware_receipt_save(&store, &next));
+        assert(pet_firmware_receipt_open(&store, &io));
+        assert(store.value.layout_id == (pet_layout_id_t)id);
+    }
     pet_firmware_receipt_t r={0};pet_firmware_release_t candidate=release();char previous[65];hash_fill(previous,'b');
     assert(pet_firmware_receipt_valid(&r));assert(!pet_firmware_receipt_status(&r));
     pet_firmware_receipt_t after_boot={0};

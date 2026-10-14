@@ -1,7 +1,8 @@
-/* The v2 install machine on the three-pet store, on simulated flash: the
- * real writer, journal, inventory and SHA-256. An installation writes only its
- * target slot, never the pet on screen or the bound pet, and every step is one
- * inventory record that survives a reboot. */
+/* The v2 install machine on the two-pet store, on simulated flash: the
+ * real writer, journal, inventory and SHA-256. A Pocket keeps one pet: every
+ * installation writes slot 0 only, after its readers let go, never slot 1's
+ * region (the sound bank's), and every step is one inventory record that
+ * survives a reboot. */
 #include "pet_slot_store.h"
 #include "frame_player.h"
 #include "esp_flash.h"
@@ -20,7 +21,7 @@ static size_t count;
 static esp_flash_t chip;
 esp_flash_t *esp_flash_default_chip = &chip;
 static unsigned freezes, detaches;
-static uint8_t copy[PET_LAYOUT_THREE_SLOT_PACK_BYTES];
+static uint8_t copy[PET_POCKET_MAX_PACK_BYTES];
 static uint32_t lowest_write = UINT32_MAX, highest_write;
 
 esp_partition_iterator_t esp_partition_find(int type,int subtype,const char *label)
@@ -62,7 +63,7 @@ void vTaskDelay(TickType_t ticks) { (void)ticks; }
 static void put32(uint8_t *p,uint32_t value) { for(unsigned i=0;i<4;++i)p[i]=(uint8_t)(value>>(i*8)); }
 static void configure(void)
 {
-    pet_flash_layout_t v; assert(pet_flash_layout_known(PET_LAYOUT_THREE_3P5M,&v)); count=v.count;
+    pet_flash_layout_t v; assert(pet_flash_layout_known(PET_LAYOUT_ONE_10M,&v)); count=v.count;
     memset(parts,0,sizeof(parts)); memset(flash,0xff,sizeof(flash));
     for (size_t i=0;i<count;++i) {
         const pet_flash_region_t *r=&v.regions[i]; esp_partition_t *p=&parts[i];
@@ -126,7 +127,7 @@ static unsigned install(pet_slot_store_t *s,const uint8_t *content,uint32_t leng
     pet_replace_t next=s->machine.state;
     assert(pet_replace_request(&next,operation,&target,next.binding_revision[0]?next.binding_revision:"r0"));step(s,&next);
     int slot=s->inventory.state.target;
-    assert(slot>=0&&(replacement||(slot!=s->inventory.state.active&&slot!=s->inventory.state.bound)));
+    assert(slot==0);
     assert(pet_replace_fenced(&next,operation,fence,&target));step(s,&next);
     unsigned frozen=freezes;
     assert(pet_replace_writer_resume(&s->writer));
@@ -134,7 +135,7 @@ static unsigned install(pet_slot_store_t *s,const uint8_t *content,uint32_t leng
     assert(s->inventory.state.slots[slot].state==PET_SLOT_INSTALLING);
     uint8_t manifest[PET_REPLACE_MANIFEST_BYTES];memset(manifest,0x42,sizeof(manifest));
     assert(pet_replace_writer_manifest(&s->writer,manifest,sizeof(manifest)));
-    assert(!memcmp(slot_bytes(s,(unsigned)slot)+PET_LAYOUT_THREE_SLOT_PACK_BYTES,manifest,sizeof(manifest)));
+    assert(!memcmp(slot_bytes(s,(unsigned)slot)+PET_LAYOUT_ONE_SLOT_PACK_BYTES,manifest,sizeof(manifest)));
     /* Firmware protection reads the record of the slot being written. */
     uint8_t written[PET_REPLACE_MANIFEST_BYTES];
     assert(pet_slot_store_read_record(s,(unsigned)slot,written,sizeof(written))==ESP_OK&&!memcmp(written,manifest,sizeof(written)));
@@ -164,71 +165,64 @@ static unsigned install(pet_slot_store_t *s,const uint8_t *content,uint32_t leng
 int main(void)
 {
     static pet_slot_store_t s;
-    static uint8_t first[300000],second[250001],third[200000];
+    static uint8_t first[PET_POCKET_MAX_PACK_BYTES],second[250001],third[200000];
     for (size_t i=0;i<sizeof(first);++i)first[i]=(uint8_t)(i*7u);
     for (size_t i=0;i<sizeof(second);++i)second[i]=(uint8_t)(i*11u+5u);
     for (size_t i=0;i<sizeof(third);++i)third[i]=(uint8_t)(i*3u+1u);
     configure();
     assert(pet_slot_store_open(&s)==ESP_OK);
-    place(&s,0,120000,9);place(&s,1,90000,21); /* Pablo and Luna from the USB installation, Luna on screen */
+    place(&s,0,120000,9); /* A USB pet on screen. */
     static uint8_t before[PET_FLASH_BYTES];memcpy(before,flash,sizeof(before));
     assert(pet_slot_store_attach_installer(&s,&readers)==ESP_OK);
     assert(pet_slot_store_attach_installer(&s,&readers)==ESP_ERR_INVALID_STATE);
     size_t bytes=0;
     assert(pet_slot_store_load_target(&s,copy,sizeof(copy),&bytes)==ESP_ERR_INVALID_STATE);
 
-    // The first website installation goes to the free slot; the pets already
-    // installed are not written, and the new pet is shown.
+    // The first website installation replaces the pet on screen, as on a
+    // single-pet device: its readers let go first. Neither slot 1's region,
+    // which holds the sound bank, nor the audio reserve is written.
+    unsigned detached=detaches;
     unsigned slot=install(&s,first,sizeof(first),"22222222-2222-4222-8222-222222222222","33333333-3333-4333-8333-333333333333",
                           "44444444-4444-4444-8444-444444444444",false);
-    uint32_t pack_offset=0,record_offset=0;assert(pet_flash_layout_slot(&s.layout,2,&pack_offset,&record_offset));
-    assert(slot==2&&lowest_write>=pack_offset&&highest_write<=record_offset+PET_REPLACE_MANIFEST_BYTES);
-    assert(!memcmp(slot_bytes(&s,0),before+(slot_bytes(&s,0)-flash),120000));
-    assert(!memcmp(slot_bytes(&s,1),before+(slot_bytes(&s,1)-flash),90000));
+    uint32_t pack_offset=0,record_offset=0;assert(pet_flash_layout_slot(&s.layout,0,&pack_offset,&record_offset));
+    assert(slot==0&&detaches>detached&&lowest_write>=pack_offset&&highest_write<=record_offset+PET_REPLACE_MANIFEST_BYTES);
+    assert(!memcmp(flash+0x3c0000,before+0x3c0000,0x200000));
+
     const pet_slot_inventory_t *inventory=&s.inventory.state;
-    assert(inventory->active==2&&inventory->bound==2&&inventory->target==-1&&inventory->operation.phase==PET_REPLACE_ACTIVE);
-    assert(inventory->slots[2].state==PET_SLOT_READY&&inventory->slots[2].validator_revision==FP_VALIDATOR_REVISION);
-    assert(inventory->slots[0].state==PET_SLOT_READY&&inventory->slots[1].state==PET_SLOT_READY);
+    assert(inventory->active==0&&inventory->bound==0&&inventory->target==-1&&inventory->operation.phase==PET_REPLACE_ACTIVE);
+    assert(inventory->slots[0].state==PET_SLOT_READY&&inventory->slots[0].validator_revision==FP_VALIDATOR_REVISION);
+
 
     // It is all one record: after a reboot the new pet copies with its hash.
     reboot(&s);inventory=&s.inventory.state;
-    assert(inventory->active==2&&inventory->bound==2&&pet_slot_store_load(&s,2,copy,sizeof(copy),&bytes)==ESP_OK&&bytes==sizeof(first));
-    // Its signed record follows the pack; a pet placed over USB has none.
-    static uint8_t record[PET_REPLACE_MANIFEST_BYTES],erased[PET_REPLACE_MANIFEST_BYTES];
-    memset(erased,0xff,sizeof(erased));
-    assert(pet_slot_store_read_record(&s,2,record,sizeof(record))==ESP_OK);
+    assert(inventory->active==0&&inventory->bound==0&&pet_slot_store_load(&s,0,copy,sizeof(copy),&bytes)==ESP_OK&&bytes==sizeof(first));
+    // Its signed record follows the pack; slot 1 holds no pet and no record.
+    static uint8_t record[PET_REPLACE_MANIFEST_BYTES];
+    assert(pet_slot_store_read_record(&s,0,record,sizeof(record))==ESP_OK);
     for(size_t i=0;i<sizeof(record);++i)assert(record[i]==0x42);
-    assert(pet_slot_store_read_record(&s,0,record,sizeof(record))==ESP_OK&&!memcmp(record,erased,sizeof(record)));
-    assert(pet_slot_store_read_record(&s,2,record,sizeof(record)-1)==ESP_ERR_INVALID_ARG);
+    assert(pet_slot_store_read_record(&s,1,record,sizeof(record))==ESP_ERR_INVALID_ARG);
+    assert(pet_slot_store_read_record(&s,0,record,sizeof(record)-1)==ESP_ERR_INVALID_ARG);
     assert(pet_slot_store_read_record(&s,PET_SLOT_COUNT,record,sizeof(record))==ESP_ERR_INVALID_ARG);
 
-    // With every slot full, the next installation replaces the stalest pet that
-    // is neither on screen nor bound, while Pablo's new neighbour stays shown.
-    lowest_write=UINT32_MAX;highest_write=0;
-    assert(pet_slot_store_load(&s,0,copy,sizeof(copy),&bytes)==ESP_OK);unsigned detached=detaches;
+    // The next pet replaces it in slot 0 too, resuming after a power loss.
+    lowest_write=UINT32_MAX;highest_write=0;detached=detaches;
     slot=install(&s,second,sizeof(second),"55555555-5555-4555-8555-555555555555","66666666-6666-4666-8666-666666666666",
                  "77777777-7777-4777-8777-777777777777",true);
-    assert(slot==0&&detaches>detached); /* Pablo was shown longest ago; his readers let go first */
-    assert(pet_flash_layout_slot(&s.layout,0,&pack_offset,&record_offset));
+    assert(slot==0&&detaches>detached);
     assert(lowest_write>=pack_offset&&highest_write<=record_offset+PET_REPLACE_MANIFEST_BYTES);
-    assert(inventory->active==0&&inventory->bound==0&&inventory->slots[1].state==PET_SLOT_READY);
-    assert(!memcmp(slot_bytes(&s,2),first,sizeof(first)));
+    assert(inventory->active==0&&inventory->bound==0);
 
     // A request cancelled before its fence leaves every slot as it was.
     pet_replace_pack_t target={.bytes=sizeof(third)};strcpy(target.build_id,"88888888-8888-4888-8888-888888888888");
     hex_sha256(third,sizeof(third),target.sha256);
     pet_replace_t next=s.machine.state;
     assert(pet_replace_request(&next,"99999999-9999-4999-8999-999999999999",&target,next.binding_revision));step(&s,&next);
-    assert(inventory->target==1);
+    assert(inventory->target==0);
     assert(pet_replace_cancel(&next));step(&s,&next);
-    assert(inventory->target==-1&&inventory->slots[1].state==PET_SLOT_READY&&inventory->bound==0&&inventory->active==0);
-    s.inventory.state.slots[1].state=PET_SLOT_FREE;
-    assert(pet_slot_store_read_record(&s,1,record,sizeof(record))==ESP_ERR_INVALID_STATE);
-    s.inventory.state.slots[1].state=PET_SLOT_INSTALLING; /* Only the target is ever written. */
-    assert(pet_slot_store_read_record(&s,1,record,sizeof(record))==ESP_ERR_INVALID_STATE);
-    s.inventory.state.slots[1].state=PET_SLOT_READY;
-    reboot(&s);assert(s.inventory.state.slots[1].state==PET_SLOT_READY&&s.inventory.state.bound==0);
-    // Same-pet update replaces the exact active/bound slot, not older Luna.
+    assert(inventory->target==-1&&inventory->slots[0].state==PET_SLOT_READY&&inventory->bound==0&&inventory->active==0);
+    assert(pet_slot_store_read_record(&s,1,record,sizeof(record))==ESP_ERR_INVALID_ARG);
+    reboot(&s);assert(s.inventory.state.slots[0].state==PET_SLOT_READY&&s.inventory.state.bound==0);
+    // A same-pet update replaces the exact active, bound pet in slot 0.
     const pet_replace_pack_t old=s.inventory.state.slots[0].pack;
     pet_replace_pack_t missing=old;missing.bytes++;
     assert(!pet_slot_store_prepare_replacement(&s,&target,&missing));
@@ -236,11 +230,10 @@ int main(void)
     slot=install(&s,third,sizeof(third),target.build_id,"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
                  "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",true);
     assert(slot==0&&s.inventory.state.bound==0&&s.inventory.state.active==0);
-    assert(pet_flash_layout_slot(&s.layout,0,&pack_offset,&record_offset));
     assert(lowest_write>=pack_offset&&highest_write<=record_offset+PET_REPLACE_MANIFEST_BYTES);
-    for(unsigned other=1;other<PET_SLOT_COUNT;++other)
-        assert(!memcmp(slot_bytes(&s,other),before+(slot_bytes(&s,other)-flash),PET_LAYOUT_THREE_SLOT_PACK_BYTES+PET_REPLACE_MANIFEST_BYTES));
+    assert(!memcmp(flash+0x3c0000,before+0x3c0000,0x200000));
     reboot(&s);assert(s.inventory.state.bound==0&&!strcmp(s.inventory.state.slots[0].pack.build_id,target.build_id));
-    puts("three-pet installation: v2 machine per slot, target never shown or bound, other pets untouched, resume, reboot, cancel");
+    puts("one-pet installation: every pet replaces slot 0 after its readers let go, maximum-size pack, "
+         "slot 1's region and the audio reserve untouched, resume, reboot, cancel, same-pet update");
     return 0;
 }

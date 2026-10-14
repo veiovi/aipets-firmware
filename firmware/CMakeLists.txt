@@ -21,7 +21,7 @@ if(AIPET_BOARD STREQUAL "waveshare-esp32-s3-touch-lcd-1.85b")
 endif()
 
 if(NOT DEFINED PROJECT_VER)
-    set(PROJECT_VER "aipet-6.0.2-240")
+    set(PROJECT_VER "aipet-8.0.0-240")
 endif()
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 idf_build_set_property(AIPET_BSP_COMPONENT "${AIPET_BSP_COMPONENT}")

@@ -37,6 +37,8 @@
 
 /* On battery the board stays on only while this pin is high. */
 #define BSP_POWER_HOLD GPIO_NUM_2
+/* The power button, low while pressed. */
+#define BSP_POWER_BUTTON GPIO_NUM_5
 /* Battery voltage through a 1:3 divider on ADC1 channel 0. */
 #define BSP_BATTERY_ADC GPIO_NUM_1
 /* Low while the battery charges. */

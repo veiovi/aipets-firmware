@@ -10,6 +10,13 @@ extern const lv_font_t pet_menu_font_20;
 extern const lv_font_t pet_menu_font_28;
 /* The fonts' copyright notice and SIL OFL 1.1 text, verbatim. */
 extern const char pet_menu_font_license[];
+/* WOODLAND's faces (pet_menu_woodland_font.c, SIL OFL 1.1): Jersey at each of
+ * the menu's sizes, and Jacquard 12 for titles. */
+extern const lv_font_t pet_woodland_font_12;
+extern const lv_font_t pet_woodland_font_16;
+extern const lv_font_t pet_woodland_font_20;
+extern const lv_font_t pet_woodland_font_28;
+extern const lv_font_t pet_woodland_title;
 
 extern const lv_image_dsc_t pet_icon_wifi;
 extern const lv_image_dsc_t pet_icon_speaker;
@@ -20,5 +27,44 @@ extern const lv_image_dsc_t pet_icon_sync;
 extern const lv_image_dsc_t pet_icon_power;
 extern const lv_image_dsc_t pet_icon_chevron_right;
 extern const lv_image_dsc_t pet_icon_chevron_up;
+extern const lv_image_dsc_t pet_icon_handle_down;
+extern const lv_image_dsc_t pet_icon_handle_left;
+extern const lv_image_dsc_t pet_icon_handle_right;
+extern const lv_image_dsc_t pet_icon_palette;
+extern const lv_image_dsc_t pet_icon_flame;
+extern const lv_image_dsc_t pet_icon_shield;
+extern const lv_image_dsc_t pet_icon_star;
+extern const lv_image_dsc_t pet_icon_heart;
+extern const lv_image_dsc_t pet_icon_bolt;
+extern const lv_image_dsc_t pet_icon_eye;
+extern const lv_image_dsc_t pet_icon_leaf;
+extern const lv_image_dsc_t pet_icon_moon;
+extern const lv_image_dsc_t pet_icon_key;
+extern const lv_image_dsc_t pet_icon_feather;
+extern const lv_image_dsc_t pet_icon_potion;
+extern const lv_image_dsc_t pet_icon_sword;
+extern const lv_image_dsc_t pet_icon_blessing_mask;
+extern const lv_image_dsc_t pet_icon_blessing_hand;
+extern const lv_image_dsc_t pet_icon_blessing_bubble;
+extern const lv_image_dsc_t pet_icon_blessing_skull;
+extern const lv_image_dsc_t pet_icon_blessing_crown;
+extern const lv_image_dsc_t pet_icon_blessing_coin;
+extern const lv_image_dsc_t pet_icon_blessing_ring;
+extern const lv_image_dsc_t pet_icon_blessing_scroll;
+extern const lv_image_dsc_t pet_icon_blessing_bell;
+extern const lv_image_dsc_t pet_icon_blessing_hourglass;
+extern const lv_image_dsc_t pet_icon_blessing_sun;
+extern const lv_image_dsc_t pet_icon_blessing_cloud;
+extern const lv_image_dsc_t pet_icon_blessing_drop;
+extern const lv_image_dsc_t pet_icon_blessing_pick;
+extern const lv_image_dsc_t pet_icon_blessing_bow;
+extern const lv_image_dsc_t pet_icon_blessing_lantern;
+extern const lv_image_dsc_t pet_icon_blessing_gem;
+extern const lv_image_dsc_t pet_icon_blessing_ghost;
+extern const lv_image_dsc_t pet_icon_blessing_paw;
+extern const lv_image_dsc_t pet_icon_blessing_gear;
+/* WOODLAND's plank and rope tiles, RGB565. */
+extern const lv_image_dsc_t pet_wood_planks;
+extern const lv_image_dsc_t pet_wood_rope;
 /* The boot page's mark, an 8-bit mask the page tints. */
 extern const lv_image_dsc_t pet_boot_mark;

@@ -29,17 +29,17 @@ class NativeLayoutExportTests(unittest.TestCase):
 
     def test_exact_native_layouts_and_reserved_regions(self):
         g = self.geometry
-        self.assertEqual(len(g["layouts"]), 7)
+        self.assertEqual(len(g["layouts"]), 9)
         self.assertEqual(g["bootloaderOffset"], 0)
         self.assertEqual(g["bootloaderRegionBytes"], g["partitionTableOffset"])
         common = g["layouts"][0]["regions"][:4]
         self.assertEqual(common[0], {"name": "nvs", "type": 1, "subtype": 2,
                                     "offset": 0x9000, "bytes": 0x6000, "flags": 0})
-        for layout in g["layouts"]:
+        for layout in g["layouts"][:-1]:
             self.assertEqual(layout["regions"][:4], common)
             self.assertEqual(layout["regions"][-1]["offset"] + layout["regions"][-1]["bytes"], 0x1000000)
             self.assertEqual(layout["regions"][4]["bytes"], layout["regions"][5]["bytes"])
-        self.assertEqual([v["petSlots"] for v in g["layouts"]], [0, 2, 1, 1, 1, 1, 3])
+        self.assertEqual([v["petSlots"] for v in g["layouts"]], [0, 2, 1, 1, 1, 1, 3, 2, 1])
         self.assertEqual([v["petPartitionBytes"] for v in g["layouts"][2:6]],
                          [0xbc0000, 0xac0000, 0x9c0000, 0x7c0000])
         for layout in g["layouts"][2:6]:
@@ -52,8 +52,23 @@ class NativeLayoutExportTests(unittest.TestCase):
         self.assertEqual(layouts.sha256(layouts.encode_partition(pocket, g)),
                          "6b040cbd3fd1d853839000f73472525b8a33421d0eb15a787248f42054a5daf7")
 
+    def test_usb_one_pet_layout(self):
+        g = self.geometry
+        pocket = g["layouts"][8]
+        self.assertEqual(pocket["id"], "one-pet-10m-v5")
+        self.assertEqual((pocket["petSlots"], pocket["appSlotBytes"], pocket["packCapacityBytes"]),
+                         (1, 0x380000, 0xa3e000))
+        self.assertEqual([(r["name"], r["type"], r["subtype"], r["offset"], r["bytes"])
+                          for r in pocket["regions"]], [
+            ("nvs", 1, 2, 0x9000, 0x6000), ("phy_init", 1, 1, 0xf000, 0x1000),
+            ("coredump", 1, 3, 0x12000, 0x10000), ("factory", 0, 0, 0x30000, 0x380000),
+            ("pet_journal", 1, 0x41, 0x3b0000, 0x10000), ("pet_sound", 1, 0x44, 0x3c0000, 0x200000),
+            ("pet_store", 1, 0x43, 0x5c0000, 0xa40000)])
+        self.assertEqual(layouts.sha256(layouts.encode_partition(pocket, g)),
+                         "298b26fa886c2f1fd58bf0a550ea4a4c1485d1bdb0a304a9d226caa78c752d5f")
+
     def test_native_smallest_slot_selection_boundaries(self):
-        values = [v for v in self.geometry["layouts"] if v["petSlots"] == 1]
+        values = [v for v in self.geometry["layouts"] if v["petSlots"] == 1 and v["id"] != "one-pet-10m-v5"]
         for index, layout in enumerate(values):
             boundary = layout["appSlotBytes"] * 85 // 100
             selected = layouts.read_geometry(self.binary, boundary)["selection"]
@@ -120,7 +135,7 @@ class IdfLayoutArtifactTests(unittest.TestCase):
             second, again = layouts.create_export(IDF, b, app_bytes=0x180000)
             self.assertEqual(first, second)
             self.assertEqual(files, again)
-            self.assertEqual(len(files), 14)
+            self.assertEqual(len(files), 18)
             self.assertEqual(first["status"], "geometry-only-not-installation-authority")
             self.assertEqual(first["selection"]["layoutId"], "single-pet-2m-v2")
             for v in first["layouts"]:
@@ -128,7 +143,7 @@ class IdfLayoutArtifactTests(unittest.TestCase):
             # Repository CSVs must produce exactly the native tables, including
             # the Pocket table that its firmware builds with.
             for csv, layout_id in [("partitions.csv", "embedded-v1"), ("partitions-vnext.csv", "dual-pet-v1"),
-                                   ("partitions-pocket.csv", "three-pet-3p5m-v3")]:
+                                   ("partitions-pocket.csv", "one-pet-10m-v5")]:
                 oracle = layouts.command([sys.executable, str(a / "gen_esp32part.py"), "--quiet",
                                           "--flash-size", "16MB", str(ROOT / "firmware" / csv)])
                 self.assertEqual(oracle, files[f"{layout_id}.bin"])

@@ -6,6 +6,22 @@
 #include "mbedtls/sha256.h"
 #include "pet_face_id.h"
 
+typedef struct
+{
+    const uint8_t *bytes;
+    uint32_t length;
+    bool fail;
+} flash_t;
+
+static int read_flash(void *context, uint32_t offset, void *out, uint32_t length)
+{
+    const flash_t *flash = context;
+    assert(offset <= flash->length && length <= flash->length - offset && length <= 8192u);
+    if (flash->fail) return 0;
+    memcpy(out, flash->bytes + offset, length);
+    return 1;
+}
+
 /* The cloud's imported face ID: `<pack ID>-<first 8 hex of the project ID>`. */
 static void face_id_checks(void)
 {
@@ -34,10 +50,21 @@ int main(int argc,char **argv)
     assert((code==FP_OK)==!strcmp(argv[2],"structural"));
     bool valid=pet_release_v2_validate_pack(&release,pack,bytes,workspace,workspace_bytes,&info);
     assert(valid==!strcmp(argv[1],"valid"));
+    flash_t flash = {.bytes = pack, .length = (uint32_t)bytes};
+    fp_pack_source_t source = {.bytes = (uint32_t)bytes, .context = &flash, .read = read_flash};
+    uint8_t scratch[257];
+    if (code == FP_OK)
+    {
+        assert(pet_release_v2_validate_source(&release, &source, &info, scratch, sizeof(scratch)) == valid);
+        flash.fail = true;
+        assert(!pet_release_v2_validate_source(&release, &source, &info, scratch, sizeof(scratch)));
+        flash.fail = false;
+    }
     if(valid){
         assert(!pet_release_v2_validate_pack(&release,pack,bytes-1,workspace,workspace_bytes,NULL));
         assert(!pet_release_v2_validate_pack(&release,pack,bytes+1,workspace,workspace_bytes,NULL));
         release.pack.sha256[0]=release.pack.sha256[0]=='a'?'b':'a';
+        assert(!pet_release_v2_validate_source(&release, &source, &info, scratch, sizeof(scratch)));
         assert(!pet_release_v2_validate_pack(&release,pack,bytes,workspace,workspace_bytes,NULL));
         release.pack.sha256[0]=hex[digest[0]>>4];
         /* The pack's own codecs decide, through the validator. Metadata that

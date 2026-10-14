@@ -12,7 +12,14 @@ A reply's statistics count the buffers the ring played empty (a click the
 queue's underrun counter never sees), the ring is the board's own
 (firmware/main/pet_audio_board.c, created as the Waveshare BSP creates it), and
 playback outranks the face's renderer.
+
+The story's sound loops (pet_atmosphere.c) play under a reply and hold the
+speaker after it; the harness embeds test loops written by
+tools/make_atmospheres.py's own encoder, so swapping the shipped loops changes
+nothing here. Every other scenario runs without a loop, as before.
 """
+import importlib.util
+import math
 import os
 from pathlib import Path
 import re
@@ -26,6 +33,9 @@ BSP = (ROOT.parent / "vendor/waveshare/Examples/ESP-IDF-V5.5.3/01_comprehensive_
        "waveshare__esp32_s3_touch_lcd_1_85B/esp32_s3_touch_lcd_1_85B.c")
 BOARD = ROOT / "main/pet_audio_board.c"
 IDF_I2S = Path(os.environ.get("IDF_PATH", "")) / "components/esp_driver_i2s/include/driver/i2s_common.h"
+_spec = importlib.util.spec_from_file_location("make_atmospheres", ROOT / "tools/make_atmospheres.py")
+atmospheres = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(atmospheres)
 
 
 def kconfig_option(name: str) -> str:
@@ -46,18 +56,45 @@ def dma_buffers_default() -> int:
     return int(re.search(r"^\s+default (\d+)$", kconfig_option("PET_AUDIO_DMA_BUFFERS"), re.M).group(1))
 
 
+# The sound bank's test sounds (audio_host/pet_audio_host.c), 16 kHz: the
+# frequency and the blocks of the dice and the hit, one-shots, and a loop.
+BANK_SOUNDS = {"dice": (1000, 32), "hit": (1500, 16), "campfire": (2000, 2)}
+
+
+def write_test_loops(directory: Path) -> Path:
+    """Every loop a steady tone at half of full scale, two blocks long, so a
+    level heard is the level pet_audio.c set: 500 Hz, and 750 Hz for victory
+    so a switch can be heard. The bank's test sounds the same way."""
+    loops = directory / "atmospheres"
+    loops.mkdir(exist_ok=True)
+    for name in atmospheres.NAMES:
+        frequency = 750 if name == "victory" else 500
+        tone = [round(16384 * math.sin(2 * math.pi * frequency * n / atmospheres.RATE))
+                for n in range(2 * atmospheres.BLOCK_SAMPLES)]
+        (loops / f"{name}.adpcm").write_bytes(atmospheres.encode(tone))
+    for name, (frequency, blocks) in BANK_SOUNDS.items():
+        tone = [round(16384 * math.sin(2 * math.pi * frequency * n / 16000))
+                for n in range(blocks * atmospheres.BLOCK_SAMPLES)]
+        (loops / f"{name}.adpcm").write_bytes(atmospheres.encode(tone))
+    return loops
+
+
 def build_audio_host(binary: str, dma_buffers: int | None = None) -> None:
     """Compiles pet_audio.c with the host stand-ins and the scenario runner:
     the board's ring as the Kconfig default builds it, or `dma_buffers`."""
     buffers = dma_buffers_default() if dma_buffers is None else dma_buffers
+    loops = write_test_loops(Path(binary).parent)
     subprocess.run([
         os.environ.get("CC", "cc"), "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-pthread",
         "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
         f"-DCONFIG_PET_PLAYBACK_TAIL_MS={tail_default_ms()}", f"-DCONFIG_LV_DEF_REFR_PERIOD={lvgl_refresh_ms()}",
-        f"-DCONFIG_PET_AUDIO_DMA_BUFFERS={buffers}",
+        f"-DCONFIG_PET_AUDIO_DMA_BUFFERS={buffers}", f'-DATMOSPHERE_DIR="{loops}"',
+        # A story loop's 45 s hold, short enough for a scenario to see it end.
+        "-DATMOSPHERE_HOLD_MS=4000",
         "-I", str(HOST / "include"), "-I", str(ROOT / "main"),
         str(ROOT / "main/pet_audio.c"), str(ROOT / "main/pet_pcm_gain.c"),
-        str(ROOT / "main/pet_speech_mouth.c"), str(HOST / "fake_rtos.c"),
+        str(ROOT / "main/pet_speech_mouth.c"), str(ROOT / "main/pet_atmosphere.c"),
+        str(ROOT / "main/pet_ima_adpcm.c"), str(HOST / "atmosphere_assets.c"), str(HOST / "fake_rtos.c"),
         str(HOST / "pet_audio_host.c"), "-o", binary,
     ], check=True)
 
@@ -107,6 +144,54 @@ class PlaybackTailTests(unittest.TestCase):
 
     def test_speech_slower_than_real_time_pauses_instead_of_chopping(self) -> None:
         self.run_scenario("slow-link")
+
+    def test_speech_plays_one_db_above_the_volume_setting_on_the_codec(self) -> None:
+        self.run_scenario("speech-volume-lift")
+
+    def test_the_story_loops_have_lower_case_names(self) -> None:
+        self.run_scenario("atmosphere-names")
+
+    def test_a_loop_plays_under_speech_and_never_moves_the_mouth(self) -> None:
+        self.run_scenario("atmosphere-under-speech")
+
+    def test_a_loop_holds_the_speaker_until_the_microphone_and_fades_first(self) -> None:
+        self.run_scenario("atmosphere-hold-microphone")
+
+    def test_a_cue_for_no_loop_fades_it_out_and_closes_the_speaker(self) -> None:
+        self.run_scenario("atmosphere-off")
+
+    def test_sound_cues_are_refused_while_a_loop_holds_the_speaker(self) -> None:
+        self.run_scenario("atmosphere-refuses-cues")
+
+    def test_a_loop_gives_way_to_speech_near_full_scale(self) -> None:
+        self.run_scenario("atmosphere-loud-speech")
+
+    def test_a_cue_in_the_hold_then_a_reply_switches_the_loop_cleanly(self) -> None:
+        self.run_scenario("atmosphere-cue-then-reply")
+
+    def test_a_stop_between_a_cue_and_its_reply_drops_the_cue(self) -> None:
+        self.run_scenario("atmosphere-stop-drops-cue")
+
+    def test_a_hold_left_alone_fades_out_and_closes(self) -> None:
+        self.run_scenario("atmosphere-hold-expires")
+
+    def test_cues_play_in_order_before_the_speech(self) -> None:
+        self.run_scenario("sounds-before-speech")
+
+    def test_playing_on_skips_the_cues_still_waiting(self) -> None:
+        self.run_scenario("sounds-play-on")
+
+    def test_a_reply_held_to_listen_gives_the_speaker_up_and_plays_on(self) -> None:
+        self.run_scenario("hold-to-listen")
+
+    def test_a_stinger_plays_in_the_tail_or_opens_the_speaker(self) -> None:
+        self.run_scenario("stinger")
+
+    def test_a_bank_loop_plays_under_speech(self) -> None:
+        self.run_scenario("atmosphere-bank-loop")
+
+    def test_a_stalled_sound_read_does_not_stall_speech(self) -> None:
+        self.run_scenario("stalled-sound-read")
 
 
 class DeeperRingTests(unittest.TestCase):

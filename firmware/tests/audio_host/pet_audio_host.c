@@ -1,5 +1,6 @@
 /* Speech playback through the real firmware/main/pet_audio.c: the end of a
- * reply (test_playback_tail.py) and mouth timing (test_mouth_timing.py).
+ * reply and the story's loops (test_playback_tail.py), and mouth timing
+ * (test_mouth_timing.py).
  *
  * Its tasks run on POSIX threads (fake_rtos.c). The board (pet_audio_board.h)
  * is a model of the I2S TX DMA ring the device has: CONFIG_PET_AUDIO_DMA_BUFFERS
@@ -27,9 +28,13 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <assert.h>
+#include <stdatomic.h>
+#include "pet_atmosphere.h"
 #include "pet_audio.h"
 #include "pet_audio_board.h"
 #include "pet_face.h"
+#include "pet_sound_bank.h"
 
 #ifndef CONFIG_PET_PLAYBACK_TAIL_MS
 #error "Build with -DCONFIG_PET_PLAYBACK_TAIL_MS=<the Kconfig default>"
@@ -67,6 +72,11 @@ typedef struct {
     uint32_t rate;
     uint64_t speech_frames_before;
     bool silent;
+    /* The largest magnitude written, that of the last sample, and how often
+     * the sign changed. */
+    uint16_t peak;
+    uint16_t last;
+    uint16_t crossings;
 } write_record_t;
 
 typedef struct {
@@ -111,6 +121,8 @@ static struct {
     uint64_t speech_frames;
     int64_t last_speech_end_us;
     bool microphone_open;
+    /* The speaker's last volume (esp_codec_dev_set_out_vol). */
+    int speaker_volume;
     esp_codec_dev_sample_info_t microphone_format;
     int microphone_opens;
     int microphone_closes;
@@ -262,8 +274,14 @@ int esp_codec_dev_write(esp_codec_dev_handle_t handle, void *data, int len)
     if (!handle->output || len <= 0 || (len & 1)) abort();
     const int16_t *pcm = data;
     uint32_t frames = (uint32_t)len / 2u;
-    bool silent = true;
-    for (uint32_t i = 0; i < frames; i++) silent = silent && pcm[i] == 0;
+    uint16_t peak = 0;
+    uint16_t crossings = 0;
+    for (uint32_t i = 0; i < frames; i++) {
+        uint16_t magnitude = (uint16_t)abs(pcm[i]);
+        if (magnitude > peak) peak = magnitude;
+        if (i && (pcm[i] < 0) != (pcm[i - 1] < 0)) crossings++;
+    }
+    bool silent = peak == 0;
     pthread_mutex_lock(&g_lock);
     int64_t starve = 0;
     if (!silent && g.speaker_open && ++g.speech_writes == g.starve_at_write) starve = g.starve_us;
@@ -297,6 +315,7 @@ int esp_codec_dev_write(esp_codec_dev_handle_t handle, void *data, int len)
         g.writes[g.write_count++] = (write_record_t){
             .start_us = start, .end_us = end, .heard_end_us = end + (int64_t)g.fill_us,
             .frames = frames, .rate = rate, .speech_frames_before = g.speech_frames, .silent = silent,
+            .peak = peak, .last = (uint16_t)abs(pcm[frames - 1]), .crossings = crossings,
         };
     }
     if (!silent) {
@@ -334,7 +353,9 @@ int esp_codec_dev_read(esp_codec_dev_handle_t handle, void *data, int len)
 int esp_codec_dev_set_out_vol(esp_codec_dev_handle_t handle, int volume)
 {
     (void)handle;
-    (void)volume;
+    pthread_mutex_lock(&g_lock);
+    g.speaker_volume = volume;
+    pthread_mutex_unlock(&g_lock);
     return 0;
 }
 
@@ -364,6 +385,70 @@ void pet_face_set_audio_level(uint8_t level)
 
 void pet_face_set_speech_articulation(uint8_t level) { (void)level; }
 void pet_face_begin_speech_stream(pet_speech_mouth_mode_t mode) { (void)mode; }
+
+/* The sound bank: steady 16 kHz tones at half of full scale that
+ * test_playback_tail.py writes. */
+#define BANK_SOUND(name) \
+    extern const uint8_t name##_sound_start[] __asm__("_binary_" #name "_adpcm_start"); \
+    extern const uint8_t name##_sound_end[] __asm__("_binary_" #name "_adpcm_end");
+BANK_SOUND(campfire)
+BANK_SOUND(dice)
+BANK_SOUND(hit)
+static const struct {
+    const char *id;
+    pet_sound_kind_t kind;
+    const uint8_t *start;
+    const uint8_t *end;
+} BANK[] = {
+    { "campfire", PET_SOUND_LOOP, campfire_sound_start, campfire_sound_end },
+    { "dice", PET_SOUND_ONE_SHOT, dice_sound_start, dice_sound_end },
+    { "hit", PET_SOUND_ONE_SHOT, hit_sound_start, hit_sound_end },
+};
+
+static atomic_uint bank_generation = 1;
+
+int pet_sound_bank_find(const char *id, pet_sound_kind_t kind, uint32_t *generation)
+{
+    if (generation) *generation = atomic_load(&bank_generation);
+    for (size_t i = 0; id && i < sizeof(BANK) / sizeof(BANK[0]); i++) {
+        if (BANK[i].kind == kind && !strcmp(BANK[i].id, id)) return (int)i;
+    }
+    return -1;
+}
+
+static atomic_bool bank_stalled, bank_entered;
+static pthread_t media_thread;
+uint32_t pet_sound_bank_generation(void)
+{
+    return atomic_load(&bank_generation);
+}
+
+bool pet_sound_bank_copy(int index, uint8_t *buffer, size_t capacity, size_t *bytes, uint32_t *rate)
+{
+    assert(pthread_equal(pthread_self(), media_thread));
+    atomic_store(&bank_entered, true);
+    while (atomic_load(&bank_stalled)) vTaskDelay(1);
+    if (index < 0 || (size_t)index >= sizeof(BANK) / sizeof(BANK[0])) return false;
+    size_t length = (size_t)(BANK[index].end - BANK[index].start);
+    if (length > capacity) return false;
+    memcpy(buffer, BANK[index].start, length);
+    *bytes = length;
+    *rate = 16000;
+    return true;
+}
+
+/* The reply's cues have played (pet_audio_playback_hold_for_sounds). */
+static int g_played;
+static uint32_t g_played_stream;
+static int64_t g_played_us;
+static void sounds_played(uint32_t stream_id)
+{
+    pthread_mutex_lock(&g_lock);
+    g_played++;
+    g_played_stream = stream_id;
+    g_played_us = esp_timer_get_time();
+    pthread_mutex_unlock(&g_lock);
+}
 
 static void playback_done(uint32_t stream_id)
 {
@@ -430,13 +515,16 @@ static bool speaker_closed(void) { return g.closes >= s_expected_closes && !g.sp
 static bool microphone_opened(void) { return g.microphone_opens > 0; }
 static bool capture_finished(void) { return g.capture_done_count > 0; }
 
+/* The amplitude of the speech stream_reply sends. */
+static int16_t s_speech_level = 6000;
+
 /* Streams one reply: 40 ms frames of a square wave, then the final marker. */
 static int stream_reply(uint32_t stream, uint32_t rate, int frames_before_gap, int frames_after_gap,
                         int64_t gap_ms)
 {
     int16_t pcm[1024];
     size_t samples = rate / 25u;
-    for (size_t i = 0; i < samples; i++) pcm[i] = (i / 12u) % 2u ? 6000 : -6000;
+    for (size_t i = 0; i < samples; i++) pcm[i] = (int16_t)((i / 12u) % 2u ? s_speech_level : -s_speech_level);
     pthread_mutex_lock(&g_lock);
     s_expected_speech_frames = g.speech_frames + (uint64_t)samples * (uint64_t)(frames_before_gap + frames_after_gap);
     pthread_mutex_unlock(&g_lock);
@@ -1031,8 +1119,591 @@ static int scenario_mouth_skipped_frames(void)
     return 0;
 }
 
+/* ---- Story loops ------------------------------------------------------ */
+
+/* The test loops (test_playback_tail.py): a steady tone at half of full
+ * scale, 500 Hz and victory's 750 Hz. pet_audio.c plays them at a quarter
+ * under speech and at 40% after it. */
+#define LOOP_PEAK 16384
+#define UNDER_SPEECH_PEAK (LOOP_PEAK / 8)
+#define HOLD_PEAK (LOOP_PEAK / 5)
+/* Tap to talk in a loop's hold waits for one 20 ms fade block and silence
+ * for the ring and one DMA buffer more, after the codec takeover. */
+#define LOOP_YIELD_MS (TAKEOVER_MS + 20 + DMA_MS + 10)
+
+static bool near(uint16_t peak, int expected) { return peak >= expected * 9 / 10 && peak <= expected * 11 / 10; }
+
+static int64_t reply_done_us(void)
+{
+    s_expected_done = 1;
+    if (!wait_for(reply_done, 3000)) return 0;
+    pthread_mutex_lock(&g_lock);
+    int64_t done = g.done_us[0];
+    pthread_mutex_unlock(&g_lock);
+    return done;
+}
+
+/* Called with g_lock held: the largest peak of the writes started in [from, to). */
+static uint16_t peak_between(int64_t from_us, int64_t to_us)
+{
+    uint16_t peak = 0;
+    for (size_t i = 0; i < g.write_count; i++) {
+        if (g.writes[i].start_us >= from_us && g.writes[i].start_us < to_us && g.writes[i].peak > peak) {
+            peak = g.writes[i].peak;
+        }
+    }
+    return peak;
+}
+
+/* Called with g_lock held: the last write that carried sound. */
+static const write_record_t *last_sound(void)
+{
+    for (size_t i = g.write_count; i > 0; i--) {
+        if (!g.writes[i - 1].silent) return &g.writes[i - 1];
+    }
+    return NULL;
+}
+
+static int scenario_atmosphere_names(void)
+{
+    static const char *const names[] = {
+        "calm", "forest", "water", "night", "cave", "storm", "danger", "battle", "magic", "victory",
+    };
+    for (int i = 0; i < 10; i++) {
+        CHECK(pet_atmosphere_from_name(names[i]) == (pet_atmosphere_t)(PET_ATMOSPHERE_CALM + i), "%s", names[i]);
+    }
+    static const char *const unknown[] = { "", "none", "Storm", "storm ", "rain" };
+    for (size_t i = 0; i < sizeof(unknown) / sizeof(unknown[0]); i++) {
+        CHECK(pet_atmosphere_from_name(unknown[i]) == PET_ATMOSPHERE_NONE, "\"%s\" names a loop", unknown[i]);
+    }
+    CHECK(pet_atmosphere_from_name(NULL) == PET_ATMOSPHERE_NONE, "NULL names a loop");
+    return 0;
+}
+
+/* Speech plays 1 dB (two volume steps) above the setting on the codec, never
+ * in the samples; muted stays muted, and the top of the scale is the limit. */
+static int scenario_speech_volume_lift(void)
+{
+    static const struct {
+        uint8_t setting;
+        int speech;
+    } cases[] = { { 55, 57 }, { 0, 0 }, { 99, 100 } };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        pet_audio_set_volume(cases[i].setting);
+        if (stream_reply((uint32_t)(301 + i), 24000, 4, 0, 0)) return 1;
+        pthread_mutex_lock(&g_lock);
+        int volume = g.speaker_volume;
+        pthread_mutex_unlock(&g_lock);
+        CHECK(volume == cases[i].speech, "volume %u played speech at %d, expected %d", cases[i].setting, volume,
+              cases[i].speech);
+    }
+    return 0;
+}
+
+/* Cued before a reply, the loop fades in under it at a quarter of its level,
+ * in every slice. The mouth follows the speech alone: this reply is silent,
+ * so the mouth never opens. */
+static int scenario_atmosphere_under_speech(void)
+{
+    pet_atmosphere_cue(PET_ATMOSPHERE_STORM);
+    s_speech_level = 0;
+    if (stream_reply(101, 24000, 12, 0, 0)) return 1;
+    REQUIRE(reply_done_us(), "the reply was reported done");
+    pthread_mutex_lock(&g_lock);
+    /* 12 frames of 40 ms: the reply's first 24 writes, 20 ms each. */
+    REQUIRE(g.write_count >= 24, "%zu writes", g.write_count);
+    bool every = true;
+    uint16_t faded_in = 0;
+    for (size_t i = 0; i < 24; i++) {
+        every = every && !g.writes[i].silent;
+        if (i >= 18 && g.writes[i].peak > faded_in) faded_in = g.writes[i].peak;
+    }
+    uint16_t first = g.writes[0].peak;
+    uint8_t mouth = 0;
+    for (size_t i = 0; i < g.level_count; i++) {
+        if (g.levels[i].level > mouth) mouth = g.levels[i].level;
+    }
+    pthread_mutex_unlock(&g_lock);
+    CHECK(every, "a slice of the reply played without the loop");
+    CHECK(first < UNDER_SPEECH_PEAK / 4, "the loop began at %u: no fade-in", first);
+    CHECK(near(faded_in, UNDER_SPEECH_PEAK), "under speech the loop peaked at %u, expected %d", faded_in,
+          UNDER_SPEECH_PEAK);
+    CHECK(mouth == 0, "the loop opened the mouth to %u", mouth);
+    return 0;
+}
+
+/* After the reply the loop holds the speaker at 40%, past the usual tail.
+ * Tap to talk: one block fades it out and silence follows until the ring has
+ * played the fade; only then does the speaker close and the microphone open. */
+static int scenario_atmosphere_hold_microphone(void)
+{
+    pet_atmosphere_cue(PET_ATMOSPHERE_CALM);
+    if (stream_reply(111, 24000, 6, 0, 0)) return 1;
+    int64_t done = reply_done_us();
+    REQUIRE(done, "the reply was reported done");
+    sleep_until(done + (TAIL_MS + 500) * 1000);
+    REQUIRE(speaker_opens_minus_closes() == 1, "the loop holds the speaker past the %lld ms tail", (long long)TAIL_MS);
+    int64_t before = now_us();
+    REQUIRE(pet_audio_capture_start(112) == ESP_OK, "the microphone may start in the hold");
+    REQUIRE(wait_for(microphone_opened, 1000), "the microphone opened");
+    vTaskDelay(60);
+    pet_audio_capture_stop();
+    REQUIRE(wait_for(capture_finished, 1000), "the capture finished");
+    pthread_mutex_lock(&g_lock);
+    int64_t microphone = g.microphone_open_us, closed = g.close_us[0];
+    uint16_t held = peak_between(done + 500 * 1000, before);
+    const write_record_t *fade = last_sound();
+    REQUIRE(fade, "the loop never played");
+    uint32_t silence = 0;
+    for (const write_record_t *w = fade + 1; w < g.writes + g.write_count; w++) silence += w->frames;
+    printf("the microphone waited %lld ms; the hold peaked at %u\n", (long long)((microphone - before) / 1000), held);
+    CHECK(near(held, HOLD_PEAK), "the hold peaked at %u, expected %d", held, HOLD_PEAK);
+    CHECK(g.closes == 1 && closed >= before && closed <= microphone, "the speaker closed before the microphone");
+    CHECK(fade->start_us >= before && fade->last == 0, "the loop's last block ends at %u, not faded", fade->last);
+    CHECK(fade->heard_end_us <= closed, "the speaker closed %.1f ms before the fade was heard",
+          (fade->heard_end_us - closed) / 1000.0);
+    CHECK(silence >= DMA_FRAMES + PET_AUDIO_DMA_FRAMES, "%u frames of silence after the fade", silence);
+    CHECK(microphone - before <= LOOP_YIELD_MS * 1000, "the microphone waited %lld ms",
+          (long long)((microphone - before) / 1000));
+    CHECK(g.done_count == 1 && g.writes_while_closed == 0, "done %d, writes while closed %d", g.done_count,
+          g.writes_while_closed);
+    pthread_mutex_unlock(&g_lock);
+    CHECK(speaker_writes_started_after(microphone) == 0, "the speaker was written after the microphone opened");
+    return 0;
+}
+
+/* A cue for no loop while the loop holds the speaker after a 16 kHz reply: it
+ * fades out over half a second, then silence until the speaker closes, long
+ * before the hold would end. */
+static int scenario_atmosphere_off(void)
+{
+    pet_atmosphere_cue(PET_ATMOSPHERE_NIGHT);
+    if (stream_reply(121, 16000, 6, 0, 0)) return 1;
+    int64_t done = reply_done_us();
+    REQUIRE(done, "the reply was reported done");
+    sleep_until(done + 600 * 1000);
+    int64_t cued = now_us();
+    pet_atmosphere_cue(PET_ATMOSPHERE_NONE);
+    s_expected_closes = 1;
+    REQUIRE(wait_for(speaker_closed, 2000), "the speaker closed");
+    pthread_mutex_lock(&g_lock);
+    int64_t closed = g.close_us[0];
+    uint16_t early = peak_between(cued, cued + 100 * 1000), late = peak_between(cued + 350 * 1000, cued + 450 * 1000);
+    const write_record_t *fade = last_sound();
+    REQUIRE(fade, "the loop never played");
+    int64_t faded_ms = (fade->start_us - cued) / 1000, closed_ms = (closed - cued) / 1000;
+    pthread_mutex_unlock(&g_lock);
+    printf("the loop faded from %u to %u and ended %lld ms after the cue; the speaker closed at %lld ms\n", early, late,
+           (long long)faded_ms, (long long)closed_ms);
+    CHECK(near(early, HOLD_PEAK) && late < early / 2, "the loop went from %u to %u: no fade", early, late);
+    CHECK(faded_ms >= 450 && faded_ms <= 500 + LATE_MS, "the loop ended %lld ms after the cue", (long long)faded_ms);
+    CHECK(fade->heard_end_us <= closed, "the speaker closed before the fade was heard");
+    CHECK(closed_ms >= 500 && closed_ms <= 500 + DRAIN_FLOOR_MS + LATE_MS, "the speaker closed %lld ms after the cue",
+          (long long)closed_ms);
+    return 0;
+}
+
+/* While the loop holds the speaker after a reply, a sound cue is refused
+ * without touching the speaker, and the loop plays on. */
+static int scenario_atmosphere_refuses_cues(void)
+{
+    pet_atmosphere_cue(PET_ATMOSPHERE_MAGIC);
+    if (stream_reply(131, 24000, 4, 0, 0)) return 1;
+    int64_t done = reply_done_us();
+    REQUIRE(done, "the reply was reported done");
+    sleep_until(done + 600 * 1000);
+    static int16_t cue[2400];
+    for (size_t i = 0; i < sizeof(cue) / sizeof(cue[0]); i++) cue[i] = (i / 6u) % 2u ? 3000 : -3000;
+    int64_t before = now_us();
+    CHECK(pet_audio_play_local((const uint8_t *)cue, sizeof(cue), NULL, NULL) == ESP_ERR_INVALID_STATE,
+          "the cue was not refused");
+    vTaskDelay(200);
+    pthread_mutex_lock(&g_lock);
+    CHECK(g.opens == 1 && g.closes == 0, "the cue touched the speaker: opens %d closes %d", g.opens, g.closes);
+    uint16_t after = peak_between(before, now_us());
+    pthread_mutex_unlock(&g_lock);
+    CHECK(near(after, HOLD_PEAK), "after the cue the loop peaked at %u", after);
+    return 0;
+}
+
+/* Speech near full scale (94%) under a loop: the loop gives way to the
+ * headroom the speech leaves, so nothing reaches the int16 limits and the
+ * reply counts nothing limited. */
+static int scenario_atmosphere_loud_speech(void)
+{
+    enum { LOUD = 30800 };
+    pet_atmosphere_cue(PET_ATMOSPHERE_CALM);
+    s_speech_level = LOUD;
+    if (stream_reply(141, 24000, 12, 0, 0)) return 1;
+    REQUIRE(reply_done_us(), "the reply was reported done");
+    pthread_mutex_lock(&g_lock);
+    uint16_t loudest = 0;
+    int clipped = 0;
+    for (size_t i = 0; i < 24 && i < g.write_count; i++) {
+        if (g.writes[i].peak > loudest) loudest = g.writes[i].peak;
+        clipped += g.writes[i].peak >= INT16_MAX;
+    }
+    pthread_mutex_unlock(&g_lock);
+    long limited = stats_value("limited");
+    CHECK(clipped == 0 && limited == 0, "%d slices reached full scale; limited=%ld", clipped, limited);
+    CHECK(loudest > LOUD, "the loop vanished under the speech (peak %u)", loudest);
+    return 0;
+}
+
+/* The blessing path: in a hold, a cue for another loop, then the next reply.
+ * The codec closes only once its fade is heard, and the new loop plays under
+ * the new reply. */
+static int scenario_atmosphere_cue_then_reply(void)
+{
+    pet_atmosphere_cue(PET_ATMOSPHERE_CALM);
+    if (stream_reply(151, 24000, 6, 0, 0)) return 1;
+    int64_t done = reply_done_us();
+    REQUIRE(done, "the reply was reported done");
+    sleep_until(done + 600 * 1000);
+    pet_atmosphere_cue(PET_ATMOSPHERE_VICTORY);
+    vTaskDelay(40);
+    s_speech_level = 0;
+    if (stream_reply(152, 16000, 12, 0, 0)) return 1;
+    s_expected_done = 2;
+    REQUIRE(wait_for(reply_done, 3000), "the second reply was reported done");
+    pthread_mutex_lock(&g_lock);
+    int64_t closed = g.close_us[0], reopened = g.open_us[1];
+    const write_record_t *fade = NULL;
+    uint32_t crossings = 0, frames = 0;
+    for (size_t i = 0; i < g.write_count; i++) {
+        const write_record_t *w = &g.writes[i];
+        if (w->start_us < closed && !w->silent) fade = w;
+        if (w->start_us >= reopened + 150 * 1000 && w->start_us < reopened + 400 * 1000) {
+            crossings += w->crossings;
+            frames += w->frames;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    double hz = frames ? crossings / 2.0 * 16000.0 / frames : 0.0;
+    CHECK(fade && fade->heard_end_us <= closed, "the codec closed before the hold's fade was heard");
+    CHECK(hz > 700 && hz < 800, "under the new reply the loop is at %.0f Hz, not victory's 750", hz);
+    return 0;
+}
+
+/* A stop between a cue and its reply drops the cue: the reply has no loop. */
+static int scenario_atmosphere_stop_drops_cue(void)
+{
+    pet_atmosphere_cue(PET_ATMOSPHERE_STORM);
+    pet_audio_playback_cancel();
+    s_speech_level = 0;
+    if (stream_reply(161, 24000, 6, 0, 0)) return 1;
+    REQUIRE(reply_done_us(), "the reply was reported done");
+    pthread_mutex_lock(&g_lock);
+    bool sound = last_sound() != NULL;
+    pthread_mutex_unlock(&g_lock);
+    CHECK(!sound, "the reply played the loop the stop dropped");
+    return 0;
+}
+
+/* Left alone, the hold ends ATMOSPHERE_HOLD_MS after the reply's last frame
+ * (the host build shortens it): the loop fades out over a second, then the
+ * speaker closes once the ring has played the fade. */
+static int scenario_atmosphere_hold_expires(void)
+{
+    pet_atmosphere_cue(PET_ATMOSPHERE_WATER);
+    if (stream_reply(171, 24000, 6, 0, 0)) return 1;
+    int64_t done = reply_done_us();
+    REQUIRE(done, "the reply was reported done");
+    s_expected_closes = 1;
+    REQUIRE(wait_for(speaker_closed, ATMOSPHERE_HOLD_MS + 3000), "the hold never ended");
+    pthread_mutex_lock(&g_lock);
+    int64_t closed = g.close_us[0], closed_ms = (closed - done) / 1000;
+    uint16_t held = peak_between(done + (ATMOSPHERE_HOLD_MS - 1000) * 1000, done + (ATMOSPHERE_HOLD_MS - 600) * 1000);
+    uint16_t fading = peak_between(done + (ATMOSPHERE_HOLD_MS + 400) * 1000, done + (ATMOSPHERE_HOLD_MS + 500) * 1000);
+    const write_record_t *fade = last_sound();
+    REQUIRE(fade, "the loop never played");
+    bool heard = fade->heard_end_us <= closed;
+    pthread_mutex_unlock(&g_lock);
+    CHECK(near(held, HOLD_PEAK) && fading < held / 2, "the loop went from %u to %u: no fade", held, fading);
+    CHECK(heard, "the speaker closed before the fade was heard");
+    CHECK(closed_ms >= ATMOSPHERE_HOLD_MS + 600 && closed_ms <= ATMOSPHERE_HOLD_MS + 1000 + DRAIN_FLOOR_MS + LATE_MS,
+          "the speaker closed %lld ms after the reply", (long long)closed_ms);
+    return 0;
+}
+
+/* Called with g_lock held: the frequency of the writes started in [from,
+ * to), from their sign changes. */
+static double hz_between(int64_t from_us, int64_t to_us)
+{
+    uint32_t crossings = 0, frames = 0, rate = 0;
+    for (size_t i = 0; i < g.write_count; i++) {
+        const write_record_t *w = &g.writes[i];
+        if (w->start_us < from_us || w->start_us >= to_us) continue;
+        crossings += w->crossings;
+        frames += w->frames;
+        rate = w->rate;
+    }
+    return frames ? crossings / 2.0 * rate / frames : 0.0;
+}
+
+/* The frames of a reply already started, as stream_reply sends them. */
+static int send_frames(uint32_t stream, uint32_t rate, int frames)
+{
+    int16_t pcm[1024];
+    size_t samples = rate / 25u;
+    for (size_t i = 0; i < samples; i++) pcm[i] = (int16_t)((i / 12u) % 2u ? s_speech_level : -s_speech_level);
+    for (int i = 0; i < frames; i++) {
+        REQUIRE(pet_audio_playback_enqueue(stream, (uint32_t)i, (const uint8_t *)pcm,
+                                           samples * sizeof(int16_t)) == ESP_OK, "enqueue %d", i);
+    }
+    pet_audio_playback_finish(stream);
+    return 0;
+}
+
+/* Three cues queued before a reply: the dice (1.008 s), the hit (0.504 s) and
+ * the dice again play first, in order, in its held silence, then its speech,
+ * and the played callback runs once between. A fourth cue, or a loop, is not
+ * queued. */
+static int scenario_sounds_before_speech(void)
+{
+    REQUIRE(pet_atmosphere_queue_sound("dice") && pet_atmosphere_queue_sound("hit") &&
+            pet_atmosphere_queue_sound("dice"), "three cues queue");
+    CHECK(!pet_atmosphere_queue_sound("hit"), "a fourth cue queued");
+    CHECK(!pet_atmosphere_queue_sound("campfire"), "a loop queued as a cue");
+    s_speech_level = 0;
+    int64_t started = now_us();
+    REQUIRE(pet_audio_playback_start(181, 16000, PET_REALTIME_BOOST_OFF,
+                                     PET_SPEECH_MOUTH_FULL_FRAME_AUTHORED) == ESP_OK, "start");
+    REQUIRE(pet_audio_playback_hold_for_sounds(sounds_played) && pet_audio_playback_held(), "the reply waits");
+    if (send_frames(181, 16000, 12)) return 1;
+    s_expected_done = 1;
+    REQUIRE(wait_for(reply_done, 6000), "the reply was reported done");
+    pthread_mutex_lock(&g_lock);
+    int64_t done = g.done_us[0], played_ms = (g_played_us - started) / 1000;
+    int played = g_played;
+    uint32_t stream = g_played_stream;
+    double first = hz_between(started + 150000, started + 800000);
+    double second = hz_between(started + 1150000, started + 1400000);
+    double third = hz_between(started + 1700000, started + 2300000);
+    pthread_mutex_unlock(&g_lock);
+    printf("the cues played for %lld ms at %.0f, %.0f and %.0f Hz\n", (long long)played_ms, first, second, third);
+    CHECK(played == 1 && stream == 181, "the played callback ran %d times", played);
+    CHECK(played_ms >= 2350 && played_ms <= 2520 + LATE_MS, "the cues played for %lld ms", (long long)played_ms);
+    CHECK(done - g_played_us >= 400000, "the speech was done %lld ms after the cues",
+          (long long)((done - g_played_us) / 1000));
+    CHECK(first > 900 && first < 1100 && second > 1350 && second < 1650 && third > 900 && third < 1100,
+          "the cues played out of order");
+    CHECK(!pet_audio_playback_hold_for_sounds(sounds_played), "a reply still waits");
+    return 0;
+}
+
+/* Playing on (the owner's tap) during the cues: the speech plays at once,
+ * the cue playing goes on under it, the one waiting never plays and no
+ * callback runs. */
+static int scenario_sounds_play_on(void)
+{
+    REQUIRE(pet_atmosphere_queue_sound("dice") && pet_atmosphere_queue_sound("hit"), "two cues queue");
+    s_speech_level = 0;
+    int64_t started = now_us();
+    REQUIRE(pet_audio_playback_start(191, 16000, PET_REALTIME_BOOST_OFF,
+                                     PET_SPEECH_MOUTH_FULL_FRAME_AUTHORED) == ESP_OK, "start");
+    REQUIRE(pet_audio_playback_hold_for_sounds(sounds_played), "the reply waits");
+    if (send_frames(191, 16000, 12)) return 1;
+    sleep_until(started + 300000);
+    REQUIRE(pet_audio_playback_hold(false) && !pet_audio_playback_held(), "the reply plays on");
+    s_expected_done = 1;
+    REQUIRE(wait_for(reply_done, 3000), "the reply was reported done");
+    sleep_until(started + 1500000);
+    pthread_mutex_lock(&g_lock);
+    int64_t done_ms = (g.done_us[0] - started) / 1000;
+    double under = hz_between(started + 400000, started + 900000);
+    double skipped = hz_between(started + 1150000, started + 1400000);
+    int played = g_played;
+    pthread_mutex_unlock(&g_lock);
+    CHECK(done_ms < 1600, "the speech waited for the cues: done after %lld ms", (long long)done_ms);
+    CHECK(under > 900 && under < 1100, "the dice went on under the speech at %.0f Hz", under);
+    CHECK(skipped < 100 && !played && !pet_atmosphere_sounds_waiting(), "the hit played (%.0f Hz) or waits", skipped);
+    return 0;
+}
+
+/* Held for the owner to talk over it (speech-pause-listen-v1). A plain hold
+ * still refuses a cue and the microphone. Held to listen, the reply gives the
+ * speaker up by itself at once and writes nothing more: written on, its
+ * silence would hold the codec all but an instant of each block, and the
+ * listening cue waiting for it could wait for ever. The cue then takes the
+ * codec without waiting, and the microphone after it, while the reply's
+ * frames wait; playing on, the reply opens the speaker again at its own rate,
+ * plays every held frame and is reported done once. The listen is no gap in
+ * its feed. */
+static int scenario_hold_to_listen(void)
+{
+    static int16_t cue[2400];
+    for (size_t i = 0; i < sizeof(cue) / sizeof(cue[0]); i++) cue[i] = (i / 6u) % 2u ? 3000 : -3000;
+    REQUIRE(pet_audio_playback_start(221, 16000, PET_REALTIME_BOOST_OFF,
+                                     PET_SPEECH_MOUTH_FULL_FRAME_AUTHORED) == ESP_OK, "start");
+    REQUIRE(pet_audio_playback_hold(true), "a plain hold");
+    CHECK(pet_audio_play_local((const uint8_t *)cue, sizeof(cue), NULL, NULL) == ESP_ERR_INVALID_STATE,
+          "a plain hold gave the speaker to a cue");
+    CHECK(pet_audio_capture_start(222) == ESP_ERR_INVALID_STATE, "a plain hold gave the speaker to the microphone");
+    REQUIRE(pet_audio_playback_hold(false), "a plain hold plays on");
+    /* Half of the reply plays, then it is held to listen. */
+    int16_t pcm[640];
+    for (size_t i = 0; i < 640; i++) pcm[i] = (int16_t)((i / 12u) % 2u ? s_speech_level : -s_speech_level);
+    for (uint32_t i = 0; i < 12; i++) {
+        if (i == 6) {
+            s_expected_speech_frames = 2 * 640;
+            REQUIRE(wait_for(speech_written, 2000), "the reply began");
+            REQUIRE(pet_audio_playback_hold_to_listen(), "held to listen");
+        }
+        REQUIRE(pet_audio_playback_enqueue(221, i, (const uint8_t *)pcm, sizeof(pcm)) == ESP_OK, "enqueue %u", i);
+    }
+    pet_audio_playback_finish(221);
+    s_expected_closes = 1;
+    REQUIRE(wait_for(speaker_closed, 500), "held to listen, the reply kept the speaker");
+    int64_t asked = now_us();
+    REQUIRE(pet_audio_play_local((const uint8_t *)cue, sizeof(cue), NULL, NULL) == ESP_OK, "the listening cue played");
+    REQUIRE(pet_audio_capture_start(222) == ESP_OK, "the microphone may start over the held reply");
+    REQUIRE(wait_for(microphone_opened, 500), "the microphone opened");
+    vTaskDelay(400);
+    pet_audio_capture_stop();
+    REQUIRE(wait_for(capture_finished, 1000), "the capture finished");
+    vTaskDelay(100);
+    int64_t resumed = now_us();
+    REQUIRE(pet_audio_playback_hold(false), "the reply plays on");
+    s_expected_done = 1;
+    REQUIRE(wait_for(reply_done, 3000), "the reply was reported done");
+    pthread_mutex_lock(&g_lock);
+    int64_t yielded = g.close_us[0];
+    size_t written_meanwhile = 0;
+    for (size_t i = 0; i < g.write_count; i++) {
+        written_meanwhile += g.writes[i].start_us >= yielded && g.writes[i].start_us < resumed &&
+                             g.writes[i].rate != 24000;
+    }
+    CHECK(g.writes_while_closed == 0 && !written_meanwhile, "the speaker was written closed (%d), or by the held "
+          "reply (%zu)", g.writes_while_closed, written_meanwhile);
+    CHECK(g.open_us[1] - asked <= TAKEOVER_MS * 1000, "the listening cue waited %lld ms for the codec",
+          (long long)((g.open_us[1] - asked) / 1000));
+    CHECK(g.opens == 3 && g.open_rate[1] == 24000 && g.open_rate[2] == 16000 && g.open_us[2] >= resumed,
+          "opens %d: the reply did not open the speaker again at its rate after playing on", g.opens);
+    CHECK(g.speech_frames == 2400 + 12 * 640, "%llu frames of the cue and the speech were written",
+          (unsigned long long)g.speech_frames);
+    CHECK(g.done_count == 1 && g.done_stream[0] == 221, "done %d", g.done_count);
+    pthread_mutex_unlock(&g_lock);
+    long gap = stats_value("feed_gap_ms");
+    CHECK(gap >= 0 && gap < LATE_MS, "the reply's feed gap was %ld ms", gap);
+    return 0;
+}
+
+/* A stinger plays in a reply's tail and holds the speaker until it has
+ * played, past the tail's end. With the speaker closed it opens it at 16 kHz
+ * for the stinger alone and closes it after. An id the bank lacks opens
+ * nothing. */
+static int scenario_stinger(void)
+{
+    if (reply_then_wait_in_tail(201, TAIL_MS - 300)) return 1;
+    int64_t asked = now_us();
+    REQUIRE(pet_audio_play_story_sound("hit"), "the stinger plays in the tail");
+    s_expected_closes = 1;
+    REQUIRE(wait_for(speaker_closed, 3000), "the speaker closed");
+    pthread_mutex_lock(&g_lock);
+    int64_t closed_ms = (g.close_us[0] - asked) / 1000;
+    double tail = hz_between(asked + 100000, asked + 400000);
+    pthread_mutex_unlock(&g_lock);
+    CHECK(tail > 1400 && tail < 1600, "in the tail the stinger played at %.0f Hz", tail);
+    CHECK(closed_ms >= 600 && closed_ms <= 504 + DRAIN_FLOOR_MS + LATE_MS, "the tail closed %lld ms after it began",
+          (long long)closed_ms);
+    CHECK(!pet_audio_play_story_sound("nothing"), "an id the bank lacks played");
+    vTaskDelay(60);
+    CHECK(speaker_opens_minus_closes() == 0, "an id the bank lacks opened the speaker");
+    int64_t alone = now_us();
+    REQUIRE(pet_audio_play_story_sound("hit"), "the stinger plays alone");
+    s_expected_closes = 2;
+    REQUIRE(wait_for(speaker_closed, 3000), "the speaker closed again");
+    pthread_mutex_lock(&g_lock);
+    int opens = g.opens;
+    uint32_t rate = g.open_rate[1];
+    closed_ms = (g.close_us[1] - alone) / 1000;
+    double heard = hz_between(alone + 100000, alone + 400000);
+    pthread_mutex_unlock(&g_lock);
+    CHECK(opens == 2 && rate == 16000, "the stinger opened the speaker at %u Hz (opens %d)", rate, opens);
+    CHECK(heard > 1400 && heard < 1600, "alone the stinger played at %.0f Hz", heard);
+    CHECK(closed_ms >= 500 && closed_ms <= 504 + DRAIN_FLOOR_MS + LATE_MS, "the speaker closed %lld ms after it began",
+          (long long)closed_ms);
+    return 0;
+}
+
+/* story.atmosphere naming a loop of the sound bank: it plays under a reply
+ * as a built-in loop does (atmosphere-under-speech). A one-shot's id names no
+ * loop. */
+static int scenario_atmosphere_bank_loop(void)
+{
+    s_speech_level = 0;
+    pet_atmosphere_cue_name("dice");
+    if (stream_reply(211, 16000, 6, 0, 0)) return 1;
+    REQUIRE(reply_done_us(), "the first reply was reported done");
+    pthread_mutex_lock(&g_lock);
+    bool sound = last_sound() != NULL;
+    pthread_mutex_unlock(&g_lock);
+    CHECK(!sound, "a one-shot's id played as a loop");
+    pet_atmosphere_cue_name("campfire");
+    int64_t second = now_us();
+    if (stream_reply(212, 16000, 12, 0, 0)) return 1;
+    s_expected_done = 2;
+    REQUIRE(wait_for(reply_done, 3000), "the second reply was reported done");
+    /* Its 19th to 24th 20 ms writes, after the loop's fade-in. */
+    pthread_mutex_lock(&g_lock);
+    uint16_t faded_in = 0;
+    uint32_t crossings = 0, frames = 0;
+    for (size_t i = 0, n = 0; i < g.write_count && n < 24; i++) {
+        if (g.writes[i].start_us < second || n++ < 18) continue;
+        if (g.writes[i].peak > faded_in) faded_in = g.writes[i].peak;
+        crossings += g.writes[i].crossings;
+        frames += g.writes[i].frames;
+    }
+    pthread_mutex_unlock(&g_lock);
+    double hz = frames ? crossings / 2.0 * 16000.0 / frames : 0.0;
+    CHECK(near(faded_in, UNDER_SPEECH_PEAK), "under speech the bank loop peaked at %u, expected %d", faded_in,
+          UNDER_SPEECH_PEAK);
+    CHECK(hz > 1900 && hz < 2100, "the bank loop played at %.0f Hz, not 2000", hz);
+    return 0;
+}
+
+/* A blocked flash read must not hold the codec lock or delay the reply. */
+static int scenario_stalled_sound_read(void)
+{
+    /* An index queued before replacement cannot identify a new-bank sound. */
+    REQUIRE(pet_atmosphere_queue_sound("hit"), "queued the old-bank cue");
+    atomic_fetch_add(&bank_generation, 1);
+    CHECK(!pet_atmosphere_play_queued(), "an old-bank cue survived replacement");
+    atomic_store(&bank_stalled, true);
+    pet_atmosphere_cue_name("campfire");
+    if (stream_reply(231, 16000, 12, 0, 0)) return 1;
+    s_expected_done = 1;
+    REQUIRE(wait_for(reply_done, 2000), "speech completed while the driver remained blocked");
+    REQUIRE(atomic_load(&bank_entered), "the media task entered the flash read");
+    REQUIRE(reply_done_us(), "speech drained while the sound read stayed blocked");
+    long gap = stats_value("feed_gap_ms");
+    CHECK(gap >= 0 && gap < LATE_MS, "blocked sound read left a %ld ms speech gap", gap);
+    pet_audio_playback_cancel();
+    atomic_fetch_add(&bank_generation, 1);
+    atomic_store(&bank_stalled, false);
+    vTaskDelay(100);
+    CHECK(!pet_atmosphere_active(), "cancelled old-bank sound became audible after its read completed");
+    return 0;
+}
+
+static void *media_worker(void *unused)
+{
+    (void)unused;
+    media_thread = pthread_self();
+    for (;;)
+    {
+        pet_atmosphere_prepare();
+        struct timespec delay = {.tv_nsec = 10000000};
+        nanosleep(&delay, NULL);
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
+    pthread_t media;
+    assert(!pthread_create(&media, NULL, media_worker, NULL));
     g_verbose = getenv("AUDIO_HOST_VERBOSE") != NULL;
     if (argc != 2) {
         fprintf(stderr, "usage: %s <scenario>\n", argv[0]);
@@ -1046,22 +1717,38 @@ int main(int argc, char **argv)
         const char *name;
         int (*run)(void);
     } scenarios[] = {
-        { "complete", scenario_complete },
-        { "stop-in-tail", scenario_stop_in_tail },
-        { "stop-while-draining", scenario_stop_while_draining },
-        { "new-reply-in-tail", scenario_new_reply_in_tail },
-        { "capture-in-tail", scenario_capture_in_tail },
-        { "cue-in-tail", scenario_cue_in_tail },
-        { "dma-underflow", scenario_dma_underflow },
-        { "slow-link", scenario_slow_link },
-        { "mouth-default", scenario_mouth_default },
-        { "mouth-later", scenario_mouth_later },
-        { "mouth-earlier", scenario_mouth_earlier },
-        { "mouth-earliest", scenario_mouth_earliest },
-        { "mouth-clamp", scenario_mouth_clamp },
-        { "mouth-drain", scenario_mouth_drain },
-        { "mouth-cancel", scenario_mouth_cancel },
-        { "mouth-skipped-frames", scenario_mouth_skipped_frames },
+        {"complete", scenario_complete},
+        {"stop-in-tail", scenario_stop_in_tail},
+        {"stop-while-draining", scenario_stop_while_draining},
+        {"new-reply-in-tail", scenario_new_reply_in_tail},
+        {"capture-in-tail", scenario_capture_in_tail},
+        {"cue-in-tail", scenario_cue_in_tail},
+        {"dma-underflow", scenario_dma_underflow},
+        {"slow-link", scenario_slow_link},
+        {"mouth-default", scenario_mouth_default},
+        {"mouth-later", scenario_mouth_later},
+        {"mouth-earlier", scenario_mouth_earlier},
+        {"mouth-earliest", scenario_mouth_earliest},
+        {"mouth-clamp", scenario_mouth_clamp},
+        {"mouth-drain", scenario_mouth_drain},
+        {"mouth-cancel", scenario_mouth_cancel},
+        {"mouth-skipped-frames", scenario_mouth_skipped_frames},
+        {"speech-volume-lift", scenario_speech_volume_lift},
+        {"atmosphere-names", scenario_atmosphere_names},
+        {"atmosphere-under-speech", scenario_atmosphere_under_speech},
+        {"atmosphere-hold-microphone", scenario_atmosphere_hold_microphone},
+        {"atmosphere-off", scenario_atmosphere_off},
+        {"atmosphere-refuses-cues", scenario_atmosphere_refuses_cues},
+        {"atmosphere-loud-speech", scenario_atmosphere_loud_speech},
+        {"atmosphere-cue-then-reply", scenario_atmosphere_cue_then_reply},
+        {"atmosphere-stop-drops-cue", scenario_atmosphere_stop_drops_cue},
+        {"atmosphere-hold-expires", scenario_atmosphere_hold_expires},
+        {"sounds-before-speech", scenario_sounds_before_speech},
+        {"sounds-play-on", scenario_sounds_play_on},
+        {"hold-to-listen", scenario_hold_to_listen},
+        {"stinger", scenario_stinger},
+        {"atmosphere-bank-loop", scenario_atmosphere_bank_loop},
+        {"stalled-sound-read", scenario_stalled_sound_read},
     };
     for (size_t i = 0; i < sizeof(scenarios) / sizeof(scenarios[0]); i++) {
         if (strcmp(argv[1], scenarios[i].name)) continue;

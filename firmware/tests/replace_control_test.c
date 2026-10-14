@@ -1,4 +1,5 @@
 #include "pet_replace_control.h"
+#include "pet_flash_layout.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -271,6 +272,16 @@ static void queue_new(char identity)
 int main(void)
 {
     flash=malloc(PET_REPLACE_MAX_BYTES+PET_REPLACE_MANIFEST_BYTES);assert(flash);
+    initialize();
+    server.operation.release.requirements.layout_id = PET_LAYOUT_ONE_10M;
+    server.operation.release.pack.bytes = PET_POCKET_MAX_PACK_BYTES + 1;
+    uint64_t untouched_generation = journal.journal.generation;
+    for (unsigned i = 0; i < 4; ++i)
+        step(true);
+    assert(!strcmp(worker.error_code, "PET_PACK_TOO_LARGE_10739712_BYTES"));
+    assert(server.operation.phase == PET_CLOUD_QUEUED && !server.operation.fence_confirmed);
+    assert(journal.state.phase == PET_REPLACE_EMPTY && journal.journal.generation == untouched_generation);
+    assert(!erases && !writes && !detaches && !verifications && !activations);
     initialize();finish();assert(erases==3&&writes==3&&verifications==1&&detaches==1);
     assert(downloads_completed==1&&!downloads_stopped&&download_writes==2&&!worker.download.client&&!worker.download.url[0]);
     /* Losing connectivity closes the kept connection but keeps the operation;

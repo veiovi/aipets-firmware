@@ -143,7 +143,7 @@ static bool decode(const uint8_t in[PET_FIRMWARE_RECEIPT_BYTES],pet_firmware_rec
     if(memcmp(in,"FWR2",4)||get32(in+4)!=PET_FIRMWARE_RECEIPT_BYTES||!get64(in+8)||
        get32(in+PET_FIRMWARE_RECEIPT_BYTES-4)!=crc(in,PET_FIRMWARE_RECEIPT_BYTES-4))return false;
     uint32_t fields[10];size_t at=16;for(unsigned i=0;i<10;++i){fields[i]=get32(in+at);at+=4;}
-    if(fields[0]>PET_FW_ROLLED_BACK||fields[7]>PET_LAYOUT_SINGLE_4M||fields[8]>1||fields[9]>PET_FW_STORAGE_RECOVERY)return false;
+    if(fields[0]>PET_FW_ROLLED_BACK||fields[7]>PET_LAYOUT_TWO_4M||fields[8]>1||fields[9]>PET_FW_STORAGE_RECOVERY)return false;
     pet_firmware_receipt_t v={.phase=(pet_fw_phase_t)fields[0],.image_bytes=fields[1],.downloaded_bytes=fields[2],
         .sequence=fields[3],.acknowledged_sequence=fields[4],.firmware_epoch=fields[5],.target_offset=fields[6],
         .layout_id=(pet_layout_id_t)fields[7],.image_verified=fields[8]!=0,.healthy_storage=(pet_fw_storage_t)fields[9]};

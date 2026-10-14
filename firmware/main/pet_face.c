@@ -19,7 +19,9 @@
 #include "freertos/semphr.h"
 #include "lvgl.h"
 #if CONFIG_PET_POCKET_TERMINAL
+#include <stdatomic.h>
 #include "pet_menu_assets.h"
+#include "pet_onboarding.h"
 #endif
 
 static const char *TAG = "pet_face";
@@ -146,6 +148,9 @@ typedef struct {
     char terminal_text[PET_FACE_TERMINAL_MAX + 1];
     uint8_t terminal_length;
     uint8_t terminal_typed;
+    /* The story frame, made the first time it shows; then only hidden or shown. */
+    lv_obj_t *story_frame;
+    atomic_bool story_frame_wanted;
 #endif
     char current_ssid[PET_SSID_MAX];
     char wifi_names[PET_WIFI_SCAN_MAX][PET_SSID_MAX];
@@ -205,6 +210,14 @@ static void open_settings(void)
     lv_label_set_text(s_face.wifi_status, "scanning...");
     if (s_face.callbacks.settings_opened) s_face.callbacks.settings_opened();
     if (s_face.callbacks.wifi_scan_requested) s_face.callbacks.wifi_scan_requested();
+}
+
+/* A swipe to another screen (Pocket Terminal): like the menu, it covers the
+ * face, which keeps its clocks but draws nothing until pet_face_show. */
+static void open_screen(pet_face_swipe_t swipe)
+{
+    s_face.settings_open = true;
+    s_face.callbacks.swiped(swipe);
 }
 
 static void close_settings(bool user_initiated)
@@ -281,12 +294,19 @@ static void touch_event(lv_event_t *event)
         return;
     }
 #endif
-    if (abs(dx) >= 48 && abs(dx) > abs(dy) && duration < 1500000) {
-        request_adjacent_face(dx < 0 ? 1 : -1);
+    const pet_face_swipe_t swipe = pet_face_swipe(s_face.touch_started_at.x, s_face.touch_started_at.y,
+                                                  point.x, point.y, duration);
+    if (swipe == PET_FACE_SWIPE_RIGHT || swipe == PET_FACE_SWIPE_LEFT) {
+        if (s_face.callbacks.swiped) open_screen(swipe);
+        else request_adjacent_face(swipe == PET_FACE_SWIPE_LEFT ? 1 : -1);
         return;
     }
-    if (dy >= 48 && abs(dy) > abs(dx) && duration < 1500000) {
+    if (swipe == PET_FACE_SWIPE_DOWN) {
         open_settings();
+        return;
+    }
+    if (swipe == PET_FACE_SWIPE_UP && s_face.callbacks.swiped) {
+        open_screen(swipe);
         return;
     }
     if (duration >= TOUCH_LONG_PRESS_US &&
@@ -467,6 +487,27 @@ static void animation_perf_record(bool rendered, uint32_t elapsed_us)
     s_face.perf_max_us = 0;
 }
 
+#if CONFIG_PET_POCKET_TERMINAL
+/* LVGL context: the frame changes only when it is shown or hidden, under the
+ * terminal line. */
+static void show_story_frame(bool shown)
+{
+    if (shown && !s_face.story_frame)
+        s_face.story_frame = pet_onboarding_story_frame(s_face.screen);
+    if (!s_face.story_frame)
+        return;
+    const bool hidden = lv_obj_has_flag(s_face.story_frame, LV_OBJ_FLAG_HIDDEN);
+    if (hidden != shown)
+        return; /* already as wanted */
+    if (shown)
+        lv_obj_remove_flag(s_face.story_frame, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_add_flag(s_face.story_frame, LV_OBJ_FLAG_HIDDEN);
+    if (s_face.terminal_line)
+        lv_obj_move_foreground(s_face.terminal_line);
+}
+#endif
+
 static void animation_tick(lv_timer_t *timer)
 {
     (void)timer;
@@ -509,6 +550,9 @@ static void animation_tick(lv_timer_t *timer)
     s_face.force_render = false;
     animation_perf_record(rendered, rendered ? (uint32_t)(esp_timer_get_time() - started) : 0);
     update_conversation_status();
+#if CONFIG_PET_POCKET_TERMINAL
+    show_story_frame(atomic_load(&s_face.story_frame_wanted));
+#endif
 }
 
 static lv_obj_t *create_button(lv_obj_t *parent, const char *text, int width,
@@ -596,10 +640,6 @@ static uint32_t face_option_index(const char *face_id)
 
 static void request_adjacent_face(int direction)
 {
-    if (s_face.callbacks.pet_swiped) {
-        s_face.callbacks.pet_swiped(direction);
-        return;
-    }
     if (!s_face.face_option_count || !s_face.callbacks.face_changed) return;
     uint32_t current = face_option_index(s_face.selected_face_id);
     uint32_t next = direction > 0 ?
@@ -1521,6 +1561,11 @@ static void terminal_step(lv_timer_t *timer)
     }
     lv_obj_add_flag(s_face.terminal_line, LV_OBJ_FLAG_HIDDEN);
     lv_timer_pause(timer);
+}
+
+void pet_face_set_story_frame(bool shown)
+{
+    atomic_store(&s_face.story_frame_wanted, shown);
 }
 
 void pet_face_announce(const char *text)

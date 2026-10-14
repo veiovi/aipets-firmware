@@ -6,3 +6,4 @@
 void *heap_caps_aligned_alloc(size_t alignment,size_t size,unsigned capabilities);
 void *heap_caps_calloc(size_t count,size_t size,unsigned capabilities);
 void heap_caps_free(void *memory);
+size_t heap_caps_get_largest_free_block(unsigned capabilities);

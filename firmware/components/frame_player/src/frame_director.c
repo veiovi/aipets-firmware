@@ -271,7 +271,7 @@ static void fp_enter_talk(fp_player_t *p)
     p->phase = FP_PHASE_TALK;
     p->current_emotion = 0;
     p->clear_requested = 0;
-    p->talk_stage = (int32_t)p->pack[p->view.talk_lut_offset + (uint32_t)p->audio_level];
+    p->talk_stage = (int32_t)fp_player_at(p, p->view.talk_lut_offset + (uint32_t)p->audio_level)[0];
     p->talk_dwell_ticks_left = FP_TALK_STAGE_MIN_DWELL_TICKS;
     p->talk_lower_streak = 0;
     if (p->view.speaking_pose_count > 0u) {
@@ -444,7 +444,7 @@ static void fp_tick_emotion_hold(fp_player_t *p)
 
 static void fp_tick_talk(fp_player_t *p)
 {
-    int32_t raw = (int32_t)p->pack[p->view.talk_lut_offset + (uint32_t)p->audio_level];
+    int32_t raw = (int32_t)fp_player_at(p, p->view.talk_lut_offset + (uint32_t)p->audio_level)[0];
     if (p->talk_dwell_ticks_left > 0) p->talk_dwell_ticks_left--;
     if (raw > p->talk_stage) {
         p->talk_stage = raw;
@@ -524,21 +524,18 @@ void fp_director_tick(fp_player_t *p)
         if (p->phase != FP_PHASE_SYS_STATIC || p->shown_sys_state != p->sys_state) fp_enter_sys_static(p);
         else fp_advance_clip(p);
         fp_actions_tick(p);
-        fp_render(p);
         return;
     }
     if (wants_talk) {
         if (p->phase != FP_PHASE_TALK) fp_enter_talk(p);
         else fp_tick_talk(p);
         fp_actions_tick(p);
-        fp_render(p);
         return;
     }
     if (wants_attend) {
         if (p->phase != FP_PHASE_ATTEND || p->shown_sys_state != p->sys_state) fp_enter_attend(p);
         else fp_advance_clip(p);
         fp_actions_tick(p);
-        fp_render(p);
         return;
     }
 
@@ -549,7 +546,6 @@ void fp_director_tick(fp_player_t *p)
         if (p->phase != FP_PHASE_IDLE) fp_enter_idle(p, 0);
         else fp_advance_clip(p);
         fp_actions_tick(p);
-        fp_render(p);
         return;
     }
 
@@ -589,5 +585,4 @@ void fp_director_tick(fp_player_t *p)
         break;
     }
     fp_actions_tick(p);
-    fp_render(p);
 }

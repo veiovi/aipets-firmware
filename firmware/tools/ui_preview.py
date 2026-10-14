@@ -8,6 +8,7 @@ contact sheet, so a design can be reviewed before it is flashed.
     python3 firmware/tools/ui_preview.py --output <directory>
     python3 firmware/tools/ui_preview.py --board amoled-206 --output <directory>
     python3 firmware/tools/ui_preview.py --board lcd-154 --output <directory>
+    python3 firmware/tools/ui_preview.py --style woodland --output <directory>
 
 Needs a C compiler (CC) and LVGL_SOURCE_DIR (or firmware/managed_components)
 and Pillow. LVGL objects are cached between runs.
@@ -28,8 +29,10 @@ CC = os.environ.get("CC", "cc")
 # LVGL as the Pocket build configures it (16-bit colour, Montserrat 14 default).
 LVGL_FLAGS = ["-std=c11", "-O1", "-DLV_CONF_SKIP", "-DLV_USE_STDLIB_MALLOC=1", "-DLV_USE_STDLIB_STRING=1",
               "-DLV_USE_STDLIB_SPRINTF=1", "-DLV_COLOR_DEPTH=16", "-I", str(LVGL)]
-PAGES = ["boot", "home", "home-cards", "home-log", "home-about", "wifi", "password", "code", "link",
-         "link-question", "move-code", "move-question", "restart", "about", "about-notices"]
+PAGES = ["boot", "home", "home-cards", "home-log", "home-about", "home-pets", "deck-style", "wifi", "password", "code",
+         "link", "link-question", "move-code", "move-question", "restart", "about", "about-notices", "deck-story",
+         "stories", "stories-restart", "blessings", "character", "blessings-game", "character-game",
+         "story", "story-empty", "frame", "frame-detour", "frame-hurry"]
 
 
 def lvgl_objects(cache: Path) -> list[str]:
@@ -64,6 +67,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--board", choices=("round-185b", "amoled-206", "lcd-154"), default="round-185b")
+    parser.add_argument("--style", choices=("terminal", "woodland"), default="terminal")
+    parser.add_argument("--pet", type=Path, help="optional artwork to preview behind the story frame")
     arguments = parser.parse_args()
     output = arguments.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -76,10 +81,20 @@ def main() -> None:
     subprocess.run([CC, *LVGL_FLAGS, "-g", "-Wall", "-Wextra", "-Werror", "-DCONFIG_PET_POCKET_TERMINAL=1",
                     "-I", str(ROOT / "tests/onboarding_host/include"), "-I", str(ROOT / "main"),
                     str(ROOT / "tests/onboarding_host/ui_preview.c"), str(ROOT / "main/pet_enrollment.c"),
-                    str(ROOT / "main/pet_menu_font.c"), str(ROOT / "main/pet_menu_icons.c"),
+                    str(ROOT / "main/pet_menu_font.c"), str(ROOT / "main/pet_menu_woodland_font.c"),
+                    str(ROOT / "main/pet_menu_icons.c"),
                     *board_flags, *objects, "-lm", "-o", str(binary)], check=True)
+    # The pet as the face draws it: a square as wide as the glass's longer side.
+    side = max({"round-185b": (360, 360), "amoled-206": (410, 502), "lcd-154": (240, 240)}[arguments.board])
+    pet = (Image.open(arguments.pet).convert("RGB").resize((side, side), Image.Resampling.NEAREST)
+           if arguments.pet else Image.new("RGB", (side, side), (32, 48, 40)))
+    raw = output / "pet.rgb565"
+    rgb = pet.tobytes()
+    raw.write_bytes(b"".join(((rgb[i] >> 3) << 11 | (rgb[i + 1] >> 2) << 5 | rgb[i + 2] >> 3).to_bytes(2, "little")
+                             for i in range(0, len(rgb), 3)))
     # LVGL's default assert handler spins forever: a stuck page fails here instead.
-    subprocess.run([str(binary), str(output)], check=True, capture_output=True, timeout=120)
+    subprocess.run([str(binary), str(output), str(raw), arguments.style], check=True, capture_output=True, timeout=120)
+    raw.unlink()
     columns = 4
     rows = (len(PAGES) + columns - 1) // columns
     cell_width, cell_height = {"round-185b": (380, 380), "amoled-206": (430, 522),
