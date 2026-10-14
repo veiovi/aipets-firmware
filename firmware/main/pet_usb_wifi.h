@@ -5,7 +5,7 @@
 
 #define PET_USB_WIFI_PREFIX "AIPETS_WIFI "
 #define PET_USB_WIFI_FRAME_BYTES 1024
-typedef enum { PET_USB_WIFI_INFO, PET_USB_WIFI_SAVE, PET_USB_WIFI_SAVED } pet_usb_wifi_action_t;
+typedef enum { PET_USB_WIFI_INFO, PET_USB_WIFI_SAVE, PET_USB_WIFI_SAVED, PET_USB_WIFI_FORGET } pet_usb_wifi_action_t;
 typedef struct {
     pet_usb_wifi_action_t action;
     char request_id[37], mac[18], ssid[33], password[65];

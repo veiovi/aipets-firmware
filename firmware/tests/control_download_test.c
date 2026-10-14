@@ -32,7 +32,8 @@ static unsigned fail_connect,fail_send;
 static int status=206,json_status=200;
 static bool silent,close_header,mid_body_fail;
 static const char *wrong_range,*auth_buffer;
-static const uint32_t total=4*65536+3;
+static uint32_t total=4*65536+3;
+static char last_url[256];
 
 int64_t esp_timer_get_time(void){return now;}
 esp_err_t esp_crt_bundle_attach(void *p){(void)p;return ESP_OK;}
@@ -51,7 +52,8 @@ esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *c)
     assert(c->disable_auto_redirect&&c->crt_bundle_attach&&c->timeout_ms==10000&&c->event_handler&&c->user_data&&c->transport);
     assert(!strncmp(c->url,"https://device.fixture.invalid/v",32));
     fake_client_t *f=calloc(1,sizeof(*f));assert(f);f->event_handler=c->event_handler;f->transport=c->transport;
-    f->user_data=c->user_data;f->method=c->method;snprintf(f->url,sizeof(f->url),"%s",c->url);++inits;return f;
+    f->user_data=c->user_data;f->method=c->method;snprintf(f->url,sizeof(f->url),"%s",c->url);++inits;
+    snprintf(last_url,sizeof(last_url),"%s",c->url);return f;
 }
 esp_err_t esp_http_client_set_header(esp_http_client_handle_t h,const char *k,const char *v)
 {
@@ -297,6 +299,29 @@ int main(void)
     assert(pet_control_http_json(&http,"/v2/device/pets/poll","{}",json,sizeof(json),&r)&&!pet_control_http_last_timing().reused&&inits==i1+1);
     pet_control_http_close_kept();
     assert(!s_json.client&&inits==cleanups&&transports==destroyed&&auth_sets==auth_cleared);
+    /* A story event's pack: at most 250 KiB, whole in one range on a connection
+     * of its own, from /v2/device/story-events/<sha256> with the credential.
+     * A larger pack or a sha256 not in lowercase hex is never asked for. */
+    static char event[256000];
+    total=sizeof(event);i1=inits;
+    assert(pet_control_http_event_range(&http,sha,total,0,event,total,&r)&&r.status==206&&r.bytes==total);
+    assert(inits==i1+1&&inits==cleanups&&!strcmp(last_url,"https://device.fixture.invalid/v2/device/story-events/"
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    assert(!pet_control_http_event_range(&http,sha,total+1,0,event,total,&r)&&inits==i1+1);
+    assert(!pet_control_http_event_range(&http,"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",total,0,event,
+        total,&r)&&inits==i1+1);
+    /* The sound bank: its ranges share one connection, from
+     * /v2/device/sound-bank/<sha256> with the credential. A bank over 2 MiB or
+     * a range over 64 KiB is never asked for. */
+    pet_control_download_t bank={0};
+    total=0x200000;i1=inits;arm_us=30000000;
+    assert(pet_control_http_sound_bank_range(&http,&bank,sha,total,0,chunk,sizeof(chunk),&r)&&r.status==206);
+    assert(pet_control_http_sound_bank_range(&http,&bank,sha,total,sizeof(chunk),chunk,sizeof(chunk),&r)&&r.status==206);
+    assert(inits==i1+1&&bank.reused==1&&!strcmp(last_url,"https://device.fixture.invalid/v2/device/sound-bank/"
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    assert(!pet_control_http_sound_bank_range(&http,&bank,sha,total+1,0,chunk,sizeof(chunk),&r));
+    assert(!pet_control_http_sound_bank_range(&http,&bank,sha,total,0,chunk,sizeof(chunk)+1,&r)&&inits==i1+1);
+    pet_control_download_end(&bank,false);assert(strstr(logged,"sound bank download stopped: 131072 of 2097152 bytes"));
     puts("control downloads: one kept connection per operation, per-range deadline and credential, discard on any deviation, "
          "fallback after two connection failures, and one summary line passed; control JSON requests share one kept "
          "connection, with a fresh connection when it is idle, closed or reset");

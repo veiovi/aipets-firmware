@@ -75,7 +75,7 @@ def read_geometry(binary: Path, app_bytes: int | None = None) -> dict:
     if (value["flashBytes"] != 0x1000000 or value["sectorBytes"] != 0x1000 or
             value["partitionTableOffset"] != 0x8000 or value["partitionTableBytes"] != 0xc00 or
             value["bootloaderOffset"] != 0 or value["bootloaderRegionBytes"] != 0x8000 or
-            value["manifestReservationBytes"] != 0x2000 or len(value["layouts"]) != 7):
+            value["manifestReservationBytes"] != 0x2000 or len(value["layouts"]) != 9):
         raise LayoutError("Unsupported geometry export version")
     return value
 

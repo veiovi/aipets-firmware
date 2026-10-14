@@ -9,6 +9,7 @@
 #include "pet_face_profile.h"
 #include "pet_ota.h"
 #include "pet_control_wire.h"
+#include "pet_session_wire.h"
 
 typedef struct {
     uint32_t version;
@@ -60,6 +61,27 @@ typedef struct {
     bool (*credential_commit_received)(const pet_credential_commit_t *command);
     bool (*speech_preference_received)(const pet_speech_preference_t *preference);
     esp_err_t (*ota_update)(const pet_ota_request_t *request);
+    /* story-log-v1: the story log of the session's pet (its face ID), oldest
+     * line first; `count` 0 clears it. The lines live only during the call. */
+    void (*story_log)(const char *face_id, const char *const *lines, size_t count);
+    /* story-mode-v1: the story of the session's pet (its face ID) and the
+     * owner's stories, each whole; they live only during the call. */
+    void (*story_state)(const char *face_id, const pet_story_state_t *state);
+    void (*story_list)(const char *face_id, const pet_story_list_t *list);
+    /* story-game-v1: the sound loop under the next story turn's speech, by
+     * its name, a built-in's or a sound bank loop's id (it lives only during
+     * the call), or NULL to fade it out. */
+    void (*story_atmosphere)(const char *name_or_null);
+    /* story-event-v1: the events the story can reach next, whole, which a
+     * gateway without story events empties; and a milestone's event to show
+     * once its speech has drained, which pet_network_story_event_ended ends.
+     * Each lives only during the call. */
+    void (*story_events)(const pet_story_events_t *events);
+    void (*story_event)(const char *id);
+    /* sound-bank-v1: the sound bank to keep, by its sha256 and size, and a
+     * game cue for the next reply, by its sound id. */
+    void (*sound_bank)(const char *sha256, uint32_t bytes);
+    void (*story_sound)(const char *id);
 } pet_network_callbacks_t;
 
 #define PET_WIFI_SCAN_MAX 12
@@ -79,6 +101,13 @@ esp_err_t pet_network_start(const pet_config_t *config, const pet_network_callba
 esp_err_t pet_network_start_wifi_only(const pet_config_t *config);
 /* Register HTTPS settings callbacks and reuse telemetry before Brain admission. */
 esp_err_t pet_network_start_management(const pet_network_callbacks_t *callbacks);
+/* Joins the primary network just stored (over USB or on the Wi-Fi page) without
+ * a restart: the station reconnects to it, and the existing drop recovery
+ * reopens the cloud connections. */
+esp_err_t pet_network_use_stored_wifi(void);
+/* Reloads the stored primary and fallback into the running copy, as after a
+ * network sent from the cloud updated one of their passwords. */
+esp_err_t pet_network_refresh_wifi(void);
 bool pet_network_wifi_is_ready(void);
 /* vNext worker owns these calls. Freeze/stop completes before changing bound
  * identity/config; Wi-Fi remains running. No automatic bound reconnect. */
@@ -137,13 +166,45 @@ esp_err_t pet_network_set_face_context(const char *active_face_id,
                                        size_t installed_face_count,
                                        const pet_face_profiles_t *profiles);
 esp_err_t pet_network_scan(pet_network_scan_callback_t callback);
-esp_err_t pet_network_input_start(uint32_t stream_id, const char *ai_pet_id);
+/* input.audio.start for a recording on `stream_id`. With `blessing`, an id,
+ * the recording is the owner's words for that blessing (story-blessings-v2):
+ * ESP_ERR_INVALID_STATE when the gateway doesn't take them. */
+esp_err_t pet_network_input_start(uint32_t stream_id, const char *ai_pet_id, const char *blessing);
 /* A ready session whose gateway listed PET_STORY_CAPABILITY. pet_network_story
  * then asks the pet for a story from its world on `stream_id`: the gateway
  * answers as it answers a spoken turn (thinking, speech, idle), and
  * pet_network_cancel(stream_id) stops it. */
 bool pet_network_can_story(void);
 esp_err_t pet_network_story(uint32_t stream_id, const char *ai_pet_id);
+/* story-mode-v1: the session's pet is in story mode, as its last story.state
+ * said. It outlives the socket, so the next hello resumes it, and ends when
+ * the session moves to another pet or a gateway without story mode answers. */
+bool pet_network_story_mode(void);
+/* story-mode-v1: "story.pause", "story.restart", or "story.load" of
+ * `story_id`. Queued behind the microphone's frames without waiting, so any
+ * task may ask; ESP_ERR_INVALID_STATE without a ready session that offers it.
+ * The two below are queued the same way. */
+esp_err_t pet_network_story_request(const char *type, const char *story_id);
+/* speech-pause-v1: a ready session whose gateway holds a reply's speech.
+ * pet_network_output_pause then sends output.pause for the reply on
+ * `stream_id`, or output.resume when not `paused`. */
+bool pet_network_can_pause_speech(void);
+esp_err_t pet_network_output_pause(uint32_t stream_id, bool paused);
+/* speech-pause-listen-v1, beside speech-pause-v1: the gateway keeps a held
+ * reply while the owner talks over it. */
+bool pet_network_can_listen_over_speech(void);
+/* story-reaction-v1: story.event.ended for the story.event cue `id`, once the
+ * device is done with it; the gateway then speaks the pet's reaction.
+ * ESP_ERR_INVALID_STATE without a ready session whose gateway waits for it. */
+esp_err_t pet_network_story_event_ended(const char *id);
+/* story-game-v1: a ready session whose gateway plays story games. Then
+ * pet_network_blessing uses the blessing with id `blessing` on `stream_id`,
+ * a turn without the microphone, answered as pet_network_story's. */
+bool pet_network_can_blessing(void);
+esp_err_t pet_network_blessing(uint32_t stream_id, const char *blessing, const char *ai_pet_id);
+/* story-blessings-v2: a ready session whose gateway takes the owner's words
+ * for a blessing, as a recording (pet_network_input_start with the blessing). */
+bool pet_network_can_speak_blessing(void);
 esp_err_t pet_network_send_microphone(uint32_t stream_id, uint32_t sequence,
                                       const int16_t *pcm, size_t samples);
 esp_err_t pet_network_input_end(uint32_t stream_id, uint32_t final_sequence, uint32_t duration_ms);

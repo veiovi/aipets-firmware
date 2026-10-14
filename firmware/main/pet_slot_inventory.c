@@ -33,7 +33,7 @@ static bool slot_valid(const pet_slot_t *s)
         return false;
     if (s->state == PET_SLOT_READY)
         return uuid(s->pack.build_id) && hash(s->pack.sha256) && s->pack.bytes &&
-            s->pack.bytes <= PET_LAYOUT_THREE_SLOT_PACK_BYTES && s->validator_revision;
+            s->pack.bytes <= PET_POCKET_MAX_PACK_BYTES && s->validator_revision;
     return (s->state == PET_SLOT_FREE || s->state == PET_SLOT_INSTALLING) && empty_pack(&s->pack) &&
         !s->validator_revision && !s->shown_at;
 }
@@ -44,7 +44,7 @@ bool pet_slot_inventory_empty(pet_slot_inventory_t *inv)
     memset(inv, 0, sizeof(*inv));
     for (unsigned i = 0; i < PET_SLOT_COUNT; ++i) clear_slot(&inv->slots[i], PET_SLOT_FREE);
     inv->active = inv->bound = inv->target = -1;
-    return pet_replace_empty(&inv->operation, PET_LAYOUT_THREE_SLOT_PACK_BYTES);
+    return pet_replace_empty(&inv->operation, PET_LAYOUT_ONE_SLOT_PACK_BYTES);
 }
 
 static bool index_ok(int slot) { return slot >= -1 && slot < (int)PET_SLOT_COUNT; }
@@ -52,7 +52,9 @@ static bool index_ok(int slot) { return slot >= -1 && slot < (int)PET_SLOT_COUNT
 bool pet_slot_inventory_valid(const pet_slot_inventory_t *inv)
 {
     if (!inv || !index_ok(inv->active) || !index_ok(inv->bound) || !index_ok(inv->target) ||
-        !pet_replace_valid(&inv->operation) || inv->operation.capacity_bytes != PET_LAYOUT_THREE_SLOT_PACK_BYTES) return false;
+        !pet_replace_valid(&inv->operation) || inv->operation.capacity_bytes != PET_LAYOUT_ONE_SLOT_PACK_BYTES ||
+        inv->operation.active.bytes > PET_POCKET_MAX_PACK_BYTES ||
+        inv->operation.target.bytes > PET_POCKET_MAX_PACK_BYTES) return false;
     for (unsigned i = 0; i < PET_SLOT_COUNT; ++i) {
         if (!slot_valid(&inv->slots[i])) return false;
         if (inv->slots[i].state == PET_SLOT_INSTALLING && (int)i != inv->target) return false;
@@ -109,23 +111,6 @@ int pet_slot_inventory_step(const pet_slot_inventory_t *inv, int from, int direc
         if (inv->slots[at].state == PET_SLOT_READY) return at;
     }
     return -1;
-}
-
-/* A free slot, else the pet already holding these exact bytes (such as the USB
- * copy of a pet now signed by the cloud), else the stalest installed pet. Never
- * the pet on screen or the bound one. */
-static int choose_target(const pet_slot_inventory_t *inv, const pet_replace_pack_t *incoming)
-{
-    for (unsigned i = 0; i < PET_SLOT_COUNT; ++i)
-        if (inv->slots[i].state == PET_SLOT_FREE) return (int)i;
-    for (unsigned i = 0; i < PET_SLOT_COUNT; ++i)
-        if (inv->slots[i].state == PET_SLOT_READY && (int)i != inv->active && (int)i != inv->bound &&
-            !strcmp(inv->slots[i].pack.sha256, incoming->sha256)) return (int)i;
-    int best = -1;
-    for (unsigned i = 0; i < PET_SLOT_COUNT; ++i)
-        if (inv->slots[i].state == PET_SLOT_READY && (int)i != inv->active && (int)i != inv->bound &&
-            (best < 0 || inv->slots[i].shown_at < inv->slots[best].shown_at)) best = (int)i;
-    return best;
 }
 
 static int latest_ready_other_than(const pet_slot_inventory_t *inv, int excluded)
@@ -187,7 +172,7 @@ bool pet_slot_inventory_apply_target(pet_slot_inventory_t *inv, const pet_replac
                                      const pet_replace_pack_t *replacement)
 {
     if (!pet_slot_inventory_valid(inv) || !pet_replace_valid(op) ||
-        op->capacity_bytes != PET_LAYOUT_THREE_SLOT_PACK_BYTES) return false;
+        op->capacity_bytes != PET_LAYOUT_ONE_SLOT_PACK_BYTES) return false;
     const pet_replace_phase_t was = inv->operation.phase;
     pet_slot_inventory_t next = *inv;
     next.operation = *op;
@@ -208,9 +193,10 @@ bool pet_slot_inventory_apply_target(pet_slot_inventory_t *inv, const pet_replac
             next.target = -1;
             break;
         case PET_REPLACE_REQUESTED:
-            if (inv->target >= 0) return false;
-            next.target = replacement ? pet_slot_inventory_find(inv, replacement) : choose_target(&next, &op->target);
-            if (next.target < 0) return false;
+            /* One pet: every installation goes to slot 0, and an update names
+             * the pack there. */
+            if (inv->target >= 0 || (replacement && pet_slot_inventory_find(inv, replacement) != 0)) return false;
+            next.target = 0;
             break;
         case PET_REPLACE_FENCED:
             break;
@@ -268,13 +254,13 @@ static bool index_read(uint8_t value, int *slot)
     *slot = value == NONE ? -1 : value; return true;
 }
 
-/* Record v2: 16-byte header, three 114-byte slots, the 684-byte machine. */
+/* Record v4: 16-byte header, one 114-byte slot, the 684-byte machine. */
 bool pet_slot_inventory_encode(const pet_slot_inventory_t *inv, void *record, size_t bytes)
 {
     if (!record || bytes != PET_SLOT_RECORD_BYTES || !pet_slot_inventory_valid(inv)) return false;
     uint8_t *at = record;
-    memcpy(at, "PSI3", 4); at += 4;
-    put16(&at, 2); put8(&at, PET_SLOT_COUNT); put8(&at, index_byte(inv->active));
+    memcpy(at, "PSI4", 4); at += 4;
+    put16(&at, 4); put8(&at, PET_SLOT_COUNT); put8(&at, index_byte(inv->active));
     put32(&at, inv->selection_revision); put8(&at, index_byte(inv->target)); put8(&at, index_byte(inv->bound));
     put8(&at, 0); put8(&at, 0);
     for (unsigned i = 0; i < PET_SLOT_COUNT; ++i) {
@@ -289,10 +275,10 @@ bool pet_slot_inventory_encode(const pet_slot_inventory_t *inv, void *record, si
 
 bool pet_slot_inventory_decode(const void *record, size_t bytes, pet_slot_inventory_t *inv)
 {
-    if (!record || !inv || bytes != PET_SLOT_RECORD_BYTES || memcmp(record, "PSI3", 4)) return false;
+    if (!record || !inv || bytes != PET_SLOT_RECORD_BYTES || memcmp(record, "PSI4", 4)) return false;
     const uint8_t *at = (const uint8_t *)record + 4;
     pet_slot_inventory_t parsed = {0};
-    if (get16(&at) != 2 || get8(&at) != PET_SLOT_COUNT || !index_read(get8(&at), &parsed.active)) return false;
+    if (get16(&at) != 4 || get8(&at) != PET_SLOT_COUNT || !index_read(get8(&at), &parsed.active)) return false;
     parsed.selection_revision = get32(&at);
     if (!index_read(get8(&at), &parsed.target) || !index_read(get8(&at), &parsed.bound) || get8(&at) || get8(&at))
         return false;

@@ -51,9 +51,18 @@ bool pet_firmware_release_compatible(const pet_firmware_release_t *r,const pet_f
 {return profile&&r->requirements.bootloader.bytes==profile->bytes&&!strcmp(r->requirements.bootloader.sha256,profile->sha256)&&
  p&&p->known&&!p->active.requirements.present&&!p->interrupted.requirements.present&&!p->installed_count&&
  r->requirements.layout.id==physical->id&&!strcmp(r->requirements.partition_sha256,sha);}
+static unsigned metadata_reads, mapped_verifications;
 esp_err_t esp_image_verify(int mode,const esp_partition_pos_t *p,esp_image_metadata_t *m)
-{assert(mode==ESP_IMAGE_VERIFY_SILENT&&p->size==0x200000);if(bad_image&&p->offset==app[1].address)return ESP_FAIL;
+{++mapped_verifications;assert(mode==ESP_IMAGE_VERIFY_SILENT&&p->size==0x200000);if(bad_image&&p->offset==app[1].address)return ESP_FAIL;
  m->image.hash_appended=1;m->image_len=p->offset==app[0].address?sizeof(running_data):image_length;return ESP_OK;}
+esp_err_t esp_image_get_metadata(const esp_partition_pos_t *p, esp_image_metadata_t *m)
+{
+    ++metadata_reads;
+    assert(p->offset == app[0].address);
+    m->image.hash_appended = 1;
+    m->image_len = sizeof(running_data);
+    return ESP_OK;
+}
 esp_err_t esp_ota_get_partition_description(const esp_partition_t *p,esp_app_desc_t *d)
 {memset(d,0,sizeof(*d));strcpy(d->project_name,bad_project?"another_project":"aipet_firmware");
  strcpy(d->version,p==&app[0]?"previous":bad_version?"wrong":"fixture-v2");return ESP_OK;}
@@ -111,6 +120,17 @@ static void transfer(void)
 static bool select_image(void){return pet_firmware_image_select(&store,&candidate,store.value.report_boot_id,&bootloader,&empty);}
 int main(void)
 {
+#if CONFIG_PET_POCKET_TERMINAL
+    reset();
+    char actual[65], expected[65];
+    uint32_t usb_bytes;
+    hash(running_data, sizeof(running_data), expected);
+    assert(pet_firmware_image_running(actual, &usb_bytes));
+    assert(usb_bytes == sizeof(running_data) && !strcmp(actual, expected));
+    assert(metadata_reads == 1 && !mapped_verifications && !erase_calls && !write_calls);
+    puts("USB running image: metadata and exact hash through flash reads, no mapping");
+    return 0;
+#endif
     reset();assert(!begin()&&!erase_calls);assert(pet_firmware_receipt_ack(&store.value,1));
     assert(!pet_firmware_image_begin(&writer,&store,&candidate,NULL,&empty)&&!erase_calls);
     bootloader_bytes[0]^=1;assert(!begin()&&!erase_calls);bootloader_bytes[0]^=1;

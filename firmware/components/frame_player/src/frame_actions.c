@@ -284,21 +284,25 @@ static int fp_calm_candidate(const fp_player_t *p, uint32_t index)
 /* FP_IDLE_NATURAL: a stretch of calm ends with one of the pack's manual actions
  * that plays once. Calm is the idle family outside the reduced profile, with no
  * input, emotion or request, and nothing but an ambient loop on the base plane.
- * While none is ready (a cooldown, a moment of degraded rendering) the calm
- * pauses. The countdown is drawn when calm begins with one ready, so no other
- * mode or pack draws from the PRNG here. Mirrors player.ts tickCalm(). */
+ * An ambient event pauses the calm instead of ending it, so a pack's frequent
+ * events never starve its manual actions. While none is ready (a cooldown, a
+ * moment of degraded rendering) the calm pauses too. The countdown is drawn
+ * when calm begins with one ready, so no other mode or pack draws from the
+ * PRNG here. Mirrors player.ts tickCalm(). */
 void fp_actions_calm(fp_player_t *p)
 {
     const fp_action_cursor_t *base = &p->action_cursors[FP_PLANE_BASE];
+    int kind = base->action < 0 ? -1 : (int)p->view.actions[base->action].activation;
     int calm = p->idle_showcase_enabled == FP_IDLE_NATURAL && p->sys_state == FP_SYS_IDLE &&
         p->animation_profile != FP_PROFILE_REDUCED &&
         (p->phase == FP_PHASE_IDLE || p->phase == FP_PHASE_MICRO) && !p->tap_pending && !p->shake_pending &&
         p->gesture_pending == FP_GESTURE_NONE && p->pending_emotion == 0 && p->requested_action < 0 &&
-        (base->action < 0 || p->view.actions[base->action].activation == FP_ACTIVATION_AMBIENT_LOOP);
+        (kind < 0 || kind == FP_ACTIVATION_AMBIENT_LOOP || kind == FP_ACTIVATION_AMBIENT_EVENT);
     if (!calm) {
         p->calm_countdown = -1;
         return;
     }
+    if (kind == FP_ACTIVATION_AMBIENT_EVENT) return;
     uint32_t ready = 0;
     for (uint32_t i = 0; i < p->view.action_count; i++) ready += (uint32_t)fp_calm_candidate(p, i);
     if (!ready) return;
@@ -399,9 +403,11 @@ int32_t fp_actions_offset_y(const fp_player_t *p)
 
 static void fp_apply_masked(fp_player_t *p, uint16_t *target, uint32_t frame_index)
 {
-    const uint8_t *dir = p->pack + p->view.frame_dir_offset + frame_index * FP_FRAME_DIR_ENTRY_BYTES;
+    const uint8_t *dir = fp_player_at(p, p->view.frame_dir_offset + frame_index * FP_FRAME_DIR_ENTRY_BYTES);
     uint32_t length = fp_rd32(dir + 4u);
-    const uint8_t *data = fp_decode_resource(p->pack + fp_rd32(dir), length, dir[8], p->info.width, &p->codec_workspace, &length);
+    const uint8_t *encoded = fp_player_resource(p, (uint16_t)frame_index);
+    if (!encoded) return;
+    const uint8_t *data = fp_decode_resource(encoded, length, dir[8], p->info.width, &p->codec_workspace, &length);
     if (!data) return;
     uint32_t x0 = data[0], y0 = data[1], w = data[2], h = data[3];
     uint32_t mask_bytes = (w * h + 7u) / 8u;

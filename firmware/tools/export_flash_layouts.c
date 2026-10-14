@@ -31,7 +31,7 @@ int main(int argc, char **argv)
                               image_bytes, pet_flash_layout_name(selected.id));
     else printf("null");
     printf(",\"layouts\":[");
-    for (unsigned id = PET_LAYOUT_EMBEDDED_V1; id <= PET_LAYOUT_THREE_3P5M; ++id) {
+    for (unsigned id = PET_LAYOUT_EMBEDDED_V1; id <= PET_LAYOUT_ONE_10M; ++id) {
         pet_flash_layout_t v, identified;
         if (!pet_flash_layout_known((pet_layout_id_t)id, &v) ||
             !pet_flash_layout_identify(v.regions, v.count, PET_FLASH_BYTES, &identified) ||

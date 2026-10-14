@@ -1,5 +1,11 @@
 #include "pet_firmware_control.h"
 #include <string.h>
+#include <stdio.h>
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+#endif
+
+#if !CONFIG_PET_POCKET_TERMINAL
 
 static bool terminal(pet_fw_phase_t p)
 {return p==PET_FW_HEALTHY||p==PET_FW_FAILED||p==PET_FW_ROLLED_BACK;}
@@ -31,7 +37,7 @@ static bool snapshot(pet_firmware_control_t *w,pet_firmware_boot_state_t *boot,
  * epoch 4 cannot report its pets, and a pet store format change bumps it. */
 static bool compatible(pet_firmware_control_t *w,const pet_firmware_requirements_t *caps,const pet_firmware_protection_t *packs)
 {
-    return (caps->layout.pet_slots!=PET_LAYOUT_THREE_SLOTS||w->operation.release.requirements.firmware_epoch>=caps->firmware_epoch)&&
+    return (!pet_flash_layout_is_pocket(&caps->layout)||w->operation.release.requirements.firmware_epoch>=caps->firmware_epoch)&&
         pet_firmware_release_compatible(&w->operation.release,&caps->layout,caps->partition_sha256,&caps->bootloader,packs);
 }
 /* Before a flash action, every pet is proved again instead of trusting the
@@ -227,3 +233,75 @@ bool pet_firmware_control_health_deadline(pet_firmware_control_t *w,uint64_t ela
     w->config.freeze(w->config.context);status(w,PET_FW_CONTROL_RESTARTING,"FIRMWARE_HEALTH_TIMEOUT");
     w->config.restart(w->config.context);return true;
 }
+
+#else
+#include "pet_flash_layout_esp.h"
+
+/* Pocket firmware is USB-only. This channel reports capabilities and pet
+ * protection; it has no receipt, image writer, boot-selection or rollback. */
+bool pet_firmware_control_init(pet_firmware_control_t *w, const pet_firmware_control_config_t *config,
+                               pet_firmware_receipt_store_t *unused)
+{
+    (void)unused;
+    if (!w || !config || !config->http.origin || !config->http.device_id || !config->http.credential ||
+        !config->protection || !config->now_ms || !config->firmware_epoch)
+        return false;
+    char probe[256];
+    if (!pet_firmware_wire_encode_recovery_poll(config->boot_id, probe, sizeof(probe)))
+        return false;
+    memset(w, 0, sizeof(*w));
+    w->config = *config;
+    return true;
+}
+
+bool pet_firmware_control_blocks_pet(const pet_firmware_control_t *w)
+{
+    (void)w;
+    return false;
+}
+
+bool pet_firmware_control_health_deadline(pet_firmware_control_t *w, uint64_t now)
+{
+    (void)w;
+    (void)now;
+    return false;
+}
+
+pet_firmware_control_status_t pet_firmware_control_step(pet_firmware_control_t *w, uint64_t now)
+{
+    if (!w || now < w->retry_at_ms || (w->next_poll_ms && now < w->next_poll_ms))
+        return w ? w->status : PET_FW_CONTROL_IDLE;
+    pet_firmware_requirements_t caps = {.firmware_epoch = w->config.firmware_epoch,
+                                        .formats = 6, .codecs = 0xff, .imported_release = true};
+    pet_firmware_protection_t packs = {0};
+    char running[65];
+    uint32_t bytes;
+    bool known = pet_flash_layout_read(&caps.layout, caps.partition_sha256) == ESP_OK &&
+                 caps.layout.id == PET_LAYOUT_ONE_10M && pet_firmware_image_running(running, &bytes);
+    if (known)
+    {
+        if (pet_firmware_image_bootloader_matches(&w->config.bootloader))
+            caps.bootloader = w->config.bootloader;
+        w->config.protection(w->config.context, false, &packs);
+    }
+    bool encoded = known ? pet_firmware_wire_encode_poll(&caps, running, w->config.boot_id, &packs,
+                                                         w->request, sizeof(w->request))
+                         : pet_firmware_wire_encode_recovery_poll(w->config.boot_id, w->request, sizeof(w->request));
+    pet_control_http_result_t result = {0};
+    pet_firmware_poll_t reply;
+    bool ok = encoded && pet_control_http_json(&w->config.http, "/v2/device/firmware/poll", w->request,
+                                               w->response, sizeof(w->response), &result) &&
+              result.status == 200 &&
+              pet_firmware_wire_poll(w->response, result.bytes, w->config.http.device_id,
+                                     w->config.keys, w->config.key_count, &reply);
+    uint64_t completed = w->config.now_ms(w->config.context);
+    if (completed < now)
+        completed = now;
+    w->authenticated = ok;
+    w->next_poll_ms = ok ? completed + 15000 : 0;
+    w->retry_at_ms = ok ? 0 : completed + (result.retry_seconds ? result.retry_seconds : 15) * 1000ull;
+    w->status = ok ? PET_FW_CONTROL_IDLE : PET_FW_CONTROL_WAITING;
+    snprintf(w->error_code, sizeof(w->error_code), "%s", ok ? "" : "FIRMWARE_CONTROL_UNAVAILABLE");
+    return w->status;
+}
+#endif

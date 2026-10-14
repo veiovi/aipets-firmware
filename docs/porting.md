@@ -6,9 +6,10 @@ speaker. One build supports exactly one board, chosen by `AIPET_BOARD`.
 ## What a board needs
 
 - **ESP32-S3 with at least 16 MB flash and 8 MB octal PSRAM.** The flash layout
-  (`firmware/partitions-pocket.csv`) has two 3.5 MiB app slots, a 64 KiB pet
-  journal and room for three pets of 3 MB each, all in the first 16 MB. A pet
-  on screen is copied into PSRAM. A larger flash works; its upper part is unused.
+  (`firmware/partitions-pocket.csv`) has one 3.5 MiB factory application, a
+  64 KiB pet journal, a 2 MiB sound bank and one pet store, all in the first
+  16 MB. Packs up to 10,739,712 bytes stream through a bounded PSRAM cache.
+  A larger flash works; its upper part is unused.
 - **A display and touch controller** with ESP-IDF `esp_lcd` drivers. The pet,
   drawn at 240 × 240, is scaled to fill the screen; menus scale from a 360 px
   layout and have a compact form below 300 px.
@@ -44,8 +45,9 @@ options in its `Kconfig`.
 `firmware/sdkconfig.defaults` holds the settings every board shares: the
 ESP32-S3 target, 16 MB QIO flash, octal PSRAM at 80 MHz, 240 MHz CPU, LVGL and
 the TLS and network buffers. The release defaults that `tools/build-firmware.sh`
-adds on top select the Pocket firmware, its partition table, the qualified
-rollback bootloader profile and reproducible builds.
+adds on top select the Pocket firmware, its single-application partition table
+and reproducible builds. Firmware updates use USB; this layout has no second
+application slot for OTA rollback.
 
 The bootloader and partition table are the same for every board; only the app
 differs. Keep it that way, so boards share installation tooling. A firmware

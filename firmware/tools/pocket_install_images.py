@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""USB images that install up to three pets on a Pocket Terminal.
+"""USB images that install one pet on a Pocket Terminal.
 
-A Pocket Terminal keeps its pets in its three-pet store. Over USB, each pack
+A Pocket Terminal keeps its pet in its one-pet store. Over USB, each pack
 is written straight into its slot and the inventory journal names the slots
 ready. This tool writes that journal image and a flash plan for the pet
 regions; it never opens a port.
 
 On its first boot the firmware hashes each slot against the inventory and shows
-the first pet from flash. The records here mirror pet_slot_inventory.c (PSI3
-v2), pet_replace_journal.c (PRS2) and pet_journal.c (PJR1), so the firmware's
+the first pet from flash. The records here mirror pet_slot_inventory.c (PSI4
+v4), pet_replace_journal.c (PRS2) and pet_journal.c (PJR1), so the firmware's
 own store opens the output.
 """
 import argparse
@@ -19,16 +19,17 @@ import struct
 import sys
 import zlib
 
-JOURNAL_OFFSET = 0x730000
+JOURNAL_OFFSET = 0x3B0000
 JOURNAL_BYTES = 0x10000
 SECTOR_BYTES = 0x1000
-STORE_OFFSET = 0x740000
-SLOT_PACK_BYTES = 0x2DD000
+STORE_OFFSET = 0x5C0000
+SLOT_PACK_BYTES = 0xA3E000
+MAX_PACK_BYTES = SLOT_PACK_BYTES
 SLOT_BYTES = SLOT_PACK_BYTES + 0x2000
-SLOT_COUNT = 3
-# FP_VALIDATOR_REVISION in frame_player.h: the validator each slot's record names.
-# A mismatch is safe: the firmware validates every frame of the pack once more
-# and records its own revision.
+SLOT_COUNT = 1
+# USB images do not claim the streaming residency proof (revision 4).
+# Epoch 8 hashes and fully validates these bytes and their resident budget
+# before showing them, then records its current validator revision.
 VALIDATOR_REVISION = 3
 PACK_MAGIC = b"AIPFRAME"
 
@@ -57,8 +58,8 @@ def check_pack(path):
         raise ValueError(f"{path}: pack is not approved; the firmware only shows approved packs")
     if flags & 0x40:  # FP_FEATURE_MOVE
         raise ValueError(f"{path}: a move pack is not a pet; it plays beside its pet's core pack")
-    if len(data) > SLOT_PACK_BYTES:
-        raise ValueError(f"{path}: {len(data)} bytes exceed a slot's {SLOT_PACK_BYTES}")
+    if len(data) > MAX_PACK_BYTES:
+        raise ValueError(f"{path}: {len(data)} bytes exceed a slot's {MAX_PACK_BYTES}")
     sha = hashlib.sha256(data).hexdigest()
     return {"path": str(path), "bytes": len(data), "sha256": sha, "buildId": uuid_from_sha(sha)}
 
@@ -73,7 +74,7 @@ def empty_machine():
 
 
 def inventory(packs, active):
-    record = b"PSI3" + struct.pack("<HBB", 2, SLOT_COUNT, active)
+    record = b"PSI4" + struct.pack("<HBB", 4, SLOT_COUNT, active)
     record += struct.pack("<I", 1) + bytes([0xFF, 0xFF, 0, 0])   # selection revision; no target, none bound
     for slot in range(SLOT_COUNT):
         pack = packs[slot] if slot < len(packs) else None
@@ -83,7 +84,7 @@ def inventory(packs, active):
         else:
             record += struct.pack("<BBHII", 0, 0, 0, 0, 0) + bytes(37 + 65)
     record += empty_machine()
-    assert len(record) == 1042
+    assert len(record) == 814
     return record
 
 
@@ -101,12 +102,12 @@ def journal_image(payload):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="pocket_install_images.py", description=__doc__.splitlines()[0])
-    parser.add_argument("--pack", action="append", required=True, help="pack for the next slot (1 to 3, in order)")
+    parser.add_argument("--pack", action="append", required=True, help="the pet pack for slot 0")
     parser.add_argument("--active", type=int, default=0, help="slot shown first")
     parser.add_argument("--output", required=True, help="new directory for the journal and flash plan")
     args = parser.parse_args(argv)
     if not 1 <= len(args.pack) <= SLOT_COUNT or not 0 <= args.active < len(args.pack):
-        parser.error("give one to three packs and an active slot among them")
+        parser.error("give one pack with active slot 0")
     output = Path(args.output)
     if output.exists():
         parser.error(f"{output} already exists")
@@ -119,7 +120,7 @@ def main(argv=None):
     for slot, pack in enumerate(packs):
         writes.append({"offset": hex(STORE_OFFSET + slot * SLOT_BYTES), "file": str(Path(pack["path"]).resolve()),
                        "bytes": pack["bytes"], "sha256": pack["sha256"], "slot": slot, "buildId": pack["buildId"]})
-    plan = {"layout": "three-pet-3p5m-v3", "activeSlot": args.active, "writes": writes,
+    plan = {"layout": "one-pet-10m-v5", "activeSlot": args.active, "writes": writes,
             "esptoolArgs": " ".join(f"{w['offset']} {w['file']}" for w in writes)}
     (output / "pet-flash-plan.json").write_text(json.dumps(plan, indent=2) + "\n")
     print(plan["esptoolArgs"])

@@ -60,9 +60,9 @@ static const char *TAG = "pet_network";
 static EventGroupHandle_t s_events;
 static QueueHandle_t s_audio_tx;
 static SemaphoreHandle_t s_send_lock;
-/* Latest telemetry/config/speech acknowledgement; bounded and idempotent.
+/* Latest telemetry/config/speech/Wi-Fi acknowledgement; bounded and idempotent.
  * Control worker drains these over HTTPS, never from the socket callback. */
-static char *s_management_reports[3];
+static char *s_management_reports[4];
 static esp_websocket_client_handle_t s_websocket;
 static pet_network_callbacks_t s_callbacks;
 typedef void (*connected_callback_t)(bool);
@@ -78,6 +78,8 @@ static uint32_t s_speech_stream;
 static int16_t *s_speech_pcm;
 static pet_config_t s_config;
 static atomic_bool s_websocket_ready;
+static atomic_bool s_socket_stopping;
+static atomic_bool s_socket_disconnected;
 static bool s_legacy_gateway_enabled;
 static bool s_bound_session;
 static bool s_bound_hello_sent;
@@ -88,9 +90,15 @@ static volatile uint32_t s_dropped_chunks;
 static uint8_t *s_rx_frame;
 static size_t s_rx_expected;
 static uint8_t s_rx_opcode;
-static pet_network_scan_callback_t s_scan_callback;
-static volatile bool s_scan_running;
+static _Atomic(pet_network_scan_callback_t) s_scan_callback;
+static atomic_bool s_scan_running;
 static volatile bool s_scan_suspended_reconnect;
+/* Auto-join waits for the running scan's results. It skips the saved networks
+ * that failed since the device last got an address. */
+static atomic_bool s_autojoin_pending;
+static char s_wifi_trying[PET_SSID_MAX];
+static char s_wifi_failed[PET_WIFI_PROFILE_MAX][PET_SSID_MAX];
+static uint8_t s_wifi_failed_count;
 static TaskHandle_t s_scan_task;
 static char s_active_face_id[PET_FACE_ID_MAX];
 static char s_installed_face_ids[INSTALLED_FACE_MAX][PET_FACE_ID_MAX];
@@ -115,9 +123,154 @@ static pet_battery_snapshot_t s_battery_snapshot;
 static bool s_gateway_rebind;
 /* story-v1: the gateway's hello listed it, so a long press may ask for a story. */
 static bool s_gateway_story;
+/* story-log-v1: the gateway's hello listed it, so it sends the story log. */
+static bool s_gateway_story_log;
+/* story-mode-v1: the gateway's hello listed it, so it keeps story mode. */
+static bool s_gateway_story_mode;
+/* story-game-v1: the gateway's hello listed it, so its stories may play as games. */
+static bool s_gateway_story_game;
+/* story-blessings-v2, beside story games: its blessings may take the owner's words. */
+static bool s_gateway_story_blessings;
+/* story-event-v1: the gateway's hello listed it, so it sends story events. */
+static bool s_gateway_story_event;
+/* story-reaction-v1, beside story events: it waits for story.event.ended. */
+static bool s_gateway_story_reaction;
+/* speech-pause-v1: the gateway holds a reply's speech on output.pause. */
+static bool s_gateway_speech_pause;
+/* speech-pause-listen-v1, beside it: the gateway keeps a held reply while the owner talks over it. */
+static bool s_gateway_speech_pause_listen;
+/* sound-bank-v1: the gateway names the sound bank to keep. */
+static bool s_gateway_sound_bank;
+/* The story.events read last: up to 16 events, too many for this task's
+ * stack (PSRAM, network task only). */
+static pet_story_events_t *s_story_events;
+/* story-pacing-v1: the gateway's hello listed it, so story.state says whether the pet is on its path. */
+static bool s_gateway_story_pacing;
+/* story-hurry-v1, beside it: story.state's path may be "hurry". */
+static bool s_gateway_story_hurry;
+/* The session's pet is in story mode, as its last story.state said; kept
+ * across sockets so the next hello resumes it (pet_network_story_mode). */
+static bool s_story_mode;
 static atomic_bool s_rebind_pending;
 static pet_control_context_t *s_rebind_context;
 static SemaphoreHandle_t s_rebind_lock;
+
+/* Event callbacks only copy numeric facts. The existing telemetry task drains
+ * at most eight records per pass, including while offline. No peer text or
+ * network identifiers enter this buffer; overwrites are counted. */
+#define NETWORK_EVENT_COUNT 8
+typedef struct
+{
+    const char *kind;
+    uint32_t at_ms;
+    unsigned generation;
+    int code, detail, extra;
+} network_event_t;
+static network_event_t s_network_events[NETWORK_EVENT_COUNT];
+static unsigned s_network_event_next, s_network_event_count, s_network_event_lost;
+static portMUX_TYPE s_network_event_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void record_network_event(const char *kind, int code, int detail, int extra)
+{
+    network_event_t event = {kind, (uint32_t)(esp_timer_get_time() / 1000),
+                            atomic_load(&s_socket_generation), code, detail, extra};
+    portENTER_CRITICAL(&s_network_event_lock);
+    s_network_events[s_network_event_next] = event;
+    s_network_event_next = (s_network_event_next + 1) % NETWORK_EVENT_COUNT;
+    if (s_network_event_count < NETWORK_EVENT_COUNT)
+    {
+        s_network_event_count++;
+    }
+    else
+    {
+        s_network_event_lost++;
+    }
+    portEXIT_CRITICAL(&s_network_event_lock);
+}
+
+static void log_network_events(void)
+{
+    network_event_t events[NETWORK_EVENT_COUNT];
+    portENTER_CRITICAL(&s_network_event_lock);
+    unsigned count = s_network_event_count, lost = s_network_event_lost;
+    for (unsigned i = 0; i < count; i++)
+    {
+        events[i] = s_network_events[(s_network_event_next + NETWORK_EVENT_COUNT - count + i) % NETWORK_EVENT_COUNT];
+    }
+    s_network_event_count = s_network_event_lost = 0;
+    portEXIT_CRITICAL(&s_network_event_lock);
+    for (unsigned i = 0; i < count; i++)
+    {
+        const network_event_t *event = &events[i];
+        ESP_LOGI(TAG, "NET t=%lu gen=%u event=%s code=%d detail=%d extra=%d",
+                 (unsigned long)event->at_ms, event->generation, event->kind,
+                 event->code, event->detail, event->extra);
+    }
+    if (lost)
+    {
+        ESP_LOGW(TAG, "NET overwritten=%u", lost);
+    }
+}
+
+/* The network since boot, sent with the telemetry (`network`): Wi-Fi drops and voice-socket closes the device
+ * didn't ask for, the last drop's reason and the last close's code (0 for an abrupt one), and how long voice took to
+ * come back after the last close. Guarded by s_network_event_lock. */
+typedef struct
+{
+    uint32_t wifi_drops, last_wifi_reason, socket_closes, last_close_code, last_reconnect_ms;
+    int64_t closed_at_us;
+} network_counts_t;
+static network_counts_t s_network_counts;
+
+static void count_wifi_drop(int reason)
+{
+    portENTER_CRITICAL(&s_network_event_lock);
+    s_network_counts.wifi_drops++;
+    s_network_counts.last_wifi_reason = reason > 0 ? (uint32_t)reason : 0;
+    portEXIT_CRITICAL(&s_network_event_lock);
+}
+
+static void count_socket_close(int code)
+{
+    const int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_network_event_lock);
+    s_network_counts.socket_closes++;
+    s_network_counts.last_close_code = code > 0 ? (uint32_t)code : 0;
+    s_network_counts.closed_at_us = now;
+    portEXIT_CRITICAL(&s_network_event_lock);
+}
+
+/* Voice is ready again: how long it took since the last close. */
+static void count_voice_back(void)
+{
+    const int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_network_event_lock);
+    if (s_network_counts.closed_at_us)
+    {
+        s_network_counts.last_reconnect_ms = (uint32_t)((now - s_network_counts.closed_at_us) / 1000);
+        s_network_counts.closed_at_us = 0;
+    }
+    portEXIT_CRITICAL(&s_network_event_lock);
+}
+
+static void clear_gateway_session(void)
+{
+    s_websocket_ready = false;
+    s_gateway_rebind = false;
+    s_gateway_story = false;
+    s_gateway_story_log = false;
+    s_gateway_story_mode = false;
+    s_gateway_story_game = false;
+    s_gateway_story_blessings = false;
+    s_gateway_story_event = false;
+    s_gateway_story_pacing = false;
+    s_gateway_story_hurry = false;
+    s_gateway_story_reaction = false;
+    s_gateway_speech_pause = false;
+    s_gateway_speech_pause_listen = false;
+    s_gateway_sound_bank = false;
+    atomic_store(&s_rebind_pending, false);
+}
 
 void pet_network_set_battery_snapshot(const pet_battery_snapshot_t *snapshot)
 {
@@ -135,25 +288,86 @@ static const char *battery_state_name(pet_battery_state_t state)
     return "idle";
 }
 
-static esp_err_t connect_wifi_profile(bool fallback)
+/* The network the station joins next; it doesn't connect. */
+static esp_err_t set_wifi_network(const char *ssid, const char *password)
 {
-    const char *ssid = fallback ? s_config.wifi_fallback_ssid : s_config.wifi_ssid;
-    const char *password = fallback ? s_config.wifi_fallback_password : s_config.wifi_password;
-    if (!ssid[0]) return ESP_ERR_INVALID_STATE;
     wifi_config_t wifi = {0};
     size_t ssid_length = strlen(ssid), password_length = strlen(password);
-    if (ssid_length > sizeof(wifi.sta.ssid) || password_length > sizeof(wifi.sta.password))
+    if (!ssid_length || ssid_length > sizeof(wifi.sta.ssid) || password_length > sizeof(wifi.sta.password))
         return ESP_ERR_INVALID_ARG;
     memcpy(wifi.sta.ssid, ssid, ssid_length);
     memcpy(wifi.sta.password, password, password_length);
     wifi.sta.threshold.authmode = password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     wifi.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi), TAG,
-                        "set Wi-Fi profile");
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wifi);
+    memset(&wifi, 0, sizeof(wifi));
+    if (err == ESP_OK) strlcpy(s_wifi_trying, ssid, sizeof(s_wifi_trying));
+    return err;
+}
+
+static esp_err_t connect_wifi_profile(bool fallback)
+{
+    const char *ssid = fallback ? s_config.wifi_fallback_ssid : s_config.wifi_ssid;
+    const char *password = fallback ? s_config.wifi_fallback_password : s_config.wifi_password;
+    if (!ssid[0]) return ESP_ERR_INVALID_STATE;
+    ESP_RETURN_ON_ERROR(set_wifi_network(ssid, password), TAG, "set Wi-Fi profile");
     s_wifi_using_fallback = fallback;
-    ESP_LOGI(TAG, "connecting with %s Wi-Fi profile: %s",
-             fallback ? "fallback" : "primary", ssid);
-    return esp_wifi_connect();
+    esp_err_t result = esp_wifi_connect();
+    record_network_event(fallback ? "wifi-fallback" : "wifi-primary", result, 0, 0);
+    return result;
+}
+
+/* Back to the primary and fallback, which take turns, rather than whichever
+ * network the station tried last. */
+static void alternate_wifi_profile(void)
+{
+    bool fallback = s_config.wifi_fallback_ssid[0] && !s_wifi_using_fallback;
+    if (connect_wifi_profile(fallback) != ESP_OK) esp_wifi_connect();
+}
+
+static bool wifi_failed(const char *ssid)
+{
+    for (uint8_t i = 0; i < s_wifi_failed_count; ++i)
+        if (!strcmp(s_wifi_failed[i], ssid)) return true;
+    return false;
+}
+
+/* Scan task: the strongest saved network in reach that hasn't failed since the
+ * device last got an address joins live, of the up to eight it keeps. With none
+ * left, the failed list starts over and the primary and fallback take turns. */
+static void autojoin(const pet_wifi_network_t *networks, size_t count, esp_err_t err)
+{
+    const pet_wifi_network_t *best = NULL;
+    for (size_t i = 0; err == ESP_OK && i < count; ++i)
+        if (networks[i].saved && !wifi_failed(networks[i].ssid) && (!best || networks[i].rssi > best->rssi))
+            best = &networks[i];
+    char password[PET_PASSWORD_MAX] = {0};
+    esp_err_t joined = ESP_ERR_NOT_FOUND;
+    if (best && pet_config_recall_wifi(best->ssid, password, sizeof(password)) == ESP_OK &&
+        set_wifi_network(best->ssid, password) == ESP_OK)
+        joined = esp_wifi_connect();
+    memset(password, 0, sizeof(password));
+    record_network_event("wifi-autojoin", joined, best ? best->rssi : 0, (int)count);
+    if (joined != ESP_OK) {
+        s_wifi_failed_count = 0;
+        alternate_wifi_profile();
+    }
+}
+
+/* Wi-Fi event task: after the current network fails a few times, it is set
+ * aside and the device looks for another saved network in reach. A scan already
+ * running serves; false when none can start. */
+static bool start_autojoin_scan(void)
+{
+    if (s_wifi_trying[0] && !wifi_failed(s_wifi_trying) && s_wifi_failed_count < PET_WIFI_PROFILE_MAX)
+        strlcpy(s_wifi_failed[s_wifi_failed_count++], s_wifi_trying, sizeof(s_wifi_failed[0]));
+    atomic_store(&s_autojoin_pending, true);
+    if (atomic_exchange(&s_scan_running, true)) return true;
+    wifi_scan_config_t config = {.show_hidden = false, .scan_type = WIFI_SCAN_TYPE_ACTIVE};
+    if (esp_wifi_scan_start(&config, false) == ESP_OK) return true;
+    atomic_store(&s_scan_running, false);
+    atomic_store(&s_autojoin_pending, false);
+    return false;
 }
 
 static bool parse_speech_profile(const char *name, pet_speech_profile_t *profile)
@@ -331,17 +545,18 @@ static void finish_wifi_scan(void)
         }
     }
     free(records);
-    s_scan_running = false;
-    pet_network_scan_callback_t callback = s_scan_callback;
-    s_scan_callback = NULL;
+    atomic_store(&s_scan_running, false);
+    pet_network_scan_callback_t callback = atomic_exchange(&s_scan_callback, NULL);
+    bool autojoin_due = atomic_exchange(&s_autojoin_pending, false);
     if (s_scan_suspended_reconnect) {
         s_scan_suspended_reconnect = false;
-        esp_err_t reconnect_err = esp_wifi_connect();
+        esp_err_t reconnect_err = autojoin_due ? ESP_OK : esp_wifi_connect();
         if (reconnect_err != ESP_OK) {
             ESP_LOGW(TAG, "Wi-Fi reconnect after scan failed: %s",
                      esp_err_to_name(reconnect_err));
         }
     }
+    if (autojoin_due) autojoin(networks, network_count, err);
     if (callback) callback(networks, network_count, err);
 }
 
@@ -377,7 +592,8 @@ static esp_err_t send_text(const char *text)
         {
             bool accepted = pet_session_wire_management_message(type->valuestring, false) && strlen(text) <= 4096;
             unsigned slot = !strcmp(type->valuestring, "device.telemetry") ? 0 :
-                !strcmp(type->valuestring, "device.speech.profile.confirmed") ? 2 : 1;
+                !strcmp(type->valuestring, "device.speech.profile.confirmed") ? 2 :
+                !strcmp(type->valuestring, "device.wifi.result") ? 3 : 1;
             char *copy = accepted ? strdup(text) : NULL;
             if (copy)
             {
@@ -416,14 +632,11 @@ static void send_hello(void)
         cJSON_AddStringToObject(binding,"buildId",s_bound_context.binding.build_id);
         cJSON_AddStringToObject(binding,"sha256",s_bound_context.binding.sha256);
         cJSON_AddStringToObject(binding,"configVersion",s_bound_context.config.version);
-        cJSON *caps=cJSON_AddArrayToObject(root,"capabilities");
-        const char *names[]={"audio-in","audio-out","touch","gestures",
-            "session-binding-v1",PET_BRAIN_CAPABILITY,"text-v1",PET_IMA_ADPCM_CAPABILITY,
 #if CONFIG_PET_POCKET_TERMINAL
-            PET_SESSION_REBIND_CAPABILITY,PET_STORY_CAPABILITY,
+        pet_session_wire_hello_capabilities(root, true, s_story_mode);
+#else
+        pet_session_wire_hello_capabilities(root, false, false);
 #endif
-        };
-        for(unsigned i=0;i<sizeof(names)/sizeof(names[0]);++i)cJSON_AddItemToArray(caps,cJSON_CreateString(names[i]));
         char *json=cJSON_PrintUnformatted(root);
         if(json){s_bound_hello_sent=send_text_unchecked(json)==ESP_OK;memset(json,0,strlen(json));free(json);}
         cJSON *token=cJSON_GetObjectItemCaseSensitive(root,"token");
@@ -745,7 +958,8 @@ esp_err_t pet_network_wifi_admin_result(const char *operation_id,
 {
     if (!operation_id || strlen(operation_id) != 36 || !ssid || !ssid[0] ||
         !status || (strcmp(status,"connected") && strcmp(status,"failed") &&
-                    strcmp(status,"rolled_back") && strcmp(status,"forgotten")))
+                    strcmp(status,"rolled_back") && strcmp(status,"forgotten") &&
+                    strcmp(status,"saved")))
         return ESP_ERR_INVALID_ARG;
     cJSON *root = cJSON_CreateObject();
     if (!root) return ESP_ERR_NO_MEM;
@@ -894,6 +1108,7 @@ static bool installed_face_id(const char *face_id)
 static void apply_bound_context(const pet_control_context_t *context)
 {
     const pet_control_config_t *c = &context->config;
+    s_story_mode = pet_session_wire_story_mode_kept(s_story_mode, &s_bound_context, context);
     s_bound_context = *context;
     strlcpy(s_active_face_id, c->face_id, sizeof(s_active_face_id));
     memset(s_installed_face_ids, 0, sizeof(s_installed_face_ids));
@@ -929,7 +1144,32 @@ static void process_control(const uint8_t *data, size_t length, bool management)
         s_gesture_sequence_valid = false;
         s_gateway_rebind = s_bound_session && pet_session_wire_gateway_offers(root, PET_SESSION_REBIND_CAPABILITY);
         s_gateway_story = s_bound_session && pet_session_wire_gateway_offers(root, PET_STORY_CAPABILITY);
+        s_gateway_story_log = s_bound_session && pet_session_wire_gateway_offers(root, PET_STORY_LOG_CAPABILITY);
+        s_gateway_story_mode = s_bound_session && pet_session_wire_gateway_offers(root, PET_STORY_MODE_CAPABILITY);
+        s_gateway_story_game = s_gateway_story_mode && pet_session_wire_gateway_offers(root, PET_STORY_GAME_CAPABILITY);
+        s_gateway_story_blessings = s_gateway_story_game &&
+            pet_session_wire_gateway_offers(root, PET_STORY_BLESSINGS_CAPABILITY);
+        s_gateway_story_event = s_gateway_story_mode && pet_session_wire_gateway_offers(root, PET_STORY_EVENT_CAPABILITY);
+        s_gateway_story_pacing = s_gateway_story_mode &&
+            pet_session_wire_gateway_offers(root, PET_STORY_PACING_CAPABILITY);
+        s_gateway_story_hurry = s_gateway_story_pacing &&
+            pet_session_wire_gateway_offers(root, PET_STORY_HURRY_CAPABILITY);
+        s_gateway_story_reaction = s_gateway_story_event &&
+            pet_session_wire_gateway_offers(root, PET_STORY_REACTION_CAPABILITY);
+        s_gateway_speech_pause = s_bound_session && pet_session_wire_gateway_offers(root, PET_SPEECH_PAUSE_CAPABILITY);
+        s_gateway_speech_pause_listen = s_gateway_speech_pause &&
+            pet_session_wire_gateway_offers(root, PET_SPEECH_PAUSE_LISTEN_CAPABILITY);
+        s_gateway_sound_bank = s_bound_session && pet_session_wire_gateway_offers(root, PET_SOUND_BANK_CAPABILITY);
+        /* A gateway without story mode ends it; one with it resumes what the hello said. */
+        s_story_mode = s_story_mode && s_gateway_story_mode;
+        /* A gateway without story events keeps none: the packs kept for another are freed. */
+        if (!s_gateway_story_event && s_story_events && s_callbacks.story_events) {
+            s_story_events->count = 0;
+            s_callbacks.story_events(s_story_events);
+        }
         s_websocket_ready = true;
+        record_network_event("ws-ready", 0, 0, 0);
+        count_voice_back();
         ESP_LOGI(TAG, "gateway handshake accepted");
         const cJSON *profiles = cJSON_GetObjectItemCaseSensitive(root, "faceProfiles");
         if (cJSON_IsArray(profiles) && s_callbacks.face_profile) {
@@ -1170,6 +1410,7 @@ static void process_control(const uint8_t *data, size_t length, bool management)
                                               "failed","QUEUE_FULL",command.priority);
             memset(command.password, 0, sizeof(command.password));
         }
+        if (cJSON_IsString(password)) memset(password->valuestring, 0, strlen(password->valuestring));
     } else if (!strcmp(type->valuestring, "pet.credential.prepare")) {
         const cJSON *operation=cJSON_GetObjectItemCaseSensitive(root,"operationId");
         const cJSON *version=cJSON_GetObjectItemCaseSensitive(root,"credentialVersion");
@@ -1208,6 +1449,65 @@ static void process_control(const uint8_t *data, size_t length, bool management)
         } else {
             ESP_LOGW(TAG, "ignored malformed crash acknowledgement");
         }
+    } else if (!strcmp(type->valuestring, "story.log")) {
+        /* The whole quest log of the session's pet, at any time after the hello. */
+        const char *lines[PET_STORY_LOG_LINES];
+        size_t count = 0;
+        const char *refused = s_gateway_story_log ? pet_session_wire_story_log(root, lines, &count) :
+            "STORY_LOG_NOT_OFFERED";
+        if (refused) ESP_LOGW(TAG, "story.log refused: %s", refused);
+        else if (s_callbacks.story_log) s_callbacks.story_log(s_bound_context.config.face_id, lines, count);
+    } else if (!strcmp(type->valuestring, "story.state")) {
+        /* The session's pet's story and mode, whole. */
+        pet_story_state_t state;
+        const char *refused = s_gateway_story_mode ?
+            pet_session_wire_story_state(root, s_gateway_story_game, s_gateway_story_blessings, s_gateway_story_pacing,
+                                         s_gateway_story_hurry, &state) :
+            "STORY_MODE_NOT_OFFERED";
+        if (refused) ESP_LOGW(TAG, "story.state refused: %s", refused);
+        else {
+            s_story_mode = state.story;
+            if (s_callbacks.story_state) s_callbacks.story_state(s_bound_context.config.face_id, &state);
+        }
+    } else if (!strcmp(type->valuestring, "story.list")) {
+        pet_story_list_t list;
+        const char *refused = s_gateway_story_mode ? pet_session_wire_story_list(root, &list) :
+            "STORY_MODE_NOT_OFFERED";
+        if (refused) ESP_LOGW(TAG, "story.list refused: %s", refused);
+        else if (s_callbacks.story_list) s_callbacks.story_list(s_bound_context.config.face_id, &list);
+    } else if (!strcmp(type->valuestring, "story.atmosphere")) {
+        /* The sound loop under the next story turn's speech, or none. */
+        const char *name = NULL;
+        const char *refused = s_gateway_story_game ? pet_session_wire_story_atmosphere(root, &name) :
+            "STORY_GAME_NOT_OFFERED";
+        if (refused) ESP_LOGW(TAG, "story.atmosphere refused: %s", refused);
+        else if (s_callbacks.story_atmosphere) s_callbacks.story_atmosphere(name);
+    } else if (!strcmp(type->valuestring, "story.events")) {
+        /* The events the story can reach next, whole; their animations download in the background. */
+        const char *refused = !s_gateway_story_event ? "STORY_EVENT_NOT_OFFERED" :
+            !s_story_events ? "STORY_EVENTS_NO_MEMORY" : pet_session_wire_story_events(root, s_story_events);
+        if (refused) ESP_LOGW(TAG, "story.events refused: %s", refused);
+        else if (s_callbacks.story_events) s_callbacks.story_events(s_story_events);
+    } else if (!strcmp(type->valuestring, "story.event")) {
+        /* A milestone's event, shown once its speech has drained. */
+        char id[PET_STORY_EVENT_ID_BYTES + 1];
+        const char *refused = s_gateway_story_event ? pet_session_wire_story_event(root, id) : "STORY_EVENT_NOT_OFFERED";
+        if (refused) ESP_LOGW(TAG, "story.event refused: %s", refused);
+        else if (s_callbacks.story_event) s_callbacks.story_event(id);
+    } else if (!strcmp(type->valuestring, "sound.bank")) {
+        /* The sound bank to keep, after the hello and after a rebind. */
+        char sha256[65];
+        uint32_t bytes = 0;
+        const char *refused = s_gateway_sound_bank ? pet_session_wire_sound_bank(root, sha256, &bytes) :
+            "SOUND_BANK_NOT_OFFERED";
+        if (refused) ESP_LOGW(TAG, "sound.bank refused: %s", refused);
+        else if (s_callbacks.sound_bank) s_callbacks.sound_bank(sha256, bytes);
+    } else if (!strcmp(type->valuestring, "story.sound")) {
+        /* A game cue, before the next reply's speech. */
+        char id[PET_SOUND_ID_BYTES + 1];
+        const char *refused = s_gateway_sound_bank ? pet_session_wire_story_sound(root, id) : "SOUND_BANK_NOT_OFFERED";
+        if (refused) ESP_LOGW(TAG, "story.sound refused: %s", refused);
+        else if (s_callbacks.story_sound) s_callbacks.story_sound(id);
     } else if (!strcmp(type->valuestring, "pet.state")) {
         const cJSON *state = cJSON_GetObjectItemCaseSensitive(root, "state");
         if (cJSON_IsString(state) && s_callbacks.state) s_callbacks.state(state->valuestring);
@@ -1293,18 +1593,48 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t event_id, 
     (void)arg;
     (void)base;
     esp_websocket_event_data_t *event = event_data;
+    if (!event || event->client != s_websocket)
+        return;
+    if (event_id == WEBSOCKET_EVENT_ERROR)
+    {
+        const esp_websocket_error_codes_t *error = &event->error_handle;
+        record_network_event("ws-error", error->error_type, error->esp_tls_last_esp_err,
+                             error->esp_transport_sock_errno);
+        record_network_event("ws-tls", error->esp_tls_stack_err, error->esp_tls_cert_verify_flags,
+                             error->esp_ws_handshake_status_code);
+        return;
+    }
+    if (event_id == WEBSOCKET_EVENT_DISCONNECTED || event_id == WEBSOCKET_EVENT_CLOSED ||
+        event_id == WEBSOCKET_EVENT_FINISH)
+    {
+        const char *kind = event_id == WEBSOCKET_EVENT_CLOSED ? "ws-closed" :
+                           event_id == WEBSOCKET_EVENT_FINISH ? "ws-finish" : "ws-disconnected";
+        record_network_event(kind, event->close_status_code, event->error_handle.error_type,
+                             atomic_load(&s_socket_stopping));
+        clear_gateway_session();
+        free(s_rx_frame);
+        s_rx_frame = NULL;
+        s_rx_expected = 0;
+        /* CLOSED/FINISH need not emit DISCONNECTED. Notify the control owner
+         * once per attempt, including failure before hello, but not its stop. */
+        if (!atomic_exchange(&s_socket_disconnected, true) && !atomic_load(&s_socket_stopping))
+        {
+            count_socket_close(event->close_status_code);
+            if (s_callbacks.connected)
+                s_callbacks.connected(false);
+        }
+        return;
+    }
+    if (atomic_load(&s_socket_stopping))
+        return;
     if (event_id == WEBSOCKET_EVENT_CONNECTED) {
         ESP_LOGI(TAG, "gateway socket connected");
-        s_gateway_rebind = false;
-        s_gateway_story = false;
+        atomic_store(&s_socket_disconnected, false);
+        clear_gateway_session();
+        record_network_event("ws-connected", 0, 0, 0);
         send_hello();
-    } else if (event_id == WEBSOCKET_EVENT_DISCONNECTED) {
-        s_websocket_ready = false;
-        s_gateway_rebind = false;
-        s_gateway_story = false;
-        atomic_store(&s_rebind_pending, false);
-        if (s_callbacks.connected) s_callbacks.connected(false);
-    } else if (event_id == WEBSOCKET_EVENT_DATA && event->payload_len <= RX_FRAME_MAX) {
+    } else if (event_id == WEBSOCKET_EVENT_DATA && !atomic_load(&s_socket_disconnected) &&
+               event->payload_len <= RX_FRAME_MAX) {
         if (event->payload_offset == 0) {
             free(s_rx_frame);
             s_rx_frame = malloc(event->payload_len);
@@ -1357,6 +1687,9 @@ static void create_websocket(bool bound)
     };
     s_websocket = esp_websocket_client_init(&config);
     if (!s_websocket) return;
+    atomic_store(&s_socket_stopping, false);
+    atomic_store(&s_socket_disconnected, false);
+    record_network_event("ws-start", bound, 0, 0);
     if(esp_websocket_register_events(s_websocket,WEBSOCKET_EVENT_ANY,websocket_event,NULL)!=ESP_OK||
        esp_websocket_client_start(s_websocket)!=ESP_OK) {
         s_websocket_ready=false;
@@ -1376,10 +1709,17 @@ static void start_websocket(void)
 static void wifi_event(void *arg, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     (void)arg;
-    (void)event_data;
     if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         if (s_config.wifi_ssid[0]) connect_wifi_profile(false);
+    } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        const wifi_event_sta_connected_t *event = event_data;
+        record_network_event("wifi-up", event->channel, event->authmode, 0);
     } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        const wifi_event_sta_disconnected_t *event = event_data;
+        record_network_event(s_scan_suspended_reconnect ? "wifi-scan-down" : "wifi-down",
+                             event->reason, event->rssi, s_wifi_retry_count);
+        if (!s_scan_suspended_reconnect)
+            count_wifi_drop(event->reason);
         xEventGroupClearBits(s_events, WIFI_CONNECTED_BIT);
         s_websocket_ready = false;
         connected_callback_t callback=atomic_load(&s_wifi_connected_callback);
@@ -1390,12 +1730,9 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t event_id, void 
         if (s_scan_suspended_reconnect) return;
         if (!s_config.wifi_ssid[0]) return;
         s_wifi_retry_count++;
-        if (s_config.wifi_fallback_ssid[0] &&
-            s_wifi_retry_count >= WIFI_RETRIES_PER_PROFILE) {
+        if (s_wifi_retry_count >= WIFI_RETRIES_PER_PROFILE) {
             s_wifi_retry_count = 0;
-            if (connect_wifi_profile(!s_wifi_using_fallback) != ESP_OK) {
-                esp_wifi_connect();
-            }
+            if (!start_autojoin_scan()) alternate_wifi_profile();
         } else {
             esp_wifi_connect();
         }
@@ -1407,13 +1744,19 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t event_id, void 
         if (s_scan_task) xTaskNotifyGive(s_scan_task);
         else {
             ESP_LOGE(TAG, "Wi-Fi scan worker unavailable");
-            s_scan_running = false;
-            s_scan_callback = NULL;
+            atomic_store(&s_scan_running, false);
+            atomic_store(&s_scan_callback, NULL);
+            if (atomic_exchange(&s_autojoin_pending, false)) alternate_wifi_profile();
         }
     } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        const ip_event_got_ip_t *event = event_data;
+        record_network_event("ip-ready", event->ip_changed, 0, 0);
         s_wifi_retry_count = 0;
+        s_wifi_failed_count = 0;
         xEventGroupSetBits(s_events, WIFI_CONNECTED_BIT);
         start_websocket();
+    } else if (base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
+        record_network_event("ip-lost", 0, 0, 0);
     }
 }
 
@@ -1440,13 +1783,21 @@ static void telemetry_task(void *arg)
     uint32_t nonce = 0;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(15000));
+        log_network_events();
         /* An acknowledged core dump is erased here, where blocking on flash
          * stalls neither the websocket nor the health checks. The report that
          * follows then shows the cleared summary. */
         pet_diagnostics_clear_acknowledged_crash();
         if (!s_websocket_ready && !s_bound_session) continue;
         wifi_ap_record_t ap = {0};
-        esp_wifi_sta_get_ap_info(&ap);
+        bool rssi_valid = esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+        wifi_ps_type_t power_save = WIFI_PS_NONE;
+        esp_err_t power_result = esp_wifi_get_ps(&power_save);
+        ESP_LOGI(TAG, "NET health wifi=%d voice=%d rssi=%d valid=%d ps=%d internal=%lu largest=%lu",
+                 pet_network_wifi_is_ready(), pet_network_is_ready(), ap.rssi, rssi_valid,
+                 power_result == ESP_OK ? (int)power_save : -1,
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         pet_diagnostics_snapshot_t snapshot;
         pet_diagnostics_get_snapshot(&snapshot);
         cJSON *root = cJSON_CreateObject();
@@ -1513,6 +1864,16 @@ static void telemetry_task(void *arg)
                                      cJSON_CreateNumber(snapshot.crash_backtrace[i]));
             }
         }
+        network_counts_t counts;
+        portENTER_CRITICAL(&s_network_event_lock);
+        counts = s_network_counts;
+        portEXIT_CRITICAL(&s_network_event_lock);
+        cJSON *network = cJSON_AddObjectToObject(root, "network");
+        cJSON_AddNumberToObject(network, "wifiDrops", counts.wifi_drops);
+        cJSON_AddNumberToObject(network, "lastWifiReason", counts.last_wifi_reason);
+        cJSON_AddNumberToObject(network, "socketCloses", counts.socket_closes);
+        cJSON_AddNumberToObject(network, "lastCloseCode", counts.last_close_code);
+        cJSON_AddNumberToObject(network, "lastReconnectMs", counts.last_reconnect_ms);
         char *json = cJSON_PrintUnformatted(root);
         if (json) {
             send_text(json);
@@ -1563,6 +1924,7 @@ static esp_err_t start_network(const pet_config_t *config,
     s_send_lock = xSemaphoreCreateMutex();
     s_rebind_lock = xSemaphoreCreateMutex();
     s_rebind_context = heap_caps_calloc(1, sizeof(*s_rebind_context), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_story_events = heap_caps_calloc(1, sizeof(*s_story_events), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_events || !s_audio_tx || !s_send_lock || !s_rebind_lock) return ESP_ERR_NO_MEM;
     if (xTaskCreate(wifi_scan_task, "pet_wifi_scan",
                     WIFI_SCAN_TASK_STACK_BYTES, NULL, 4,
@@ -1581,7 +1943,7 @@ static esp_err_t start_network(const pet_config_t *config,
     esp_err_t storage = esp_wifi_set_storage(WIFI_STORAGE_RAM);
     if (storage != ESP_OK) ESP_LOGW(TAG, "Wi-Fi profile stays in flash: %s", esp_err_to_name(storage));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
     /* Modem sleep holds each frame for up to a beacon interval, so streamed
@@ -1617,6 +1979,7 @@ esp_err_t pet_network_start_management(const pet_network_callbacks_t *callbacks)
     s_bound_session = true;
     s_callbacks.config_v2_received = callbacks->config_v2_received;
     s_callbacks.speech_preference_received = callbacks->speech_preference_received;
+    s_callbacks.wifi_admin_received = callbacks->wifi_admin_received;
     if (!s_telemetry_started)
         s_telemetry_started = xTaskCreate(telemetry_task, "pet_telemetry", 4096, NULL, 2, NULL) == pdPASS;
     return s_telemetry_started ? ESP_OK : ESP_ERR_NO_MEM;
@@ -1625,6 +1988,7 @@ esp_err_t pet_network_start_management(const pet_network_callbacks_t *callbacks)
 void pet_network_freeze_bound(void)
 {
     if(!s_bound_session)return;
+    atomic_store(&s_socket_stopping, true);
     s_websocket_ready=false;
     /* Stop waits for the event worker before its callback data can be changed.
      * Destruction is serialized with any queued microphone/text sender. */
@@ -1634,11 +1998,11 @@ void pet_network_freeze_bound(void)
     /* An in-flight gateway.hello can restore readiness while stop drains the
      * event worker. Destroyed sockets never retain admission, even if no final
      * DISCONNECTED event was emitted. */
-    s_websocket_ready=false;
+    clear_gateway_session();
+    atomic_store(&s_socket_disconnected, true);
     atomic_fetch_add(&s_socket_generation,1);
     xSemaphoreGive(s_send_lock);
     s_bound_hello_sent=false;
-    s_gateway_rebind=false;s_gateway_story=false;atomic_store(&s_rebind_pending,false);
 }
 
 esp_err_t pet_network_start_bound(const pet_config_t *config,const pet_network_callbacks_t *callbacks,
@@ -1648,6 +2012,7 @@ esp_err_t pet_network_start_bound(const pet_config_t *config,const pet_network_c
        !context||!context->binding.assigned||strcmp(device_id,context->device_id)||
        !bound_config_ready(config)||!pet_network_wifi_is_ready())return ESP_ERR_INVALID_STATE;
     pet_network_freeze_bound();
+    s_story_mode = pet_session_wire_story_mode_kept(s_story_mode, &s_bound_context, context);
     s_bound_session=true;s_bound_hello_sent=false;s_bound_context=*context;
     strcpy(s_bound_device_id,device_id);
     /* Do not race the system Wi-Fi event task by rewriting its credentials. */
@@ -1667,6 +2032,7 @@ esp_err_t pet_network_start_bound(const pet_config_t *config,const pet_network_c
 
 void pet_network_stop(void)
 {
+    atomic_store(&s_socket_stopping, true);
     s_websocket_ready = false;
     if (s_events) xEventGroupClearBits(s_events, WIFI_CONNECTED_BIT);
     if (s_websocket) {
@@ -1721,13 +2087,13 @@ esp_err_t pet_network_scan(pet_network_scan_callback_t callback)
     /* Opening settings starts a scan automatically. A quick tap on the Scan
      * button can arrive before that scan completes; treat it as the same
      * request instead of reporting that Wi-Fi scanning is unavailable. */
-    if (s_scan_running) return ESP_OK;
+    /* A scan already running, this page's or auto-join's, delivers to it too. */
+    atomic_store(&s_scan_callback, callback);
+    if (atomic_exchange(&s_scan_running, true)) return ESP_OK;
     wifi_scan_config_t config = {
         .show_hidden = false,
         .scan_type = WIFI_SCAN_TYPE_ACTIVE,
     };
-    s_scan_callback = callback;
-    s_scan_running = true;
     esp_err_t err = esp_wifi_scan_start(&config, false);
     if (err == ESP_ERR_WIFI_STATE) {
         /* ESP-IDF rejects scans while a station connection is in progress.
@@ -1746,14 +2112,59 @@ esp_err_t pet_network_scan(pet_network_scan_callback_t callback)
         }
     }
     if (err != ESP_OK) {
-        s_scan_running = false;
-        s_scan_callback = NULL;
+        atomic_store(&s_scan_running, false);
+        atomic_store(&s_scan_callback, NULL);
         if (s_scan_suspended_reconnect) {
             s_scan_suspended_reconnect = false;
             esp_wifi_connect();
         }
     }
     return err;
+}
+
+/* The stored primary and fallback into the running copy, without the rest of
+ * the settings, so a small task can call it. */
+static esp_err_t load_stored_wifi(void)
+{
+    char ssid[PET_SSID_MAX], password[PET_PASSWORD_MAX], fallback_ssid[PET_SSID_MAX],
+        fallback_password[PET_PASSWORD_MAX];
+    esp_err_t err = pet_config_load_wifi(ssid, password, fallback_ssid, fallback_password);
+    if (err == ESP_OK)
+    {
+        xSemaphoreTake(s_send_lock, portMAX_DELAY);
+        strlcpy(s_config.wifi_ssid, ssid, sizeof(s_config.wifi_ssid));
+        strlcpy(s_config.wifi_password, password, sizeof(s_config.wifi_password));
+        strlcpy(s_config.wifi_fallback_ssid, fallback_ssid, sizeof(s_config.wifi_fallback_ssid));
+        strlcpy(s_config.wifi_fallback_password, fallback_password, sizeof(s_config.wifi_fallback_password));
+        xSemaphoreGive(s_send_lock);
+    }
+    memset(password, 0, sizeof(password));
+    memset(fallback_password, 0, sizeof(fallback_password));
+    return err;
+}
+
+esp_err_t pet_network_refresh_wifi(void)
+{
+    return s_send_lock ? load_stored_wifi() : ESP_ERR_INVALID_STATE;
+}
+
+esp_err_t pet_network_use_stored_wifi(void)
+{
+    if (!s_events || !s_send_lock) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = load_stored_wifi();
+    if (err == ESP_OK && !s_config.wifi_ssid[0]) err = ESP_ERR_INVALID_STATE;
+    if (err == ESP_OK) err = set_wifi_network(s_config.wifi_ssid, s_config.wifi_password);
+    if (err != ESP_OK) return err;
+    /* The owner's choice wins over an auto-join scan in progress, and starts clean. */
+    atomic_store(&s_autojoin_pending, false);
+    s_wifi_failed_count = 0;
+    s_wifi_using_fallback = false;
+    s_wifi_retry_count = 0;
+    record_network_event("wifi-switch", 0, 0, 0);
+    /* A connected station drops its network and the disconnect handler joins the
+     * new one; an idle station raises no disconnect, so it joins directly. */
+    wifi_ap_record_t ap;
+    return esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? esp_wifi_disconnect() : esp_wifi_connect();
 }
 
 void pet_network_set_brain_token(const char *token)
@@ -1769,13 +2180,15 @@ bool pet_network_management_request(char *out, size_t capacity)
     if (!out || capacity > 0x7fffffff || !s_send_lock) return false;
     cJSON *root = cJSON_CreateObject();
     cJSON *reports = root ? cJSON_AddArrayToObject(root, "reports") : NULL;
-    if (!reports)
+    cJSON *capabilities = root ? cJSON_AddArrayToObject(root, "capabilities") : NULL;
+    if (!reports || !capabilities ||
+        !cJSON_AddItemToArray(capabilities, cJSON_CreateString(PET_WIFI_COMMAND_CAPABILITY)))
     {
         cJSON_Delete(root);
         return false;
     }
     xSemaphoreTake(s_send_lock, portMAX_DELAY);
-    for (unsigned i = 0; i < 3; ++i)
+    for (unsigned i = 0; i < sizeof(s_management_reports) / sizeof(s_management_reports[0]); ++i)
     {
         if (!s_management_reports[i]) continue;
         cJSON *report = cJSON_Parse(s_management_reports[i]);
@@ -1789,11 +2202,22 @@ bool pet_network_management_request(char *out, size_t capacity)
     return ok;
 }
 
+/* A device.wifi.command carries a password: wipe it before the reply is freed. */
+static void clear_wifi_passwords(const cJSON *messages)
+{
+    const cJSON *message = NULL;
+    cJSON_ArrayForEach(message, messages)
+    {
+        const cJSON *password = cJSON_GetObjectItemCaseSensitive(message, "password");
+        if (cJSON_IsString(password)) memset(password->valuestring, 0, strlen(password->valuestring));
+    }
+}
+
 bool pet_network_management_response(const char *json, size_t bytes)
 {
     cJSON *root = pet_control_json(json, bytes, 8192);
     const cJSON *messages = root ? cJSON_GetObjectItemCaseSensitive(root, "messages") : NULL;
-    bool ok = root && pet_control_version(root) && cJSON_IsArray(messages) && cJSON_GetArraySize(messages) <= 3;
+    bool ok = root && pet_control_version(root) && cJSON_IsArray(messages) && cJSON_GetArraySize(messages) <= 4;
     const cJSON *message = NULL;
     if (ok) cJSON_ArrayForEach(message, messages)
     {
@@ -1808,48 +2232,52 @@ bool pet_network_management_response(const char *json, size_t bytes)
     {
         char *wire = cJSON_PrintUnformatted(message);
         if (wire) process_control((const uint8_t *)wire, strlen(wire), true);
+        if (wire) memset(wire, 0, strlen(wire));
         free(wire);
     }
+    if (cJSON_IsArray(messages)) clear_wifi_passwords(messages);
     cJSON_Delete(root);
     return ok;
 }
 
-/* input.audio.start, or input.story: a turn without the microphone. */
-static esp_err_t send_turn_start(const char *type, uint32_t stream_id, const char *ai_pet_id, bool microphone)
+esp_err_t pet_network_input_start(uint32_t stream_id, const char *ai_pet_id, const char *blessing)
 {
-    cJSON *root = cJSON_CreateObject();
-    if (!root) return ESP_ERR_NO_MEM;
-    cJSON_AddNumberToObject(root, "v", PET_PROTOCOL_VERSION);
-    cJSON_AddStringToObject(root, "type", type);
-    cJSON_AddNumberToObject(root, "streamId", stream_id);
-    if (microphone) {
-        cJSON *format = cJSON_AddObjectToObject(root, "format");
-        cJSON_AddStringToObject(format, "encoding", "pcm_s16le");
-        cJSON_AddNumberToObject(format, "sampleRate", 16000);
-        cJSON_AddNumberToObject(format, "channels", 1);
-        cJSON_AddNumberToObject(root, "startedAtMs", esp_timer_get_time() / 1000);
-    }
-    if (ai_pet_id && ai_pet_id[0])
-        cJSON_AddStringToObject(root, "aiPetId", ai_pet_id);
-    cJSON_AddStringToObject(root,"speechProfile",pet_speech_profile_name(s_config.speech_profile));
-    char *json = cJSON_PrintUnformatted(root);
-    esp_err_t result = json ? send_text(json) : ESP_ERR_NO_MEM;
-    free(json);
-    cJSON_Delete(root);
-    return result;
+    char json[384];
+    if (blessing && blessing[0] && !s_gateway_story_blessings) return ESP_ERR_INVALID_STATE;
+    if (!pet_session_wire_input_start(stream_id, esp_timer_get_time() / 1000, ai_pet_id,
+                                      pet_speech_profile_name(s_config.speech_profile), blessing, json, sizeof(json)))
+        return ESP_ERR_INVALID_ARG;
+    return send_text(json);
 }
 
-esp_err_t pet_network_input_start(uint32_t stream_id, const char *ai_pet_id)
+/* input.story, or input.blessing with `blessing`: a turn without the microphone. */
+static esp_err_t send_story_turn(uint32_t stream_id, const char *blessing, const char *ai_pet_id)
 {
-    return send_turn_start("input.audio.start", stream_id, ai_pet_id, true);
+    char json[256];
+    if (!pet_session_wire_story_turn(stream_id, blessing, ai_pet_id, pet_speech_profile_name(s_config.speech_profile),
+                                     json, sizeof(json)))
+        return ESP_ERR_INVALID_ARG;
+    return send_text(json);
 }
 
 bool pet_network_can_story(void) { return s_gateway_story && pet_network_is_ready(); }
 
+bool pet_network_story_mode(void) { return s_story_mode; }
+
 esp_err_t pet_network_story(uint32_t stream_id, const char *ai_pet_id)
 {
     if (!pet_network_can_story()) return ESP_ERR_INVALID_STATE;
-    return send_turn_start("input.story", stream_id, ai_pet_id, false);
+    return send_story_turn(stream_id, NULL, ai_pet_id);
+}
+
+bool pet_network_can_blessing(void) { return s_gateway_story_game && pet_network_is_ready(); }
+
+bool pet_network_can_speak_blessing(void) { return s_gateway_story_blessings && pet_network_is_ready(); }
+
+esp_err_t pet_network_blessing(uint32_t stream_id, const char *blessing, const char *ai_pet_id)
+{
+    if (!pet_network_can_blessing()) return ESP_ERR_INVALID_STATE;
+    return send_story_turn(stream_id, blessing, ai_pet_id);
 }
 
 esp_err_t pet_network_send_microphone(uint32_t stream_id, uint32_t sequence,
@@ -1882,6 +2310,48 @@ static esp_err_t queue_stream_text(const char *json)
         return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
+}
+
+/* The message in `item`'s data, behind the microphone's queued frames like
+ * the stream's own messages, but never waiting for room, so any task may send
+ * one: the deck from LVGL, a story event's end under the display lock. */
+static esp_err_t queue_now(audio_tx_item_t *item)
+{
+    item->generation = atomic_load(&s_socket_generation);
+    item->text = true;
+    item->length = strlen((const char *)item->data);
+    return xQueueSend(s_audio_tx, item, 0) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+esp_err_t pet_network_story_request(const char *type, const char *story_id)
+{
+    audio_tx_item_t item;
+    if (!s_gateway_story_mode || !pet_network_is_ready()) return ESP_ERR_INVALID_STATE;
+    if (!pet_session_wire_story_request(type, story_id, (char *)item.data, sizeof(item.data)))
+        return ESP_ERR_INVALID_ARG;
+    return queue_now(&item);
+}
+
+bool pet_network_can_pause_speech(void) { return s_gateway_speech_pause && pet_network_is_ready(); }
+
+bool pet_network_can_listen_over_speech(void) { return s_gateway_speech_pause_listen && pet_network_is_ready(); }
+
+esp_err_t pet_network_output_pause(uint32_t stream_id, bool paused)
+{
+    audio_tx_item_t item;
+    if (!pet_network_can_pause_speech()) return ESP_ERR_INVALID_STATE;
+    if (!pet_session_wire_output_pause(stream_id, paused, (char *)item.data, sizeof(item.data)))
+        return ESP_ERR_INVALID_ARG;
+    return queue_now(&item);
+}
+
+esp_err_t pet_network_story_event_ended(const char *id)
+{
+    audio_tx_item_t item;
+    if (!s_gateway_story_reaction || !pet_network_is_ready()) return ESP_ERR_INVALID_STATE;
+    if (!pet_session_wire_story_event_ended(id, (char *)item.data, sizeof(item.data)))
+        return ESP_ERR_INVALID_ARG;
+    return queue_now(&item);
 }
 
 esp_err_t pet_network_input_end(uint32_t stream_id, uint32_t final_sequence, uint32_t duration_ms)

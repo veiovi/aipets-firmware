@@ -6,12 +6,12 @@
 
 For each board it writes:
 
-    aipets-firmware-<board>-<version>-full.bin  bootloader, partition table, boot
-        selection, the app in both app slots and an empty pet journal, from
-        address 0x0. Written to a board it replaces everything the firmware uses:
-        settings, Wi-Fi and pets are gone.
-    aipets-firmware-<board>-<version>-app.bin   the app alone, for both app slots
-        (0x30000 and 0x3b0000) of a board that already runs this firmware.
+    aipets-firmware-<board>-<version>-full.bin  bootloader, partition table and
+        application, with all other partition bytes erased, from address 0x0.
+        This replaces settings, Wi-Fi, linking, sounds and pets.
+    aipets-firmware-<board>-<version>-app.bin   the app alone. Only use it on a
+        board with the identical partition table. Offsets come from the build,
+        not from an older release's instructions.
 
 plus manifest.json, which describes every file, and SHA256SUMS.
 """
@@ -45,8 +45,12 @@ def app_version(app: bytes) -> str:
 def full_image(parts: list[tuple[int, bytes]], end: int) -> bytes:
     """Each (offset, data) in one image; the rest erased (0xFF) as on blank flash."""
     image = bytearray(b"\xff" * end)
-    for offset, data in parts:
+    previous_end = 0
+    for offset, data in sorted(parts):
+        if offset < previous_end or offset + len(data) > end:
+            raise SystemExit("Overlapping or out-of-range firmware image regions")
         image[offset:offset + len(data)] = data
+        previous_end = offset + len(data)
     return bytes(image)
 
 
@@ -54,21 +58,39 @@ def package(board: str, build: Path, version: str, out: Path) -> dict:
     app = (build / "aipet_firmware.bin").read_bytes()
     table = (build / "partition_table/partition-table.bin").read_bytes()
     regions = partitions(table)
-    app_a, app_b, journal = regions["ota_0"], regions["ota_1"], regions["pet_journal"]
-    if len(app) > app_a[1]:
+    if "factory" in regions and not any(name in regions for name in ("ota_0", "ota_1", "otadata")):
+        app_slots = [regions["factory"]]
+        scheme = "factory"
+    elif "factory" not in regions and all(name in regions for name in ("ota_0", "ota_1", "otadata")):
+        app_slots = [regions["ota_0"], regions["ota_1"]]
+        scheme = "dual-ota"
+    else:
+        raise SystemExit(f"{board}: unsupported application partition layout")
+    if any(len(app) > size for _, size in app_slots):
         raise SystemExit(f"{board}: the app does not fit its slot")
     parts = [
         (0x0, (build / "bootloader/bootloader.bin").read_bytes()),
         (0x8000, table),
-        (regions["otadata"][0], (build / "ota_data_initial.bin").read_bytes()),
-        (app_a[0], app),
-        (app_b[0], app),
+        *[(offset, app) for offset, _ in app_slots],
     ]
+    if scheme == "dual-ota":
+        ota_data = (build / "ota_data_initial.bin").read_bytes()
+        if len(ota_data) > regions["otadata"][1]:
+            raise SystemExit(f"{board}: boot selection exceeds its partition")
+        parts.append((regions["otadata"][0], ota_data))
+    end = max(offset + size for offset, size in regions.values())
+    if end > 16 * 1024 * 1024:
+        raise SystemExit(f"{board}: partition layout exceeds the supported 16 MiB region")
     files = {
-        "full": (f"aipets-firmware-{board}-{version}-full.bin", full_image(parts, sum(journal)), [0x0]),
-        "app": (f"aipets-firmware-{board}-{version}-app.bin", app, [app_a[0], app_b[0]]),
+        "full": (f"aipets-firmware-{board}-{version}-full.bin", full_image(parts, end), [0x0]),
+        "app": (f"aipets-firmware-{board}-{version}-app.bin", app, [offset for offset, _ in app_slots]),
     }
-    entry = {"board": board, "chip": "esp32s3", "app_version": app_version(app)}
+    entry = {"board": board, "chip": "esp32s3", "app_version": app_version(app),
+             "application_scheme": scheme, "partition_table_sha256": hashlib.sha256(table).hexdigest(),
+             "partitions": {name: {"offset": hex(offset), "bytes": size}
+                            for name, (offset, size) in regions.items()},
+             "full_image_erases_owner_data": True, "app_requires_identical_partition_table": True,
+             "physical_verification": "not-performed"}
     for role, (name, data, offsets) in files.items():
         (out / name).write_bytes(data)
         entry[role] = {"file": name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),

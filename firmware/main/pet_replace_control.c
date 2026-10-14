@@ -1,4 +1,5 @@
 #include "pet_replace_control.h"
+#include "pet_flash_layout.h"
 #include <string.h>
 #include "cJSON.h"
 
@@ -254,6 +255,10 @@ pet_replace_control_status_t pet_replace_control_step(pet_replace_control_t *w,u
         }
         return mount(w,now);
     }
+    if (!o->cancel_requested && o->phase != PET_CLOUD_CANCELLED &&
+        o->release.requirements.layout_id == PET_LAYOUT_ONE_10M &&
+        o->release.pack.bytes > PET_POCKET_MAX_PACK_BYTES)
+        return conflict(w, now, "PET_PACK_TOO_LARGE_10739712_BYTES");
     /* Retry/supersession is explicit cloud authority, not interpretation of an
      * old recovery report as permission to resume erasing. */
     if(next.phase==PET_REPLACE_RECOVERY&&o->phase==PET_CLOUD_FENCED){

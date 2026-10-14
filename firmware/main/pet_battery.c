@@ -177,6 +177,36 @@ static void battery_task(void *arg)
     }
 }
 
+#ifdef PET_BOARD_LCD_154
+#define POWER_BUTTON_POLL_MS 50
+#define POWER_OFF_HOLD_MS 2000
+
+/* Holding the power button turns the board off, as Waveshare's firmware does:
+ * the latch drops and the battery stops powering it (on USB it stays on). The
+ * press that turned the board on still holds the button down at boot, so a
+ * hold counts only after the button has been released once. */
+static void power_button_task(void *arg)
+{
+    (void)arg;
+    bool released = false;
+    uint32_t held_ms = 0;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(POWER_BUTTON_POLL_MS));
+        if (gpio_get_level(BSP_POWER_BUTTON)) {
+            released = true;
+            held_ms = 0;
+            continue;
+        }
+        if (!released) continue;
+        held_ms += POWER_BUTTON_POLL_MS;
+        if (held_ms == POWER_OFF_HOLD_MS) {
+            ESP_LOGI(TAG, "power button held: turning off");
+            gpio_set_level(BSP_POWER_HOLD, 0);
+        }
+    }
+}
+#endif
+
 esp_err_t pet_battery_start(pet_battery_callback_t callback)
 {
     ESP_RETURN_ON_FALSE(callback, ESP_ERR_INVALID_ARG, TAG,
@@ -190,8 +220,8 @@ esp_err_t pet_battery_start(pet_battery_callback_t callback)
         .atten = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
-    const gpio_config_t charging = {
-        .pin_bit_mask = 1ULL << BSP_BATTERY_CHARGING,
+    const gpio_config_t inputs = {
+        .pin_bit_mask = (1ULL << BSP_BATTERY_CHARGING) | (1ULL << BSP_POWER_BUTTON),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
     };
@@ -199,10 +229,12 @@ esp_err_t pet_battery_start(pet_battery_callback_t callback)
     ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_adc, ADC_CHANNEL_0, &channel), TAG, "battery ADC channel");
     ESP_RETURN_ON_ERROR(adc_cali_create_scheme_curve_fitting(&calibration, &s_adc_calibration), TAG,
                         "battery ADC calibration");
-    ESP_RETURN_ON_ERROR(gpio_config(&charging), TAG, "charging pin");
+    ESP_RETURN_ON_ERROR(gpio_config(&inputs), TAG, "charging pin and power button");
     s_callback = callback;
     BaseType_t created = xTaskCreate(battery_task, "pet_battery", 3072, NULL, 2, NULL);
     ESP_RETURN_ON_FALSE(created == pdPASS, ESP_ERR_NO_MEM, TAG, "create battery task");
+    created = xTaskCreate(power_button_task, "pet_power_btn", 2048, NULL, 2, NULL);
+    ESP_RETURN_ON_FALSE(created == pdPASS, ESP_ERR_NO_MEM, TAG, "create power button task");
     ESP_LOGI(TAG, "battery voltage monitor ready");
     return ESP_OK;
 #else

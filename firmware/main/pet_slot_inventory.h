@@ -6,21 +6,21 @@
 #include "pet_replace.h"
 
 /*
- * Inventory of the three-pet store: what each slot holds, which pet is on
+ * Inventory of the one-pet store: what each slot holds, which pet is on
  * screen, which one the cloud binds for conversation, and where an
  * installation in flight is written.
  *
  * `operation` is the single-slot machine of pet_replace.h for the bound pet,
  * unchanged: its ACTIVE pack is the pet the device talks as, and an
- * installation replaces that binding exactly as on a single-pet device. The
- * new bytes go to `target`, a slot that is neither on screen nor bound, so the
- * previous pet stays installed and can be selected again. The whole inventory
- * is one versioned journal record: binding, slots and selection always change
- * together.
+ * installation replaces that binding exactly as on a single-pet device. A
+ * Pocket keeps one pet: the new bytes always go to slot 0, which invalidation
+ * takes off the screen and unbinds before it is written. The sound bank has
+ * its own partition. The whole inventory is one versioned journal record:
+ * binding, slots and selection always change together.
  */
 
-#define PET_SLOT_COUNT 3u
-#define PET_SLOT_RECORD_BYTES 1042u
+#define PET_SLOT_COUNT 1u
+#define PET_SLOT_RECORD_BYTES 814u
 
 typedef enum { PET_SLOT_FREE, PET_SLOT_INSTALLING, PET_SLOT_READY } pet_slot_status_t;
 
@@ -52,19 +52,17 @@ bool pet_slot_inventory_select(pet_slot_inventory_t *inventory, unsigned slot);
 int pet_slot_inventory_step(const pet_slot_inventory_t *inventory, int from, int direction);
 
 /* Apply the result of a pet_replace_* transition of `operation`.
- * - A new request picks the target: a free slot, else the slot already holding
- *   the same bytes, else the least recently shown slot. Never the slot on
- *   screen or the bound one.
+ * - A new request targets slot 0, on screen and bound or not. An update's
+ *   replacement must be the pack in slot 0.
  * - Invalidation starts rewriting the target and ends the old binding. If the
- *   target is on screen, another installed pet is shown instead.
+ *   target is on screen, another installed pet is shown instead, or none.
  * - A commit makes the target ready, bound and shown, and records
  *   `validator_revision` (nonzero, used only on commit).
  * - A request cancelled before its fence leaves every slot as it was. */
 bool pet_slot_inventory_apply(pet_slot_inventory_t *inventory, const pet_replace_t *next,
                               uint16_t validator_revision);
-/* An authenticated replacement names the exact old pack, never a raw slot.
- * It may replace the shown/bound pet. Missing or ambiguous targets fail;
- * there is no free-slot/LRU fallback. Only used when creating REQUESTED. */
+/* The slot of exactly this ready pack, or -1 when none or two hold it. An
+ * authenticated replacement names the exact old pack, never a raw slot. */
 int pet_slot_inventory_find(const pet_slot_inventory_t *inventory, const pet_replace_pack_t *pack);
 /* Idle-only exact removal; an absent target succeeds without changing state.
  * Clears only this slot/binding, selects another ready pet when needed. */

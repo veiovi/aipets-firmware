@@ -205,7 +205,7 @@ static cJSON *protection_json(const pet_firmware_protection_t *p,const pet_firmw
     if(!p->known)return o;
     if(count>PET_FIRMWARE_INSTALLED_MAX||
        !add(o,"active",pack_json(&p->active,current))||!add(o,"interrupted",pack_json(&p->interrupted,current))){cJSON_Delete(o);return NULL;}
-    if(current->layout.pet_slots!=PET_LAYOUT_THREE_SLOTS)return o;
+    if(!pet_flash_layout_is_pocket(&current->layout)||current->layout.id==PET_LAYOUT_ONE_10M)return o;
     cJSON *installed=cJSON_CreateArray();
     if(!add(o,"installed",installed)){cJSON_Delete(o);return NULL;}
     for(unsigned i=0;i<count;++i){
@@ -228,7 +228,7 @@ bool pet_firmware_wire_encode_poll(const pet_firmware_requirements_t *r,const ch
     if(!NUM(caps,"version",2)||!STR(caps,"hardware",pet_board_current()->hardware)||!STR(caps,"chip","esp32s3")||
        !add(caps,"layout",layout_json(r))||!NUM(caps,"firmwareEpoch",r->firmware_epoch)||!STR(caps,"firmwareSha256",running)||
        !add(caps,"renderer",renderer_json(r))||!add(caps,"bootloader",bootloader_json(&r->bootloader))||!STR(caps,"petUpdateMode","single-slot-replace-v2")||
-       !STR(caps,"firmwareUpdateMode","dual-app-ota-v1")||!TRUE(caps,"independentControl")){cJSON_Delete(caps);return false;}
+       !STR(caps,"firmwareUpdateMode",r->layout.id==PET_LAYOUT_ONE_10M?"usb-v1":"dual-app-ota-v1")||!TRUE(caps,"independentControl")){cJSON_Delete(caps);return false;}
 #ifdef ESP_PLATFORM
     /* Same base eFuse identity read by the USB ROM loader. This is public
      * correlation data inside an authenticated control report, not a credential. */

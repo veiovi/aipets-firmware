@@ -4,6 +4,8 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+static unsigned boot_reads;
+esp_err_t pet_flash_layout_read(pet_flash_layout_t *layout, char sha[65]);
 static pet_firmware_control_t worker;
 static pet_firmware_control_config_t config;
 static pet_firmware_receipt_store_t store;
@@ -35,7 +37,7 @@ static void freeze(void *p){(void)p;++freezes;}
 static void restart(void *p){(void)p;++restarts;}
 static uint64_t clock_ms(void *p){(void)p;return now;}
 bool pet_firmware_image_bootloader_matches(const pet_firmware_bootloader_t *p){return bootloader_ok&&p&&p->bytes==0x7000;}
-bool pet_firmware_image_boot_state(pet_firmware_boot_state_t *out){if(!known_layout)return false;*out=boot;return true;}
+bool pet_firmware_image_boot_state(pet_firmware_boot_state_t *out){++boot_reads;if(!known_layout)return false;*out=boot;return true;}
 bool pet_firmware_image_running(char out[65],uint32_t *bytes){strcpy(out,running);*bytes=operation.release.bytes;return known_layout;}
 /* Stands in for the real rule (firmware_release_test.c) on one field: every
  * installed pet's minimum epoch. */
@@ -145,8 +147,38 @@ static void power_cycle(bool target)
         boot.selection.active=1;boot.selection.records[1]=(pet_ota_record_t){.sequence=4,.state=PET_OTA_STATE_PENDING,.slot=1,.crc_valid=true,.bootable=true};}
     assert(pet_firmware_control_init(&worker,&config,&store));now+=1000;
 }
+esp_err_t pet_flash_layout_read(pet_flash_layout_t *layout, char sha[65])
+{
+    *layout = boot.layout;
+    strcpy(sha, boot.partition_sha256);
+    return known_layout ? ESP_OK : ESP_FAIL;
+}
 int main(void)
 {
+#if CONFIG_PET_POCKET_TERMINAL
+    reset();
+    assert(pet_flash_layout_known(PET_LAYOUT_ONE_10M, &boot.layout));
+    config.firmware_epoch = 7;
+    config.bootloader = (pet_firmware_bootloader_t){0};
+    assert(pet_firmware_control_init(&worker, &config, NULL));
+    step();
+    assert(worker.authenticated && !minimal_poll && !pet_firmware_control_blocks_pet(&worker));
+    /* Even a server offering an operation cannot start firmware work. */
+    for (unsigned i = 0; i < 20; ++i)
+    {
+        now += 15000;
+        step();
+        assert(!pet_firmware_control_health_deadline(&worker, now));
+    }
+    assert(!begins && !ranges && !reports && !confirms && !restarts && !boot_reads);
+    transport_ok = false;
+    now += 15000;
+    step();
+    assert(!worker.authenticated && worker.retry_at_ms > now);
+    assert(!pet_firmware_control_blocks_pet(&worker));
+    puts("USB capability polling: no OTA boot, download, receipt or rollback");
+    return 0;
+#endif
     reset();step();assert(polls==1&&!begins);step();assert(store.value.phase==PET_FW_DOWNLOADING&&!begins&&pet_firmware_control_blocks_pet(&worker));
     lose_report_reply=true;step();assert(!begins&&store.value.acknowledged_sequence==0&&operation.report.sequence==1);
     now+=15000;step();assert(store.value.acknowledged_sequence==1&&!begins);

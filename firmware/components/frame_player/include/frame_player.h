@@ -10,8 +10,9 @@
  * format or runtime state with the procedural emergency renderer.
  *
  * Freestanding: no heap, no floats, no libc; state lives in a caller-provided
- * arena. The pack is read in place (flash mmap or rodata) byte-wise, so no
- * alignment is required. After fp_init() succeeds, fp_tick() cannot fail.
+ * arena. Packs are byte-wise RAM/rodata spans, or resident metadata with
+ * caller-pinned RAM resources. A missing streamed resource holds the frame
+ * and director state; fp_tick_committed reports whether time advanced.
  *
  * The binary format and the director's behavior are specified by the
  * frame-pack compiler's TypeScript reference; the parity tests
@@ -165,6 +166,27 @@ typedef struct {
 
 typedef struct fp_player fp_player_t;
 
+/* A streamed pack retains runtime tables in two immutable spans, at their
+ * original file offsets. Frame resources are resolved separately. A frame
+ * callback must only inspect RAM: NULL means that the worker has not loaded
+ * it yet. begin/end pin that RAM for a complete render transaction.
+ * read is used only by full validation, on the caller's storage task. */
+typedef struct {
+    const uint8_t *bytes;
+    uint32_t offset;
+    uint32_t length;
+} fp_pack_span_t;
+
+typedef struct {
+    fp_pack_span_t spans[2];
+    uint32_t bytes;
+    void *context;
+    int (*read)(void *context, uint32_t offset, void *out, uint32_t length);
+    const uint8_t *(*frame)(void *context, uint16_t index, uint32_t offset, uint32_t length);
+    int (*begin)(void *context, uint16_t clip, uint16_t step, uint16_t frame);
+    void (*end)(void *context);
+} fp_pack_source_t;
+
 /* Legacy allocation-free raw/RLE validation. Compressed resources return
  * FP_ERR_ARENA: use the explicit workspace API for all v2 release validation. */
 fp_error_t fp_validate(const void *pack, uint32_t pack_bytes, fp_pack_info_t *info);
@@ -173,11 +195,13 @@ uint32_t fp_validation_workspace_size(void);
  * allocated off the firmware task stack. `info` may be NULL. */
 fp_error_t fp_validate_with_workspace(const void *pack, uint32_t pack_bytes,
     fp_pack_info_t *info, void *workspace, uint32_t workspace_bytes);
+fp_error_t fp_validate_source(const fp_pack_source_t *source, fp_pack_info_t *info,
+    void *workspace, uint32_t workspace_bytes, void *scratch, uint32_t scratch_bytes);
 
 /* Changes whenever fp_validate_with_workspace accepts or rejects differently.
  * An installed pack records the revision that proved it; firmware with a newer
  * validator checks that pack in full once more before showing it. */
-#define FP_VALIDATOR_REVISION 3u
+#define FP_VALIDATOR_REVISION 4u
 
 /* Arena bytes required by fp_init (compile-time constant). */
 uint32_t fp_arena_size(void);
@@ -200,6 +224,10 @@ fp_player_t *fp_player_init(void *arena, uint32_t arena_bytes, const void *pack,
  */
 fp_player_t *fp_player_init_prevalidated(void *arena, uint32_t arena_bytes, const void *pack,
                                          uint32_t pack_bytes, uint32_t seed, fp_error_t *error);
+/* The source and every resource have been fully validated and hash-bound.
+ * Binding reads resident metadata and immediate frames only. */
+fp_player_t *fp_player_init_source(void *arena, uint32_t arena_bytes,
+    const fp_pack_source_t *source, uint32_t seed, fp_error_t *error);
 /* The same structure-only check without binding, to read `info` (identity,
  * approval, size) of bytes already validated in full. Needs no workspace. */
 fp_error_t fp_inspect_prevalidated(const void *pack, uint32_t pack_bytes, fp_pack_info_t *info);
@@ -218,9 +246,10 @@ void fp_set_idle_showcase_enabled(fp_player_t *player, uint8_t enabled);
  *   art-review loop;
  * - FP_IDLE_HOLD: the neutral idle, while direct semantic actions are reviewed;
  * - FP_IDLE_NATURAL: a companion's idle. The pack's micro performances play at
- *   its authored gaps. After FP_CALM_MIN..MAX ticks of calm (about 4 to 10
- *   minutes at 33 ms), one of its manual actions plays, such as a signature
- *   move. Calm is idle with no input, emotion or other action. An ambient loop
+ *   its authored gaps. After FP_CALM_MIN..MAX ticks of calm (about 7 to 15
+ *   seconds at 33 ms), one of its manual actions plays, such as a signature
+ *   move. Calm is idle with no input, emotion or other action; an ambient
+ *   event only pauses it. An ambient loop
  *   that an action or a state interrupts resumes where it stopped, so a long
  *   idle loop plays every moment; the reduced profile, another idle mode or a
  *   new binding starts it over.
@@ -244,6 +273,9 @@ void fp_report_health(fp_player_t *player, uint8_t audio_healthy, uint16_t prese
 /* Advance exactly one 33 ms director tick. The framebuffer is refreshed only
  * when the visible frame or whole-frame offset changes. */
 void fp_tick(fp_player_t *player);
+/* False when the last streamed tick held its frame and director state while
+ * waiting for a resource. Repeated authored frames still count as a tick. */
+uint8_t fp_tick_committed(const fp_player_t *player);
 
 /* Validated pack-sized RGB565 (native endian), valid until the next fp_tick. */
 const uint16_t *fp_framebuffer(const fp_player_t *player);
@@ -260,8 +292,14 @@ int16_t fp_debug_dirty_y(const fp_player_t *player);
 uint16_t fp_debug_dirty_width(const fp_player_t *player);
 uint16_t fp_debug_dirty_height(const fp_player_t *player);
 int16_t fp_active_action(const fp_player_t *player, fp_plane_t plane);
+/* An action's id as its pack names it (its clip name without "action."), for
+ * logs; not NUL-terminated. NULL with length 0 for an action the pack lacks. */
+const char *fp_action_name(const fp_player_t *player, int16_t action, uint16_t *length);
 fp_motion_capabilities_t fp_motion_capabilities(const fp_player_t *player);
 const fp_pack_info_t *fp_pack_info(const fp_player_t *player);
+/* Ticks of one pass of the loop the bound pack idles in: its first ambient
+ * loop on the base plane, or else its idle clip. */
+uint32_t fp_idle_loop_ticks(const fp_player_t *player);
 const char *fp_error_string(fp_error_t error);
 
 /* Pack emotion id at table index [0, emotion_count); 0 if out of range.

@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import unittest
 import zlib
+from test_pet_release_v2_pack import minimal_pack
 
 ROOT = Path(__file__).resolve().parents[1]
 PLAYER = ROOT / "components/frame_player"
@@ -56,22 +57,27 @@ class FramePlayerPathsTests(unittest.TestCase):
             self.assertGreater(rewritten, 0)
             other = Path(directory) / "zlib.aipetframes"
             other.write_bytes(zlib_pack)
+            long_clip = Path(directory) / "multi-window.aipetframes"
+            long_clip.write_bytes(minimal_pack(optional_frames=10))
             binary = str(Path(directory) / "frame_player_paths")
             subprocess.run([
                 os.environ.get("CC", "cc"), "-std=c11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
-                "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+                "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-pthread",
                 "-I", str(PLAYER / "include"), str(ROOT / "tests/frame_player_paths.c"), *SOURCES, "-o", binary,
             ], check=True)
-            result = subprocess.run([binary, str(SEED), str(other)], capture_output=True, text=True, timeout=300)
+            result = subprocess.run([binary, str(SEED), str(other), str(long_clip)],
+                                    capture_output=True, text=True, timeout=300)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("both encodings identical", result.stdout)
+            windows = result.stdout.split("multi-window.aipetframes:")[1].split("windows ")[1].split(",")[0]
+            self.assertGreater(int(windows), 2)
 
     def test_benchmark_builds_and_runs(self):
         with tempfile.TemporaryDirectory(prefix="frame-player-bench-") as directory:
             binary = str(Path(directory) / "frame_player_bench")
             subprocess.run([
                 os.environ.get("CC", "cc"), "-std=c11", "-O1", "-Wall", "-Wextra", "-Werror",
-                "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+                "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-pthread",
                 "-I", str(PLAYER / "include"), "-I", str(PLAYER / "src"),
                 str(ROOT / "tests/frame_player_bench.c"), *SOURCES, "-o", binary,
             ], check=True)

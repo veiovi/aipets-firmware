@@ -1,56 +1,57 @@
 # Pet packs
 
-A pet is an `.aipetframes` pack: 240 × 240 animation frames for idle, listening,
-thinking and speaking, touch and shake reactions and the pet's own moments,
-with their timing. `firmware/components/frame_player` plays it. The device
-holds up to three pets.
+A pet is an `.aipetframes` pack: 240 × 240 animation frames, timing and state
+metadata, played by `firmware/components/frame_player`. The current
+`one-pet-10m-v5` layout holds **one pet**, up to **10,739,712 bytes**. Flash
+capacity does not remove the runtime's separate RAM and validation limits.
 
-The official AI Pets characters are not in this repository and are not
-licensed for other use ([trademarks](../TRADEMARKS.md)). Make your own.
+Official characters are not included or licensed for other use
+([trademarks](../TRADEMARKS.md)). The public
+[AI Pets Sprite Skill](https://github.com/veiovi/aipets-sprite-skill) provides
+an authoring workflow for your own packs; validate its output against the
+firmware version you use.
 
-## Make a pet
+## Install a pet over USB
 
-The [AI Pets Sprite Skill](https://github.com/veiovi/aipets-sprite-skill) for
-Codex turns a description into a reviewed pet: you approve its look, it
-animates the speech, blinks, glances and reactions, and it compiles an
-`.aipetframes` pack you can preview in the browser.
+First confirm that the device already uses the current layout. Migrate
+older layouts before installing a pet
+([getting started](getting-started.md#flash-and-migrate)).
 
-## Install pets over USB
-
-`firmware/tools/pocket_install_images.py` prepares one to three packs for a
-board that already runs this firmware. It needs only Python 3 and never opens
-a port:
+This tool only prepares files; it never opens a serial port:
 
 ```sh
 python3 firmware/tools/pocket_install_images.py \
-  --pack my-pet.aipetframes --pack second-pet.aipetframes \
-  --output pet-images
+  --pack my-pet.aipetframes --output pet-images
 ```
 
-It checks each pack first: a complete 240 px pack (format 2), marked approved,
-not a move pack, and at most 3,002,368 bytes. It then writes
-`pet-images/pet_journal.bin`, the list of installed pets, and
-`pet-images/pet-flash-plan.json`, and prints the esptool arguments: the list at
-`0x730000` and the packs at `0x740000`, `0xa1f000` and `0xcfe000`.
+It checks a complete format-2 pack, the approved flag, the size limit and
+that it is not a move pack. The firmware performs full validation on boot.
+The tool writes `pet-images/pet_journal.bin` and
+`pet-images/pet-flash-plan.json`, including hashes and the exact write plan:
+the journal at `0x3b0000`, and the pet at `0x5c0000`.
+
+Inspect the plan and use its printed esptool arguments with your device port:
 
 ```sh
 esptool.py --chip esp32s3 -p PORT write_flash <the printed arguments>
 ```
 
-The packs replace the pets that were on the device. Wi-Fi and the link stay.
-On the next boot the firmware checks each pack against the list's SHA-256 and
-shows the first one; `--active 1` or `--active 2` starts with another. Swipe to
-switch.
+This replaces the installed pet and its inventory. It leaves the settings
+and sound-bank regions untouched. There is only slot 0; the earlier
+three-pet/swipe-to-switch instructions do not apply.
 
-## What USB pets can't do
+## Signed content and conversations
 
-Pets installed over USB are unsigned. They play every animation, but:
+An unsigned USB pet can display animations but does not establish the signed
+backend binding required for conversations. A compatible backend installs
+signed pets over Wi-Fi, verified using the release public key configured in
+the firmware ([backend settings](backend.md)).
 
-- **They don't talk.** Only a pet that the linked backend installed and signed
-  talks, with its own voice and memory.
-- **The device takes no firmware update over Wi-Fi** while a USB pet is on it.
-  Update it over USB ([getting started](getting-started.md#flash)), or replace
-  the pets with ones installed from the backend.
+Story-event packs and sound-bank content are separate from the installed pet.
+The backend supplies authenticated event metadata and content hashes; missing
+or invalid event content falls back to narration. The 2 MiB sound bank is
+reserved for story sounds. Installing a pet with the USB tool does not
+populate that bank or create backend story assignments.
 
-A backend installs signed pets over Wi-Fi. The firmware verifies them with the
-release key it was built with ([backend settings](backend.md)).
+Firmware updates always use USB in this layout, whether the pet was installed
+over USB or Wi-Fi.

@@ -1,14 +1,12 @@
 # Qualified Pocket Terminal release inputs, appended after
 # sdkconfig.pocket.defaults. No credentials.
-# Epoch 4: firmware update protection of every pet slot. Epoch 3 (authored-step
-# timing, the three-pet layout) is the cloud's minimum for Pocket pets; a
-# Pocket never updates to an older epoch, so none returns to firmware that
-# cannot report its pets. Bump it with any change to the pet store's format.
-# A non-zero epoch enables signed installations over Wi-Fi.
-CONFIG_PET_VNEXT_FIRMWARE_EPOCH=5
+# Epoch 8: asynchronous playback from the epoch-7 one-pet layout. USB
+# firmware updates only; pets up to 10,739,712 bytes install over Wi-Fi.
+CONFIG_PET_VNEXT_FIRMWARE_EPOCH=8
 # The qualified rollback bootloader of released Pocket Terminals. The USB
-# migration to the three-pet layout keeps it. A board whose physical bytes
-# differ reports no bootloader profile, and the cloud refuses its installations.
+# migration to one-pet-10m-v5 keeps it. A board whose physical bytes
+# differ reports no bootloader profile. USB-only pet installs do not require
+# OTA boot state or rollback qualification. Migration still verifies the pin.
 CONFIG_PET_VNEXT_BOOTLOADER_BYTES=22304
 CONFIG_PET_VNEXT_BOOTLOADER_SHA256="7558d442cbeb03d88cd9c41129788ed500cf102343a1c4e16dcb45f190dfca43"
 

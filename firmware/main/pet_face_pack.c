@@ -39,10 +39,11 @@ typedef struct {
     const uint8_t *start;
     const uint8_t *end;
     uint8_t slot;
+    const fp_pack_source_t *source;
 } embedded_pack_t;
 
 static const embedded_pack_t s_embedded[] = {
-    {NULL,NULL,NULL,0}, /* Zero real embedded packs in the generic firmware. */
+    {NULL, NULL, NULL, 0, NULL}, /* Zero real embedded packs in the generic firmware. */
 };
 static embedded_pack_t s_external;
 static char s_external_id[PET_FACE_ID_MAX];
@@ -85,6 +86,16 @@ typedef struct {
     bool touch_was_pressed;
     bool bound_external;
     bool holding; /* pet_face_pack_hold_external: last frame stays, no player. */
+    /* A story event shown in place of the pet (pet_face_pack_play_event): its
+     * done, called once when it ends, and the ticks it has still to play. */
+    void (*event_done)(void);
+    uint32_t event_ticks;
+    /* The animation log: the base action last named, the ticks the current
+     * stall has held the picture, and this stats window's starts and stalls. */
+    int16_t logged_action;
+    uint32_t stalled_ticks;
+    uint32_t window_starts;
+    uint32_t window_stalled_ticks;
 } frame_scene_t;
 
 static frame_scene_t s_scene;
@@ -128,7 +139,7 @@ static const embedded_pack_t *find_pack(const char *id)
 
 static uint32_t pack_bytes(const embedded_pack_t *pack)
 {
-    return pack ? (uint32_t)(pack->end - pack->start) : 0;
+    return pack ? (pack->source ? pack->source->bytes : (uint32_t)(pack->end - pack->start)) : 0;
 }
 
 static pack_check_t *pack_check(const embedded_pack_t *pack)
@@ -253,6 +264,55 @@ static void forget_player(void)
     s_scene.pending_dirty_valid = false;
     s_scene.shown_state_valid = false;
     s_scene.touch_was_pressed = false;
+    /* A story event ends with the player that showed it. */
+    void (*done)(void) = s_scene.event_done;
+    s_scene.event_done = NULL;
+    if (done) done();
+}
+
+/* One serial line for each base action the pet starts, and one when a streamed
+ * action kept the picture waiting for its frames: what the pet really played. */
+static void log_animation(void)
+{
+    if (!fp_tick_committed(s_scene.player)) {
+        s_scene.stalled_ticks++;
+        s_scene.window_stalled_ticks++;
+        return;
+    }
+    int16_t action = fp_active_action(s_scene.player, FP_PLANE_BASE);
+    uint16_t length = 0;
+    const char *name = fp_action_name(s_scene.player, action, &length);
+    if (s_scene.stalled_ticks) {
+        ESP_LOGI(TAG, "anim wait %lums %.*s", (unsigned long)(s_scene.stalled_ticks * FP_TICK_MS), (int)length,
+                 name ? name : "");
+        s_scene.stalled_ticks = 0;
+    }
+    if (action >= 0 && action != s_scene.logged_action) {
+        ESP_LOGI(TAG, "anim start %.*s", (int)length, name ? name : "");
+        s_scene.window_starts++;
+    }
+    s_scene.logged_action = action;
+}
+
+/* The scene draws `player` from its first frame, as face `id`; `external`:
+ * from the caller's bytes. */
+static void show_player(fp_player_t *player, bool external, const char *id)
+{
+    s_scene.player = player;
+    s_scene.logged_action = -1;
+    s_scene.stalled_ticks = 0;
+    s_scene.bound_external = external;
+    strlcpy(s_scene.active_id, id, sizeof(s_scene.active_id));
+    s_scene.shown_expression = PET_EXPRESSION_IDLE;
+    s_scene.shown_state_valid = false;
+    s_scene.touch_was_pressed = false;
+    s_scene.pending_dirty = full_dirty();
+    s_scene.pending_dirty_valid = true;
+    s_scene.presented_revision = fp_visual_revision(player);
+    expand_dirty(fp_framebuffer(player), full_dirty());
+    sync_canvas_buffer(full_dirty());
+    if (s_scene.canvas) lv_obj_invalidate(s_scene.canvas);
+    s_scene.last_present_us = esp_timer_get_time();
 }
 
 static esp_err_t bind_pack(const embedded_pack_t *pack)
@@ -267,28 +327,17 @@ static esp_err_t bind_pack(const embedded_pack_t *pack)
      * been overwritten and must never remain reachable through s_scene. The
      * pack was proven above, so binding only checks its structure. */
     forget_player();
-    fp_player_t *player = fp_player_init_prevalidated(
-        s_scene.arena, fp_arena_size(), pack->start, pack_bytes(pack), seed,
-        &error);
+    fp_player_t *player =
+        pack->source
+            ? fp_player_init_source(s_scene.arena, fp_arena_size(), pack->source, seed, &error)
+            : fp_player_init_prevalidated(s_scene.arena, fp_arena_size(), pack->start, pack_bytes(pack), seed, &error);
     if (!player) {
         forget_player();
         ESP_LOGE(TAG, "full-frame player init failed for %s: %s",
                  pack->id, fp_error_string(error));
         return ESP_FAIL;
     }
-    s_scene.player = player;
-    s_scene.bound_external = pack == &s_external;
-    strlcpy(s_scene.active_id, pack->id, sizeof(s_scene.active_id));
-    s_scene.shown_expression = PET_EXPRESSION_IDLE;
-    s_scene.shown_state_valid = false;
-    s_scene.touch_was_pressed = false;
-    s_scene.pending_dirty = full_dirty();
-    s_scene.pending_dirty_valid = true;
-    s_scene.presented_revision = fp_visual_revision(player);
-    expand_dirty(fp_framebuffer(player), full_dirty());
-    sync_canvas_buffer(full_dirty());
-    if (s_scene.canvas) lv_obj_invalidate(s_scene.canvas);
-    s_scene.last_present_us = esp_timer_get_time();
+    show_player(player, pack == &s_external, pack->id);
     ESP_LOGI(TAG,
              "full-frame pack %.*s v%.*s id=%s bytes=%lu frames=%u emotions=%u actions=%u",
              info.name_len, (const char *)info.name,
@@ -312,10 +361,21 @@ esp_err_t pet_face_pack_use_external(const char *id,const void *bytes,size_t len
         return ESP_ERR_INVALID_CRC;
     }
     strcpy(s_external_id,id);
-    s_external=(embedded_pack_t){s_external_id,bytes,(const uint8_t *)bytes+length,0};
+    s_external = (embedded_pack_t){s_external_id, bytes, (const uint8_t *)bytes + length, 0, NULL};
     s_external_check=(pack_check_t){.checked=true,.valid=true,.info=info};
     /* Force a rebind even if a newer build has the same face ID. */
     return s_scene.arena?bind_pack(&s_external):ESP_OK;
+}
+
+esp_err_t pet_face_pack_use_source(const char *id, const fp_pack_source_t *source, const fp_pack_info_t *info)
+{
+    if (!id || !id[0] || strlen(id) >= sizeof(s_external_id) || !source || !info || !source->spans[0].bytes ||
+        info->pack_bytes != source->bytes || !info->approved || !pet_face_id_matches(id, info->id, info->id_len, true))
+        return ESP_ERR_INVALID_ARG;
+    strcpy(s_external_id, id);
+    s_external = (embedded_pack_t){.id = s_external_id, .start = source->spans[0].bytes, .source = source};
+    s_external_check = (pack_check_t){.checked = true, .valid = true, .info = *info};
+    return s_scene.arena ? bind_pack(&s_external) : ESP_OK;
 }
 
 void pet_face_pack_release_external(void)
@@ -334,6 +394,33 @@ void pet_face_pack_hold_external(void)
     bool held = s_scene.bound_external || s_scene.holding;
     pet_face_pack_release_external();
     s_scene.holding = held;
+}
+
+esp_err_t pet_face_pack_play_event(const void *pack, size_t bytes, void (*done)(void))
+{
+    fp_error_t error = FP_OK;
+    if (!pack || bytes > UINT32_MAX || !done || !s_scene.player || !s_scene.bound_external || !s_external.start ||
+        s_scene.event_done)
+        return ESP_ERR_INVALID_STATE;
+    forget_player();
+    fp_player_t *player = fp_player_init_prevalidated(s_scene.arena, fp_arena_size(), pack, (uint32_t)bytes,
+                                                       esp_random(), &error);
+    if (!player) {
+        ESP_LOGE(TAG, "story event not shown: %s", fp_error_string(error));
+        if (bind_pack(&s_external) != ESP_OK) forget_player();
+        return ESP_FAIL;
+    }
+    /* Still the pet's face to everyone else: only its pixels are the event's. */
+    show_player(player, true, s_external.id);
+    s_scene.event_done = done;
+    s_scene.event_ticks = 3 * fp_idle_loop_ticks(player);
+    return ESP_OK;
+}
+
+void pet_face_pack_stop_event(void)
+{
+    /* Binding the pet's pack again forgets the event's player, which ends it. */
+    if (s_scene.event_done && bind_pack(&s_external) != ESP_OK) forget_player();
 }
 
 esp_err_t pet_face_pack_create(lv_obj_t *parent, const char *preferred_id,
@@ -425,8 +512,7 @@ esp_err_t pet_face_pack_list(pet_face_catalog_item_t *items, size_t capacity,
             memcpy(item->version, info.version, version_length);
             item->version[version_length] = 0;
             item->pack_bytes = info.pack_bytes;
-            item->format_version=(uint16_t)pack->start[8]|
-                                 ((uint16_t)pack->start[9]<<8);
+            item->format_version = info.format_version;
             /* Hashed once per boot, and never for the installed pack: its
              * size would stall the caller and its installer knows the hash. */
             uint8_t digest[32];
@@ -489,9 +575,19 @@ esp_err_t pet_face_pack_update(pet_face_state_t state,
     (void)touch_x_q88;
     (void)touch_y_q88;
     if (rendered_out) *rendered_out = false;
+    /* A story event has played its idle loop three times: the pet again. */
+    if (s_scene.event_done && !s_scene.event_ticks) pet_face_pack_stop_event();
     if (!s_scene.player || !s_scene.canvas) return s_scene.holding && s_scene.canvas ? ESP_OK : ESP_ERR_INVALID_STATE;
     int64_t started_us = esp_timer_get_time();
     s_scene.last_now_ms = now_ms;
+    if (s_scene.event_done) {
+        /* Until then it plays whatever the pet's state and input. */
+        state = PET_FACE_IDLE;
+        expression = PET_EXPRESSION_IDLE;
+        audio_level = 0;
+        pressed = false;
+        imu_x_q88 = imu_y_q88 = 0;
+    }
 
     /* Every pet follows real device inputs. Authored idle performances remain
      * the shared director's responsibility, not a name-triggered demo. */
@@ -526,6 +622,8 @@ esp_err_t pet_face_pack_update(pet_face_state_t state,
     s_scene.touch_was_pressed = pressed;
 
     fp_tick(s_scene.player);
+    log_animation();
+    if (s_scene.event_done && fp_tick_committed(s_scene.player)) --s_scene.event_ticks;
     uint32_t revision = fp_visual_revision(s_scene.player);
     if (revision != s_scene.presented_revision) {
         union_pending_dirty(fp_dirty_rect(s_scene.player));
@@ -565,7 +663,8 @@ esp_err_t pet_face_pack_update(pet_face_state_t state,
         fp_motion_capabilities_t capabilities =
             fp_motion_capabilities(s_scene.player);
         ESP_LOGI(TAG,
-                 "id=%s ticks=%lu present=%lu coalesced=%lu frame=%u dirty=%dx%d actions=%u maxTick=%lldus maxPresent=%lldus",
+                 "id=%s ticks=%lu present=%lu coalesced=%lu frame=%u dirty=%dx%d actions=%u started=%lu "
+                 "stalledMs=%lu maxTick=%lldus maxPresent=%lldus",
                  s_scene.active_id, (unsigned long)s_scene.ticks,
                  (unsigned long)s_scene.presentations,
                  (unsigned long)s_scene.coalesced_presentations,
@@ -573,9 +672,13 @@ esp_err_t pet_face_pack_update(pet_face_state_t state,
                  fp_debug_dirty_width(s_scene.player),
                  fp_debug_dirty_height(s_scene.player),
                  capabilities.action_count,
+                 (unsigned long)s_scene.window_starts,
+                 (unsigned long)(s_scene.window_stalled_ticks * FP_TICK_MS),
                  (long long)s_scene.max_tick_us,
                  (long long)s_scene.max_present_us);
         s_scene.ticks = 0;
+        s_scene.window_starts = 0;
+        s_scene.window_stalled_ticks = 0;
         s_scene.presentations = 0;
         s_scene.coalesced_presentations = 0;
         s_scene.max_tick_us = 0;
@@ -587,7 +690,7 @@ esp_err_t pet_face_pack_update(pet_face_state_t state,
 
 uint8_t pet_face_pack_trigger_gesture(uint8_t gesture)
 {
-    if (!s_scene.player || gesture == FC_GESTURE_NONE ||
+    if (!s_scene.player || s_scene.event_done || gesture == FC_GESTURE_NONE ||
         gesture >= FC_GESTURE_COUNT) return FC_GESTURE_NONE;
     switch (gesture) {
         case FC_GESTURE_SPIN_CCW:
@@ -627,7 +730,7 @@ uint8_t pet_face_pack_trigger_gesture(uint8_t gesture)
 
 bool pet_face_pack_touch(void)
 {
-    if (!s_scene.player) return false;
+    if (!s_scene.player || s_scene.event_done) return false;
     fp_notify_touch(s_scene.player);
     return true;
 }

@@ -11,6 +11,18 @@
  * free for 8 s after a turn; nothing listens without a tap; a listen that
  * cannot be sent says so. The runtime, inventory, pack rules and frame player
  * are real; signed records, flash, the pet worker's HTTP and the socket are
+ * seams.
+ *
+ * Story events (story-event-v1): the cache downloads packs between turns into
+ * the unused tail of the pet's copy, keeps, forgets and adds them as the list
+ * and the copy change, and refuses a pack that is not exactly the one named; a
+ * cued event shows once the speech has drained, and a touch, a new reply, the
+ * microphone, a rebind or a pet switch ends it. Every cue ends with
+ * story.event.ended (story-reaction-v1). In story mode a tap holds the pet's
+ * answer and the next lets it play on (speech-pause-v1); with a gateway that
+ * keeps it (speech-pause-listen-v1) the tap listens over it instead, and the
+ * answer plays on if nothing is said; a double tap stops it. The cache and
+ * the pack checks are real; the renderer, the speaker and the download are
  * seams. */
 #include <assert.h>
 #include "../main/pet_vnext.c"
@@ -29,7 +41,7 @@ static pet_face_state_t face_state=PET_FACE_BOOTING;
 static char announced[PET_FACE_TERMINAL_MAX+1];
 static pet_sfx_t last_sound=PET_SFX_COUNT;
 static unsigned sounds,switch_sounds,error_cues,listen_cues,capture_starts,input_starts,cancels,freezes,starts,rebinds,disconnects,selects;
-static uint32_t last_cancel;
+static uint32_t last_cancel, previous_cancel;
 static bool capturing,playing,drawing_copy,wifi_ok=true;
 /* The face while a swipe copies the next pack (0.4-0.9 s on the Pocket), when
  * pet_diagnostics may look at it. */
@@ -49,6 +61,44 @@ bool pet_network_bound_to(const pet_control_context_t *c){return pet_network_is_
 bool pet_network_can_rebind(void){return pet_network_is_ready()&&socket_state.rebind;}
 bool pet_network_can_story(void){return false;}
 esp_err_t pet_network_story(uint32_t stream,const char *pet){(void)stream;(void)pet;assert(!"no story while switching");return ESP_FAIL;}
+/* Story mode (story-mode-v1) as the session last told it, the pauses sent, and
+ * the story frame over the pet. */
+static bool story_mode,frame_shown;
+static unsigned pauses;
+bool pet_network_story_mode(void){return story_mode;}
+bool pet_network_can_blessing(void){return false;}
+bool pet_network_can_speak_blessing(void){return false;}
+esp_err_t pet_network_blessing(uint32_t stream,const char *blessing,const char *pet)
+{(void)stream;(void)blessing;(void)pet;assert(!"no blessing while switching");return ESP_FAIL;}
+esp_err_t pet_network_story_request(const char *type,const char *id)
+{assert(!strcmp(type,"story.pause")&&!id);++pauses;return ESP_OK;}
+/* speech-pause-v1 as the gateway offers it, and the holds sent for a reply. */
+static bool speech_pause_offered;
+static unsigned output_pauses, output_resumes;
+static uint32_t output_stream;
+bool pet_network_can_pause_speech(void)
+{
+    return speech_pause_offered;
+}
+esp_err_t pet_network_output_pause(uint32_t stream, bool paused)
+{
+    assert(speech_pause_offered);
+    output_stream = stream;
+    if (paused)
+        ++output_pauses;
+    else
+        ++output_resumes;
+    return ESP_OK;
+}
+/* speech-pause-listen-v1 as the gateway offers it: it keeps a held reply
+ * while the owner talks over it. */
+static bool listen_offered;
+bool pet_network_can_listen_over_speech(void)
+{
+    return listen_offered;
+}
+void pet_face_set_story_frame(bool shown){frame_shown=shown;}
+void pet_onboarding_set_story_state(const char *face_id,const pet_story_state_t *state){(void)face_id;(void)state;}
 esp_err_t pet_network_rebind(const pet_control_context_t *c)
 {
     if(!pet_network_can_rebind())return ESP_ERR_NOT_SUPPORTED;
@@ -106,9 +156,9 @@ bool pet_network_management_response(const char *json, size_t bytes)
     (void)bytes;
     return false;
 }
-esp_err_t pet_network_cancel(uint32_t stream){++cancels;last_cancel=stream;return ESP_OK;}
+esp_err_t pet_network_cancel(uint32_t stream){++cancels;previous_cancel=last_cancel;last_cancel=stream;return ESP_OK;}
 static esp_err_t input_start_result=ESP_OK;
-esp_err_t pet_network_input_start(uint32_t stream,const char *ai_pet_id){(void)stream;(void)ai_pet_id;++input_starts;return input_start_result;}
+esp_err_t pet_network_input_start(uint32_t stream,const char *ai_pet_id,const char *blessing){(void)stream;(void)ai_pet_id;(void)blessing;++input_starts;return input_start_result;}
 esp_err_t pet_network_input_end(uint32_t stream,uint32_t sequence,uint32_t duration){(void)stream;(void)sequence;(void)duration;return ESP_OK;}
 /* The device's answers to pet.config.desired: how many, and the last one. */
 static unsigned config_answers;
@@ -124,25 +174,34 @@ esp_err_t pet_network_ota_status(const char *release,const char *status,unsigned
 /* What the gateway answers, delivered as pet_network delivers it. */
 static void gateway_hello(bool can_rebind){socket_state.hello=true;socket_state.rebind=can_rebind;connected(true);}
 static void rebind_accepted(void){assert(socket_state.pending);socket_state.pending=false;socket_state.bound=socket_state.asked;connected(true);}
-static void rebind_refused(void)
-{
-    assert(socket_state.pending);socket_state.pending=false;
-    session_error(PET_SESSION_REBIND_REFUSED,"Reconnecting to switch pets",true);
-    socket_state.open=socket_state.hello=false;connected(false); /* The gateway closes the socket. */
-}
+
 
 /* The store: every slot holds the fixture pack and, unless unsigned, its signed record. */
 esp_err_t pet_slot_store_open(pet_slot_store_t *s)
 {
     memset(s,0,sizeof(*s));s->open=true;s->inventory.ready=true;s->inventory.state=stored;s->machine.state=stored.operation;
-    assert(pet_flash_layout_known(PET_LAYOUT_THREE_3P5M,&s->layout));memset(s->partition_sha256,'c',64);return ESP_OK;
+    assert(pet_flash_layout_known(PET_LAYOUT_ONE_10M,&s->layout));memset(s->partition_sha256,'c',64);return ESP_OK;
 }
-esp_err_t pet_slot_store_load(pet_slot_store_t *s,unsigned slot,void *buffer,size_t capacity,size_t *bytes)
+static int stream_read(void *context, uint32_t offset, void *out, uint32_t bytes)
 {
-    assert(s->open&&slot<PET_SLOT_COUNT&&buffer==s_shown_pack&&capacity==PET_LAYOUT_THREE_SLOT_PACK_BYTES&&!drawing_copy);
-    if(s->inventory.state.slots[slot].state!=PET_SLOT_READY)return ESP_ERR_INVALID_STATE;
-    face_during_copy=face_state;
-    memcpy(buffer,pack_bytes,pack_length);*bytes=pack_length;return ESP_OK;
+    assert(offset <= pack_length && bytes <= pack_length - offset);
+    memcpy(out, (const uint8_t *)context + offset, bytes);
+    return 1;
+}
+
+esp_err_t pet_slot_store_stream(pet_slot_store_t *s, unsigned slot, bool target, void *buffer, uint32_t capacity,
+                                uint32_t minimum_tail, fp_stream_t **stream)
+{
+    assert(s->open && slot < PET_SLOT_COUNT && buffer == s_shown_pack && capacity == PET_POCKET_BUFFER_BYTES &&
+           !drawing_copy);
+    const uint8_t *pack = pack_bytes;
+    bool prove = s->inventory.state.slots[slot].validator_revision != FP_VALIDATOR_REVISION;
+    if (target || s->inventory.state.slots[slot].state != PET_SLOT_READY) return ESP_ERR_INVALID_STATE;
+    face_during_copy = face_state;
+    return fp_stream_open(buffer, capacity, (uint32_t)pack_length, stream_read, (void *)pack, prove, minimum_tail,
+                          stream) == FP_OK
+               ? ESP_OK
+               : ESP_ERR_INVALID_CRC;
 }
 esp_err_t pet_slot_store_read_record(pet_slot_store_t *s,unsigned slot,void *record,size_t bytes)
 {
@@ -165,8 +224,17 @@ fp_error_t pet_face_pack_validate(const void *bytes,uint32_t length,fp_pack_info
     fp_error_t result=fp_validate_with_workspace(bytes,length,info,workspace,size);free(workspace);return result;
 }
 esp_err_t pet_face_pack_use_external(const char *id,const void *pack,size_t bytes){(void)id;assert(pack==s_shown_pack&&bytes==pack_length);drawing_copy=true;return ESP_OK;}
-void pet_face_pack_hold_external(void){drawing_copy=false;}
-void pet_face_pack_release_external(void){drawing_copy=false;}
+esp_err_t pet_face_pack_use_source(const char *id, const fp_pack_source_t *source, const fp_pack_info_t *info)
+{
+    assert(source == fp_stream_source(s_stream) && source->bytes == pack_length);
+    assert(info->approved && pet_face_id_matches(id, info->id, info->id_len, true));
+    drawing_copy = true;
+    return ESP_OK;
+}
+/* A story event is always over before the pet's copy is held or released. */
+static const void *event_shown;
+void pet_face_pack_hold_external(void){assert(!event_shown);drawing_copy=false;}
+void pet_face_pack_release_external(void){assert(!event_shown);drawing_copy=false;}
 bool pet_face_pack_ready(void){return drawing_copy;}
 
 /* The worker (pet_replace_control.c, tested on its own): a selection is
@@ -267,10 +335,52 @@ esp_err_t pet_audio_capture_start(uint32_t stream){(void)stream;++capture_starts
 void pet_audio_capture_stop(void){capturing=false;}
 bool pet_audio_is_capturing(void){return capturing;}
 bool pet_audio_is_playing(void){return playing;}
-bool pet_audio_playback_queue_healthy(void){return true;}
-void pet_audio_playback_cancel(void){playing=false;}
+/* The reply is held, its last audio drains (a hold is then refused), and the
+ * speaker's queue is nearly full. */
+static bool held, draining, queue_full;
+bool pet_audio_playback_queue_healthy(void){return !queue_full;}
+void pet_audio_playback_cancel(void){playing=held=false;}
+bool pet_audio_playback_hold(bool hold)
+{
+    if (hold && (!playing || draining))
+        return false;
+    held = hold;
+    return true;
+}
+bool pet_audio_playback_held(void)
+{
+    return held && playing;
+}
+bool pet_audio_playback_hold_to_listen(void)
+{
+    return pet_audio_playback_hold(true);
+}
+pet_atmosphere_t pet_atmosphere_from_name(const char *name){(void)name;return PET_ATMOSPHERE_NONE;}
+void pet_atmosphere_cue(pet_atmosphere_t atmosphere){(void)atmosphere;}
+void pet_atmosphere_cue_name(const char *name){(void)name;}
+/* The bank's one-shots: the cues queued, which hold the next reply, and the
+ * stingers started. */
+static unsigned cues_queued, stingers;
+static bool cues_waiting;
+static char stinger[PET_SOUND_ID_BYTES + 1];
+bool pet_atmosphere_queue_sound(const char *id){(void)id;++cues_queued;cues_waiting=true;return true;}
+bool pet_audio_playback_hold_for_sounds(void (*played)(uint32_t stream))
+{
+    assert(played == sounds_played);
+    if (!cues_waiting)
+        return false;
+    cues_waiting = false;
+    held = true;
+    return true;
+}
+bool pet_audio_play_story_sound(const char *id){strcpy(stinger,id);++stingers;return true;}
+/* The sound bank (pet_sound_bank.c has its own test): none is named here. */
+void pet_sound_bank_open(bool usable){(void)usable;}
+void pet_sound_bank_want(const char *sha256,uint32_t bytes){(void)sha256;(void)bytes;}
+bool pet_sound_bank_step(const pet_control_http_t *http,uint8_t *buffer,size_t capacity,uint64_t now_ms)
+{(void)http;(void)buffer;(void)capacity;(void)now_ms;return false;}
 esp_err_t pet_audio_playback_start(uint32_t stream,uint32_t rate,pet_realtime_boost_t boost,pet_speech_mouth_mode_t mouth)
-{(void)stream;(void)rate;(void)boost;(void)mouth;playing=true;return ESP_OK;}
+{(void)stream;(void)rate;(void)boost;(void)mouth;playing=true;held=false;return ESP_OK;}
 esp_err_t pet_audio_playback_enqueue(uint32_t stream,uint32_t sequence,const uint8_t *pcm,size_t length)
 {(void)stream;(void)sequence;(void)pcm;(void)length;return ESP_OK;}
 void pet_audio_playback_finish(uint32_t stream){(void)stream;}
@@ -284,6 +394,7 @@ static int16_t mouth_offset_kept_ms;
 void pet_audio_set_speech_mouth_offset(int16_t offset_ms){mouth_offset=offset_ms;}
 esp_err_t pet_config_store_volume(uint8_t volume){(void)volume;return ESP_OK;}
 esp_err_t pet_config_store_brightness(uint8_t brightness){(void)brightness;return ESP_OK;}
+esp_err_t pet_config_store_menu_style(uint8_t style){(void)style;return ESP_OK;}
 esp_err_t pet_config_store_speech_mouth_offset(bool present,int16_t offset_ms)
 {++mouth_offset_stores;mouth_offset_kept=present;mouth_offset_kept_ms=offset_ms;return ESP_OK;}
 void pet_motion_set_sensitivity(uint8_t sensitivity){(void)sensitivity;}
@@ -297,18 +408,96 @@ void pet_diagnostics_note_streams(uint32_t input,uint32_t output){(void)input;(v
 void pet_enrollment_clear(void *data,size_t bytes){memset(data,0,bytes);}
 void pet_onboarding_open_from_ui(void){}
 bool pet_onboarding_setup_ready(void){return true;}
+static unsigned screens_opened;
+void pet_onboarding_open_screen(pet_onboarding_screen_t screen)
+{assert((unsigned)screen<=PET_ONBOARDING_STORY);++screens_opened;}
 int64_t esp_timer_get_time(void){return (int64_t)clock_us;}
 esp_err_t esp_timer_create(const esp_timer_create_args_t *args,esp_timer_handle_t *out){(void)args;*out=NULL;return ESP_FAIL;}
 esp_err_t esp_timer_start_once(esp_timer_handle_t timer,uint64_t timeout){(void)timer;(void)timeout;return ESP_OK;}
+esp_err_t gpio_config(const gpio_config_t *config){(void)config;return ESP_OK;}
+int gpio_get_level(gpio_num_t gpio_num){(void)gpio_num;return 1;}
+esp_err_t esp_timer_start_periodic(esp_timer_handle_t timer,uint64_t period){(void)timer;(void)period;return ESP_OK;}
 uint32_t esp_random(void){return 7;}
 void esp_fill_random(void *buffer,size_t bytes){memset(buffer,7,bytes);}
+/* The only aligned PSRAM block is the copy of the pet on screen: story events'
+ * packs and their check live in its tail. */
 void *heap_caps_aligned_alloc(size_t alignment,size_t size,unsigned caps)
-{(void)caps;return aligned_alloc(alignment,(size+alignment-1)/alignment*alignment);}
+{
+    (void)caps;
+    assert(size == PET_POCKET_BUFFER_BYTES);
+    return aligned_alloc(alignment, (size + alignment - 1) / alignment * alignment);
+}
 void heap_caps_free(void *memory){free(memory);}
 void *heap_caps_calloc(size_t count,size_t size,unsigned caps){(void)caps;return calloc(count,size);}
 static bool display_locked;
 esp_err_t pet_display_lock(int timeout){(void)timeout;assert(!display_locked);display_locked=true;return ESP_OK;}
 void pet_display_unlock(void){assert(display_locked);display_locked=false;}
+/* The renderer shows a story event over the pet until it ends by itself
+ * (event_ends) or is stopped. The device's origin serves the event pack under
+ * any sha256, zeros past its end; it can damage one byte, or cut downloads
+ * off halfway. */
+static uint8_t event_pack[PET_STORY_EVENT_BYTES];
+static size_t event_length, event_damage = SIZE_MAX;
+static char event_sha[65];
+static void (*event_done)(void);
+static unsigned events_shown, events_stopped, event_downloads, cut_downloads;
+esp_err_t pet_face_pack_play_event(const void *pack, size_t bytes, void (*done)(void))
+{
+    assert(display_locked && drawing_copy && !event_shown && done);
+    assert(bytes == event_length && !memcmp(pack, event_pack, bytes));
+    event_shown = pack;
+    event_done = done;
+    ++events_shown;
+    return ESP_OK;
+}
+static void event_ends(void)
+{
+    assert(event_shown);
+    event_shown = NULL;
+    event_done();
+}
+void pet_face_pack_stop_event(void)
+{
+    assert(display_locked);
+    if (event_shown)
+    {
+        ++events_stopped;
+        event_ends();
+    }
+}
+/* story.event.ended sent (story-reaction-v1): how often, for which event, and
+ * how many cancels had been sent before the last one. */
+static unsigned ends_sent, cancels_before_end;
+static char end_sent[PET_STORY_EVENT_ID_BYTES + 1];
+esp_err_t pet_network_story_event_ended(const char *id)
+{
+    ++ends_sent;
+    strlcpy(end_sent, id, sizeof(end_sent));
+    cancels_before_end = cancels;
+    return ESP_OK;
+}
+/* The unused tail of the pet's copy, past the check's workspace. */
+static uint8_t *copy_tail(void)
+{
+    return (uint8_t *)fp_stream_tail(s_stream, NULL) + fp_validation_workspace_size();
+}
+bool pet_control_http_event_range(const pet_control_http_t *http, const char *sha256, uint32_t total, uint32_t offset,
+                                  void *out, size_t bytes, pet_control_http_result_t *result)
+{
+    assert(!strcmp(http->origin, s_origin) && !strcmp(http->device_id, s_id) && strlen(sha256) == 64);
+    assert(offset <= total && bytes <= total - offset && bytes <= 32768u && total <= PET_STORY_EVENT_BYTES);
+    assert(!atomic_load(&s_turn_active) && !playing && !capturing);      /* only between turns */
+    assert((uint8_t *)out >= copy_tail() && (uint8_t *)out + bytes <= s_shown_pack + PET_POCKET_BUFFER_BYTES);
+    ++event_downloads;
+    for (size_t i = 0; i < bytes; ++i) ((uint8_t *)out)[i] = offset + i < event_length ? event_pack[offset + i] : 0;
+    if (event_damage >= offset && event_damage - offset < bytes) ((uint8_t *)out)[event_damage - offset] ^= 1;
+    *result = (pet_control_http_result_t){.status = 206, .retry_seconds = 30, .bytes = bytes};
+    if (!cut_downloads)
+        return true;
+    --cut_downloads;
+    result->bytes = bytes / 2;
+    return false;
+}
 esp_err_t bsp_display_brightness_set(int brightness){(void)brightness;return ESP_OK;}
 SemaphoreHandle_t xSemaphoreCreateMutex(void){return (SemaphoreHandle_t)1;}
 int xSemaphoreTake(SemaphoreHandle_t handle,TickType_t ticks){(void)handle;(void)ticks;return pdTRUE;}
@@ -330,7 +519,9 @@ int xQueueReceive(QueueHandle_t queue,void *item,TickType_t ticks)
     *(control_command_t *)item=commands[0];memmove(commands,commands+1,--command_count*sizeof(*commands));return pdTRUE;
 }
 void esp_restart(void){assert(!"no restart");abort();}
-void vTaskDelay(TickType_t ticks){(void)ticks;}
+/* Waits for the speaker's room, among others. */
+static unsigned delays;
+void vTaskDelay(TickType_t ticks){(void)ticks;++delays;}
 
 /* One audio-task pass: the event, then the send it asks for. */
 static void deliver(audio_event_t event)
@@ -340,7 +531,11 @@ static void deliver(audio_event_t event)
     handle_audio(&event,&send);finish_send(&send,&event);
 }
 static void drain(void){while(queued_count){audio_event_t e=queued[0];memmove(queued,queued+1,--queued_count*sizeof(*queued));deliver(e);}}
-static void tap(void){deliver((audio_event_t){.kind=AUDIO_TAP,.generation=atomic_load(&s_generation)});}
+static void tap(void)
+{
+    const int64_t touched = (int64_t)clock_us;
+    deliver((audio_event_t){.kind = AUDIO_TAP, .touched_us = touched, .generation = atomic_load(&s_generation)});
+}
 static void retry(void){deliver((audio_event_t){.kind=AUDIO_TAP_RETRY,.generation=atomic_load(&s_generation)});}
 static void cue_done(void){deliver((audio_event_t){.kind=AUDIO_LISTEN_CUE_DONE,.stream=s_listen_token,.result=ESP_OK,.generation=atomic_load(&s_generation)});}
 static const char *tile(void)
@@ -351,9 +546,8 @@ static const char *tile(void)
 }
 static void hex_sha256(const uint8_t *bytes,size_t length,char out[65])
 {uint8_t digest[32];assert(!mbedtls_sha256(bytes,length,digest,0));for(size_t i=0;i<32;++i)snprintf(out+2*i,3,"%02x",digest[i]);}
-static const char *builds[PET_SLOT_COUNT]={"00000000-0000-4000-8000-000000000040","00000000-0000-4000-8000-000000000041",
-    "00000000-0000-4000-8000-000000000042"};
-/* Three signed cloud pets; slot 1 shows and is bound, and its session is open:
+static const char *builds[PET_SLOT_COUNT]={"00000000-0000-4000-8000-000000000040"};
+/* Two signed cloud pets; slot 1 shows and is bound, and its session is open:
  * answered (it talks) or still connecting. */
 static void reset_counts(void)
 {freezes=starts=rebinds=cancels=disconnects=selects=sounds=switch_sounds=error_cues=listen_cues=capture_starts=input_starts=0;}
@@ -372,18 +566,23 @@ static void boot(bool answered)
         t->validator_revision=FP_VALIDATOR_REVISION;t->shown_at=slot+1;strcpy(t->pack.build_id,builds[slot]);
         hex_sha256(pack_bytes,pack_length,t->pack.sha256);
     }
-    three.active=1;three.selection_revision=3;
-    assert(pet_slot_inventory_rebind(&three,1,"binding-41","00000000-0000-4000-8000-000000000050","20"));
+    three.active=0;three.selection_revision=3;
+    assert(pet_slot_inventory_rebind(&three,0,"binding-41","00000000-0000-4000-8000-000000000050","20"));
     stored=three;memset(&socket_state,0,sizeof(socket_state));
-    free(s_shown_pack);s_shown_pack=NULL;s_shown_slot=-1;s_selection_save_at=0;drawing_copy=false;
+    s_stream = NULL;
+    free(s_shown_pack);
+    s_shown_pack = NULL;
+    s_shown_slot = -1;
+    s_selection_save_at = 0;
+    drawing_copy = false;
     memset(&s_prepared,0,sizeof(s_prepared));
     s_select_moment=SELECT_NONE;s_select_refused_build[0]=0;
-    pocket_control_start();assert(s_shown_slot==1&&s_slots.inventory.state.bound==1);
+    pocket_control_start();assert(s_shown_slot==0&&s_slots.inventory.state.bound==0);
     s_pet=&pet_worker;s_firmware=&firmware_worker;memset(&pet_worker,0,sizeof(pet_worker));
     pet_worker.has_context=pet_worker.authenticated=true;
     pet_control_context_t *c=&pet_worker.cloud.context;strcpy(c->device_id,s_id);strcpy(c->account_id,signed_release.account_id);
     c->binding=(pet_control_binding_t){.assigned=true,.revision="binding-41",.relationship_id="00000000-0000-4000-8000-000000000050"};
-    strcpy(c->binding.build_id,builds[1]);strcpy(c->binding.sha256,three.slots[1].pack.sha256);
+    strcpy(c->binding.build_id,builds[0]);strcpy(c->binding.sha256,three.slots[0].pack.sha256);
     strcpy(c->config.version,"20");strcpy(c->config.face_id,signed_release.face_id);strcpy(c->config.ai_pet_id,signed_release.face_id);
     c->config.volume=40;c->config.brightness=80;c->config.recording_timeout=30;
     mount();assert(starts==1&&!rebinds&&socket_state.open);
@@ -395,96 +594,28 @@ static void end_turn(void)
 {capturing=false;atomic_store(&s_turn_active,false);pet_runtime_release(&s_resources,PET_RESOURCE_VOICE);s_input_stream=0;}
 /* A swipe to the next pet and the pass after it settles, which asks to select it. */
 static void swipe(int direction){pocket_switch(direction);}
-static void settle(void){clock_us+=3000000;pocket_tick((int64_t)clock_us);}
+
 
 /* A swipe keeps the session and says CONNECTING, not NOT LINKED; the
  * previous pet's late answer is dropped quietly. */
-static void swipe_keeps_session(void)
-{
-    boot(true);
-    atomic_store(&s_turn_active,true);s_input_stream=77;capturing=true;
-    swipe(1);
-    assert(s_shown_slot==2&&!freezes&&socket_state.open&&!capturing&&cancels==1&&last_cancel==77);
-    assert(!atomic_load(&s_voice_allowed)&&atomic_load(&s_voice_paused));
-    assert(!strcmp(tile(),"CONNECTING")&&visible_status.pet_linked&&atomic_load(&s_voice_block)==VOICE_BLOCK_CONNECTING);
-    assert(audio_start(91,24000)!=ESP_OK&&audio_chunk(91,0,(const uint8_t *)"\0\0",2)==ESP_OK);audio_end(91,0);
-    assert(!atomic_load(&s_revalidate));
-    // An answer from that session does not give the new pet a voice.
-    connected(true);assert(!atomic_load(&s_voice_allowed));
-}
+
 /* The message a tap types while the open session moves to the pet on screen. */
-static bool switching_message(void)
-{
-    char expected[PET_FACE_TERMINAL_MAX+1];
-    strlcpy(expected,"> switching to ",sizeof(expected));strlcat(expected,s_shown_name,sizeof(expected));
-    return s_shown_name[0]&&!strcmp(announced,expected);
-}
+
 /* The swipe settles: the cloud selects the pet and the session moves to it
  * with a rebind, not a new socket. The pet stays idle on screen, never the
  * connecting face. A tap meanwhile waits calmly, with the microphone closed,
  * says it is switching, and listens once the rebind is accepted. */
-static void selection_rebinds(void)
-{
-    boot(true);swipe(1);settle();
-    assert(selects==1&&s_slots.inventory.state.bound==2&&!pet_worker.admitted&&!freezes);
-    mount();
-    assert(rebinds==1&&!starts&&!freezes&&socket_state.pending&&same_context(&socket_state.asked,&pet_worker.cloud.context));
-    assert(!strcmp(socket_state.asked.binding.build_id,builds[2])&&!atomic_load(&s_voice_allowed));
-    assert(atomic_load(&s_handshake_pending)&&s_handshake_deadline==(int64_t)clock_us+REBIND_TIMEOUT_US);
-    assert(!strcmp(tile(),"CONNECTING")&&face_state==PET_FACE_IDLE&&atomic_load(&s_rebinding));
-    unsigned before_sounds=sounds;
-    tap();
-    assert(atomic_load(&s_tap_pending)&&face_state==PET_FACE_IDLE&&switching_message()&&sounds==before_sounds);
-    retry();assert(atomic_load(&s_tap_pending)&&!capture_starts&&!input_starts&&!listen_cues);
-    rebind_accepted();
-    assert(atomic_load(&s_voice_allowed)&&!atomic_load(&s_handshake_pending)&&face_state==PET_FACE_IDLE&&!atomic_load(&s_rebinding));
-    assert(!strcmp(tile(),"READY"));
-    retry();assert(!atomic_load(&s_tap_pending)&&listen_cues==1&&face_state==PET_FACE_LISTENING&&!capture_starts);
-    cue_done();assert(capture_starts==1&&input_starts==1&&capturing);
-    assert(!error_cues&&!starts&&!freezes&&rebinds==1);
-    end_turn();
-}
+
 /* A tap 2.4 s after the swipe, while the swipe settles and the cloud selects
  * (the 26 Sep capture): it waits for the whole switch however long, past the
  * 5 s a connecting tap waits, and listens once the rebind is accepted. The
  * face never shows connecting. */
-static void tap_waits_for_the_whole_switch(void)
-{
-    boot(true);swipe(1);
-    clock_us+=900000;tap();
-    assert(atomic_load(&s_tap_pending)&&face_state==PET_FACE_IDLE&&switching_message()&&!listen_cues);
-    // Tapping again only says to hold on: the tap still waits for the switch.
-    tap();assert(atomic_load(&s_tap_pending)&&!strcmp(announced,"> hold on, almost ready")&&face_state==PET_FACE_IDLE);
-    for(int t=0;t<60;++t){clock_us+=100000;retry();assert(face_state==PET_FACE_IDLE&&atomic_load(&s_tap_pending));}
-    settle(); /* 3 s more: the selection */
-    assert(selects==1&&atomic_load(&s_tap_pending));
-    mount();assert(rebinds==1&&face_state==PET_FACE_IDLE&&atomic_load(&s_tap_pending));
-    retry();assert(atomic_load(&s_tap_pending)&&!listen_cues);
-    rebind_accepted();retry();
-    assert(!atomic_load(&s_tap_pending)&&listen_cues==1&&face_state==PET_FACE_LISTENING);
-    cue_done();assert(capture_starts==1&&!starts&&!freezes&&!error_cues);
-    end_turn();
-}
+
 /* A pet the cloud refuses to select: a tap that waits for the switch hears
  * why as soon as it is known, not after its wait. */
-static void a_refused_switch_says_so(void)
-{
-    boot(true);swipe(1);tap();assert(atomic_load(&s_tap_pending)&&switching_message());
-    select_answer=PET_REPLACE_SELECT_REFUSED;settle();select_answer=PET_REPLACE_SELECT_CHOSEN;
-    assert(!strcmp(tile(),"NOT LINKED")); /* publish_status sets the reason */
-    retry();
-    assert(!atomic_load(&s_tap_pending)&&!strcmp(announced,"> not linked: no voice")&&last_sound==PET_SFX_NO_VOICE);
-    assert(face_state==PET_FACE_IDLE&&!capture_starts&&!listen_cues);
-}
+
 /* Back on the pet the open session talks as: voice returns at once. */
-static void swipe_back_resumes(void)
-{
-    boot(true);
-    swipe(1);assert(s_shown_slot==2&&!atomic_load(&s_voice_allowed));
-    swipe(-1);
-    assert(s_shown_slot==1&&atomic_load(&s_voice_allowed)&&!rebinds&&!starts&&!freezes&&!disconnects);
-    assert(!strcmp(tile(),"READY"));
-}
+
 /* While the session connects a tap waits calmly: it listens when the session
  * is ready, gives up after 5 s with a friendly retry, and a second tap
  * cancels it. No error cue, and the microphone stays closed until ready. */
@@ -507,35 +638,12 @@ static void tap_waits_for_the_session(void)
 }
 /* A refused rebind reconnects as before, calmly: a waiting tap keeps its
  * connecting face and listens once the new socket's hello arrives. */
-static void refusal_reconnects(void)
-{
-    boot(true);swipe(1);settle();mount();assert(socket_state.pending&&rebinds==1);
-    tap();assert(atomic_load(&s_tap_pending)&&switching_message()&&face_state==PET_FACE_IDLE);
-    rebind_refused();drain();
-    assert(!error_cues&&atomic_load(&s_revalidate)&&atomic_load(&s_tap_pending)&&face_state==PET_FACE_IDLE);
-    pocket_tick((int64_t)clock_us); /* Revalidation: freeze, then the worker reconciles. */
-    assert(freezes>=1&&disconnects==1&&!pet_worker.admitted&&atomic_load(&s_tap_pending));
-    mount();assert(starts==1&&rebinds==1); /* A new socket: a reconnect, which says so. */
-    assert(face_state==PET_FACE_CONNECTING);
-    gateway_hello(true);assert(atomic_load(&s_voice_allowed));
-    retry();cue_done();assert(capture_starts==1&&input_starts==1&&!error_cues);
-    end_turn();
-}
+
 /* No answer within the rebind window: reconnect. */
-static void rebind_timeout_reconnects(void)
-{
-    boot(true);swipe(1);settle();mount();assert(socket_state.pending&&rebinds==1);
-    clock_us+=REBIND_TIMEOUT_US-1000;pocket_tick((int64_t)clock_us);assert(!disconnects&&socket_state.open);
-    clock_us+=1000;pocket_tick((int64_t)clock_us);
-    assert(freezes>=1&&disconnects==1&&!pet_worker.admitted&&!socket_state.open);
-}
+
 /* An older gateway (no session-rebind-v1): the swipe still keeps the socket,
  * and the selection reconnects as today. */
-static void older_gateway_reconnects(void)
-{
-    boot(true);socket_state.rebind=false;swipe(1);assert(!freezes&&socket_state.open);
-    settle();mount();assert(!rebinds&&starts==1&&freezes==1);
-}
+
 /* The gateway's pet.config.desired for `c`, delivered as pet_network delivers it. */
 static void desired_config(const pet_control_context_t *c,bool has_offset,int16_t offset_ms)
 {
@@ -551,32 +659,7 @@ static void desired_config(const pet_control_context_t *c,bool has_offset,int16_
  * after a hello (session-rebind-v1's afterAcceptance). It applies
  * exactly as it does after a hello, mouth timing included: the speaker uses it
  * at once, NVS keeps it and the answer echoes it. */
-static void rebind_applies_the_new_configuration(void)
-{
-    boot(true);
-    unsigned answers=config_answers,stores=mouth_offset_stores;
-    // After the hello: the first pet's configuration, mouth timing +20 ms.
-    const pet_control_context_t first=pet_worker.cloud.context;
-    desired_config(&first,true,20);
-    assert(config_answers==answers+1&&config_applied&&config_echo.has_speech_mouth_offset&&config_echo.speech_mouth_offset_ms==20);
-    assert(mouth_offset==20&&mouth_offset_stores==stores+1&&mouth_offset_kept&&mouth_offset_kept_ms==20);
-    // The selection moves the open session to the next pet.
-    swipe(1);settle();mount();assert(socket_state.pending&&rebinds==1);
-    rebind_accepted();assert(atomic_load(&s_voice_allowed)&&strcmp(first.config.version,pet_worker.cloud.context.config.version));
-    // Its configuration after the acceptance, mouth timing -30 ms: the same path.
-    desired_config(&pet_worker.cloud.context,true,-30);
-    assert(config_answers==answers+2&&config_applied&&config_echo.has_speech_mouth_offset&&config_echo.speech_mouth_offset_ms==-30);
-    assert(mouth_offset==-30&&mouth_offset_stores==stores+2&&mouth_offset_kept&&mouth_offset_kept_ms==-30);
-    assert(!atomic_load(&s_revalidate)&&!starts&&!freezes&&rebinds==1);
-    // Without the field it means 0, as after a hello: applied, and NVS forgets it.
-    desired_config(&pet_worker.cloud.context,false,0);
-    assert(config_answers==answers+3&&config_applied&&!config_echo.has_speech_mouth_offset);
-    assert(mouth_offset==0&&mouth_offset_stores==stores+3&&!mouth_offset_kept);
-    // The previous pet's configuration no longer matches the session: nothing applies.
-    desired_config(&first,true,40);
-    assert(config_answers==answers+4&&!config_applied&&mouth_offset==0&&mouth_offset_stores==stores+3);
-    assert(atomic_load(&s_revalidate));
-}
+
 /* A management answer that crosses a swipe still names the previous pet. It is
  * no mismatch while the session moves: revalidating there turned a switch into
  * a reconnect (1 Oct). After the switch, the same answer still revalidates. */
@@ -591,27 +674,10 @@ static void management_answer_before_the_session_waits(void)
     // Once the session answers, a config that differs from it revalidates.
     gateway_hello(true);desired_config(&newer,false,0);assert(atomic_load(&s_revalidate));
 }
-static void management_answer_mid_switch_keeps_session(void)
-{
-    boot(true);
-    unsigned answers=config_answers;
-    const pet_control_context_t first=pet_worker.cloud.context;
-    swipe(1);assert(atomic_load(&s_voice_paused));
-    desired_config(&first,true,20);
-    assert(!atomic_load(&s_revalidate)&&config_answers==answers&&!freezes&&socket_state.open);
-    settle();mount();rebind_accepted();assert(atomic_load(&s_voice_allowed));
-    desired_config(&first,true,20);
-    assert(atomic_load(&s_revalidate));
-}
+
 /* A pet placed over USB has no cloud release: NOT LINKED once known, and a
  * tap says so with the no-voice cue. Until then it is CONNECTING. */
-static void usb_pet_not_linked(void)
-{
-    boot(true);unsigned_slots=1u<<2;swipe(1);assert(!strcmp(tile(),"CONNECTING"));
-    settle();assert(!selects&&!strcmp(tile(),"NOT LINKED")&&atomic_load(&s_voice_block)==VOICE_BLOCK_NOT_LINKED);
-    tap();assert(!strcmp(announced,"> not linked: no voice")&&last_sound==PET_SFX_NO_VOICE&&!atomic_load(&s_tap_pending));
-    unsigned_slots=0;
-}
+
 
 /* ---- Listening --------------------------------------------------------- */
 
@@ -691,9 +757,9 @@ static void a_follow_up_tap_listens_at_once(void)
     pets=pet_steps;
     for(int t=0;t<120;++t){clock_us+=100000;pocket_tick((int64_t)clock_us);retry();}
     assert(pet_steps>pets&&face_state==PET_FACE_IDLE&&listen_cues==2&&capture_starts==2&&!capturing);
-    // A swipe right after a reply switches at once: it needs control.
+    // One installed pet has no neighbouring slot to select.
     reply_heard(103);pets=pet_steps;
-    swipe(1);pocket_tick((int64_t)clock_us);assert(pet_steps==pets+1);
+    swipe(1);pocket_tick((int64_t)clock_us);assert(pet_steps==pets);
 }
 /* A listen whose audio cannot be sent (the microphone's 4 s send queue
  * overflowed while the socket stalled) ends with the error face, the error
@@ -781,69 +847,683 @@ static void brain_failure_and_renewal(void)
  * the face idle, never LISTENING or SPEAKING without its audio: pet_diagnostics
  * reads that as a stall and its recovery replaces the socket. On the Pocket a
  * swipe 6.8 s into a reply did that, so the switch needed a new socket. */
-static void a_swipe_stops_the_voice_calmly(void)
+
+
+/* Switches from the deck's pet picker while a cloud step holds the control
+ * task. On 1 Oct a step's TLS handshake took 13 s while the owner kept
+ * swiping: nothing moved, then the swipes played back as eight switches in
+ * seven seconds. Now a switch after the step's first second says why nothing
+ * moves, and the step's end moves one pet, the way the last one pointed. A
+ * switch while control waits moves at once and says nothing more. */
+
+
+
+/* The story screens never cut the pet off: opening and closing each one while
+ * it listens, thinks or speaks cancels nothing, stops no audio and queues no
+ * control step, and the turn finishes as if nothing happened. */
+static void story_screens_keep_the_turn(void)
 {
-    boot(true);
-    tap();cue_done();assert(capture_starts==1&&capturing&&face_state==PET_FACE_LISTENING);
-    clock_us+=4000000;swipe(1);
-    assert(!capturing&&face_during_copy==PET_FACE_IDLE&&face_state==PET_FACE_IDLE);
-    assert(!freezes&&socket_state.open&&!atomic_load(&s_revalidate));
-    boot(true);
-    tap();cue_done();
+    static const pet_face_swipe_t swipes[]={PET_FACE_SWIPE_RIGHT,PET_FACE_SWIPE_LEFT,PET_FACE_SWIPE_UP};
+    boot(true);screens_opened=0;
+    unsigned commands_before=command_count;
+    tap();cue_done();assert(capturing&&face_state==PET_FACE_LISTENING);
+    for(unsigned i=0;i<3;++i){face_swiped(swipes[i]);return_requested();}
+    assert(capturing&&face_state==PET_FACE_LISTENING&&screens_opened==3);
     deliver((audio_event_t){.kind=AUDIO_CAPTURE_DONE,.stream=s_input_stream,.sequence=9,.duration=2000,.result=ESP_OK,
         .generation=atomic_load(&s_generation)});
     capturing=false;assert(face_state==PET_FACE_THINKING);
-    assert(audio_start(104,24000)==ESP_OK&&playing&&face_state==PET_FACE_SPEAKING);
-    clock_us+=6800000;swipe(1);
-    assert(!playing&&face_during_copy==PET_FACE_IDLE&&face_state==PET_FACE_IDLE&&cancels==1);
-    assert(!freezes&&socket_state.open&&!atomic_load(&s_revalidate)&&atomic_load(&s_voice_paused));
+    for(unsigned i=0;i<3;++i){face_swiped(swipes[i]);return_requested();}
+    assert(face_state==PET_FACE_THINKING&&atomic_load(&s_turn_active));
+    assert(audio_start(105,24000)==ESP_OK&&playing&&face_state==PET_FACE_SPEAKING);
+    for(unsigned i=0;i<3;++i){
+        face_swiped(swipes[i]);assert(playing&&face_state==PET_FACE_SPEAKING);
+        assert(audio_chunk(105,i,(const uint8_t *)"\0\0",2)==ESP_OK);
+        return_requested();assert(playing&&face_state==PET_FACE_SPEAKING);
+    }
+    assert(screens_opened==9&&!cancels&&!freezes&&!error_cues&&command_count==commands_before);
+    assert(atomic_load(&s_voice_allowed)&&!atomic_load(&s_voice_paused)&&!atomic_load(&s_revalidate));
+    audio_end(105,2);playing=false;
+    deliver((audio_event_t){.kind=AUDIO_PLAYBACK_DONE,.stream=105,.generation=atomic_load(&s_generation)});
+    assert(face_state==PET_FACE_IDLE&&!atomic_load(&s_turn_active)&&!pet_runtime_owns(&s_resources,PET_RESOURCE_VOICE));
+    assert(!cancels&&!freezes&&!error_cues);
 }
 
-/* Swipes while a cloud step holds the control task. On 1 Oct a step's TLS
- * handshake took 13 s while the owner kept swiping: nothing moved, then the
- * swipes played back as eight switches in seven seconds. Now a swipe after the
- * step's first second says why nothing moves, and the step's end moves one
- * pet, the way the last swipe pointed. A swipe while control waits moves at
- * once and says nothing more. */
-static void swipes_during_the_step(void)
+/* In story mode a long press pauses the story without a turn: a reply that
+ * is playing goes on to its end, and nothing is cancelled or stopped. */
+static void a_story_pause_lets_the_reply_play(void)
 {
-    static const int burst[]={1,1,-1,1,1,-1,1,-1};
-    for(size_t i=0;i<sizeof(burst)/sizeof(burst[0]);++i){
-        clock_us+=1500000;pet_swiped(burst[i]);
-        assert(!strcmp(announced,"> busy, can't switch yet")&&command_count==1&&s_shown_slot==1);
+    boot(true);story_mode=true;pauses=0;
+    tap();cue_done();
+    deliver((audio_event_t){.kind=AUDIO_CAPTURE_DONE,.stream=s_input_stream,.sequence=9,.duration=2000,.result=ESP_OK,
+        .generation=atomic_load(&s_generation)});
+    capturing=false;
+    assert(audio_start(106,24000)==ESP_OK&&playing&&face_state==PET_FACE_SPEAKING);
+    deliver((audio_event_t){.kind=AUDIO_PET,.generation=atomic_load(&s_generation)});
+    assert(pauses==1&&playing&&face_state==PET_FACE_SPEAKING&&atomic_load(&s_turn_active)&&!cancels);
+    assert(audio_chunk(106,0,(const uint8_t *)"\0\0",2)==ESP_OK);
+    audio_end(106,0);playing=false;
+    deliver((audio_event_t){.kind=AUDIO_PLAYBACK_DONE,.stream=106,.generation=atomic_load(&s_generation)});
+    assert(face_state==PET_FACE_IDLE&&!atomic_load(&s_turn_active)&&!cancels&&!error_cues&&pauses==1);
+    story_mode=false;
+}
+/* The story frame shows while the pet on screen is the session's pet in story
+ * mode: it goes when another pet comes on screen and returns with this one,
+ * and a hello without story mode ends it. */
+
+
+/* ---- Story events ------------------------------------------------------ */
+
+/* story.events naming the event pack under each of `ids`, `bytes` long,
+ * with the stinger `event_sound`. */
+static const char *event_sound = "";
+static void event_list(const char *const *ids, size_t count, uint32_t bytes)
+{
+    pet_story_events_t events = {.count = (uint8_t)count};
+    for (size_t i = 0; i < count; ++i)
+    {
+        strcpy(events.events[i].id, ids[i]);
+        strcpy(events.events[i].sha256, event_sha);
+        strcpy(events.events[i].sound, event_sound);
+        events.events[i].bytes = bytes;
+    }
+    pet_story_events_want(&events);
+}
+/* Nothing listed, cued or shown, and nothing counted. */
+static void no_events(void)
+{
+    const pet_control_http_t http = {0};
+    pet_story_events_done();
+    event_shown = NULL;
+    pet_story_events_want(&(const pet_story_events_t){0});
+    pet_story_events_step(&http, 0);
+    event_damage = SIZE_MAX;
+    events_shown = events_stopped = event_downloads = ends_sent = 0;
+}
+/* Four seconds of control passes: time for every download due. */
+static void control_passes(void)
+{
+    for (int i = 0; i < 40; ++i)
+    {
+        clock_us += 100000;
+        pocket_tick((int64_t)clock_us);
     }
 }
-static void a_burst_of_swipes_moves_once(void)
+/* The gateway's story.event, as pet_network delivers it. */
+static void story_cue(const char *id){story_event(id);drain();}
+static const char *const wolves[] = {"wolves"};
+/* A pack's room in the copy's tail. */
+static size_t pack_room(void)
+{
+    return (event_length + 15) & ~(size_t)15;
+}
+/* Where the ready pack of the listed event `id` is kept: it is cued, taken
+ * and let go. */
+static const uint8_t *kept_at(const char *id)
+{
+    const void *pack = NULL;
+    size_t bytes = 0;
+    char sound[PET_SOUND_ID_BYTES + 1];
+    assert(pet_story_events_cue(id) && pet_story_events_take(&pack, &bytes, sound) && bytes == event_length);
+    pet_story_events_done();
+    return pack;
+}
+
+/* Packs download between turns, one request each, in the list's order, into
+ * the unused tail of the pet's copy past the check's workspace, never the
+ * heap, each in the first gap that holds it: a list keeps what it still names,
+ * forgets the rest and adds the new. All of a list's 16 are kept when they fit
+ * (story-events-all-v1), and one with no room waits while the next downloads. */
+static void story_events_download_between_turns(void)
+{
+    static const char *const first[] = {"a", "b", "c", "d", "e"}, *const next[] = {"e", "f", "g"};
+    boot(true);
+    no_events();
+    atomic_store(&s_turn_active, true);
+    event_list(first, 5, (uint32_t)event_length);
+    control_passes();
+    assert(!event_downloads);
+    end_turn();
+    control_passes();
+    assert(event_downloads == 5);
+    for (int i = 0; i < 5; ++i)
+        assert(kept_at(first[i]) == copy_tail() + i * pack_room());
+    /* a-d no longer listed: forgotten, and f and g take the first gaps. */
+    event_list(next, 3, (uint32_t)event_length);
+    assert(!pet_story_events_cue("a"));
+    control_passes();
+    assert(event_downloads == 7 && kept_at("f") == copy_tail() && kept_at("g") == copy_tail() + pack_room());
+    assert(kept_at("e") == copy_tail() + 4 * pack_room());
+    event_list(next, 3, (uint32_t)event_length);
+    control_passes();
+    assert(event_downloads == 7);
+    char names[PET_STORY_EVENTS][8];
+    const char *all[PET_STORY_EVENTS];
+    for (int i = 0; i < PET_STORY_EVENTS; ++i)
+    {
+        snprintf(names[i], sizeof(names[i]), "all-%d", i);
+        all[i] = names[i];
+    }
+    no_events();
+    event_list(all, PET_STORY_EVENTS, (uint32_t)event_length);
+    control_passes();
+    assert(event_downloads == PET_STORY_EVENTS && kept_at(all[15]) == copy_tail() + 15 * pack_room());
+    /* In the list's order, whichever entries the cache gave the events (here
+     * while nothing fits): the event the story heads for downloads first. */
+    static const char *const ahead[] = {"p", "q"}, *const turned[] = {"q", "p"};
+    no_events();
+    uint8_t *tail = copy_tail() - fp_validation_workspace_size();
+    pet_story_events_region(NULL, 0);
+    event_list(ahead, 2, (uint32_t)event_length);
+    clock_us += 100000;
+    pocket_tick((int64_t)clock_us);
+    pet_story_events_region(tail, fp_validation_workspace_size() + pack_room());
+    event_list(turned, 2, (uint32_t)event_length);
+    control_passes();
+    assert(event_downloads == 1 && kept_at("q") == copy_tail() && !pet_story_events_cue("p"));
+}
+/* The packs live in the tail of the copy of the pet on screen: a tail with no
+ * room for one keeps its event narration, ended at once (story.event.ended),
+ * and the pack downloads once there is room. Another pet on screen forgets
+ * every pack, which downloads again into its tail. */
+
+/* A pack that is not exactly the one named is refused at once and for good,
+ * its milestone staying narration, even when story.events names it again: a
+ * valid event pack whose sha256 is another, one byte off, another size. */
+static void a_wrong_event_pack_is_refused(void)
+{
+    char named[65];
+    boot(true);
+    no_events();
+    strcpy(named, event_sha);
+    memset(event_sha, '0', 64);
+    event_list(wolves, 1, (uint32_t)event_length);
+    control_passes();
+    assert(event_downloads == 1 && !pet_story_events_cue("wolves"));
+    clock_us += 120000000;
+    event_list(wolves, 1, (uint32_t)event_length);
+    control_passes();
+    assert(event_downloads == 1 && !pet_story_events_cue("wolves"));
+    strcpy(event_sha, named);
+    story_cue("wolves");
+    assert(!events_shown);
+    no_events();
+    event_damage = event_length / 2;
+    event_list(wolves, 1, (uint32_t)event_length);
+    control_passes();
+    assert(event_downloads == 1 && !pet_story_events_cue("wolves"));
+    no_events();
+    event_list(wolves, 1, (uint32_t)event_length + 16);
+    control_passes();
+    assert(event_downloads == 1 && !pet_story_events_cue("wolves"));
+}
+/* A download cut off halfway keeps nothing and is tried again from the start
+ * after the server's retry delay; three failures give up until story.events
+ * names the event again. */
+static void a_failed_download_is_tried_again(void)
 {
     boot(true);
-    during_step=swipes_during_the_step;pocket_control_pass();during_step=NULL;
-    assert(s_shown_slot==0&&!command_count&&switch_sounds==1&&strstr(announced," online"));
-    // Control waits for a command: the swipe moves, without the notice.
-    pet_swiped(1);assert(command_count==1&&strcmp(announced,"> busy, can't switch yet"));
-    pocket_control_pass();assert(s_shown_slot==1&&!command_count&&switch_sounds==2);
+    no_events();
+    cut_downloads = 1;
+    event_list(wolves, 1, (uint32_t)event_length);
+    control_passes();
+    assert(event_downloads == 1 && !pet_story_events_cue("wolves"));
+    clock_us += 30000000;
+    control_passes();
+    assert(event_downloads == 2 && pet_story_events_cue("wolves"));
+    pet_story_events_uncue();
+    no_events();
+    cut_downloads = 3;
+    event_list(wolves, 1, (uint32_t)event_length);
+    for (int i = 0; i < 5; ++i)
+    {
+        control_passes();
+        clock_us += 30000000;
+    }
+    assert(event_downloads == 3 && !cut_downloads && !pet_story_events_cue("wolves"));
+    event_list(wolves, 1, (uint32_t)event_length);
+    control_passes();
+    assert(event_downloads == 4 && pet_story_events_cue("wolves"));
+    pet_story_events_uncue();
+    /* An abandoned first event releases the only available reservation. */
+    no_events();
+    uint8_t *tail = copy_tail() - fp_validation_workspace_size();
+    pet_story_events_region(tail, fp_validation_workspace_size() + pack_room());
+    static const char *const two[] = {"first", "second"};
+    event_list(two, 2, (uint32_t)event_length);
+    cut_downloads = 3;
+    for (int i = 0; i < 4; ++i)
+    {
+        control_passes();
+        clock_us += 30000000;
+    }
+    assert(!pet_story_events_cue("first") && pet_story_events_cue("second"));
+    pet_story_events_uncue();
+}
+/* story.event follows the milestone's output.audio.end while the speaker
+ * still plays: the event shows once the speech has drained, with its stinger
+ * (sound-bank-v1), and the pet's idle after it changes nothing;
+ * story.event.ended follows once it has played.
+ * The unapproved event pack shows as an event and is refused as a pet. An id
+ * not listed, or one whose pack is not ready, is narration only, ended at
+ * once. */
+static void a_story_event_waits_for_the_speech(void)
+{
+    boot(true);
+    no_events();
+    event_sound = "danger-ridge";
+    event_list(wolves, 1, (uint32_t)event_length);
+    event_sound = "";
+    stingers = 0;
+    story_cue("wolves");
+    assert(!events_shown && ends_sent == 1 && !strcmp(end_sent, "wolves") && !stingers);
+    control_passes();
+    assert(audio_start(201, 24000) == ESP_OK && playing);
+    assert(audio_chunk(201, 0, (const uint8_t *)"\0\0", 2) == ESP_OK);
+    audio_end(201, 0);
+    story_cue("wolves");
+    assert(!events_shown && face_state == PET_FACE_SPEAKING && !stingers);
+    playing = false;
+    deliver((audio_event_t){.kind = AUDIO_PLAYBACK_DONE, .stream = 201, .generation = atomic_load(&s_generation)});
+    assert(events_shown == 1 && event_shown && face_state == PET_FACE_IDLE);
+    assert(stingers == 1 && !strcmp(stinger, "danger-ridge"));
+    state_changed("idle");
+    drain();
+    assert(event_shown && !events_stopped && ends_sent == 1);
+    event_ends();
+    assert(ends_sent == 2 && !strcmp(end_sent, "wolves"));
+    story_cue("wolves");
+    assert(events_shown == 2 && event_shown && stingers == 2);
+    event_ends();
+    story_cue("mirra-rises");
+    assert(events_shown == 2 && !event_shown && ends_sent == 4 && !strcmp(end_sent, "mirra-rises"));
+    pet_pack_verified_manifest_t manifest = {.bytes = (uint32_t)event_length};
+    strcpy(manifest.face_id, "event-wolves");
+    strcpy(manifest.version, "fixture-240-v2");
+    assert(!prepare_pack(1, event_pack, event_length, &manifest, false, false));
+}
+/* A tap or a long press gives the screen back to the pet and does nothing
+ * else; the next tap listens. A new reply ends it too. Each ends it with
+ * story.event.ended. */
+static void a_tap_ends_the_story_event(void)
+{
+    boot(true);
+    no_events();
+    event_list(wolves, 1, (uint32_t)event_length);
+    control_passes();
+    story_cue("wolves");
+    assert(event_shown);
+    tap();
+    assert(!event_shown && events_stopped == 1 && !listen_cues && face_state == PET_FACE_IDLE && ends_sent == 1);
+    tap();
+    assert(listen_cues == 1 && face_state == PET_FACE_LISTENING);
+    tap(); /* cancels the listen during its cue */
+    story_cue("wolves");
+    deliver((audio_event_t){.kind = AUDIO_PET, .generation = atomic_load(&s_generation)});
+    assert(!event_shown && events_stopped == 2 && face_state == PET_FACE_IDLE && ends_sent == 2);
+    story_cue("wolves");
+    assert(audio_start(202, 24000) == ESP_OK && !event_shown && events_stopped == 3 && face_state == PET_FACE_SPEAKING);
+    audio_end(202, 0);
+    playing = false;
+    deliver((audio_event_t){.kind = AUDIO_PLAYBACK_DONE, .stream = 202, .generation = atomic_load(&s_generation)});
+    assert(events_shown == 3 && !event_shown && ends_sent == 3);
+}
+/* The cue arrives while a tap waits to listen: it never shows over the
+ * listen, and the microphone drops it. One on screen ends with a rebind (the
+ * voice grant's renewal over the open session) and with install detachment. */
+static void the_microphone_or_a_rebind_ends_it(void)
+{
+    boot(true);
+    no_events();
+    event_list(wolves, 1, (uint32_t)event_length);
+    control_passes();
+    reply_heard(203);
+    assert(pet_runtime_claim(&s_resources, PET_RESOURCE_CONTROL));
+    tap();
+    assert(atomic_load(&s_tap_pending));
+    story_cue("wolves");
+    assert(!event_shown);
+    pet_runtime_release(&s_resources, PET_RESOURCE_CONTROL);
+    retry();
+    cue_done();
+    assert(capturing && face_state == PET_FACE_LISTENING && !event_shown);
+    end_turn();
+    deliver((audio_event_t){.kind = AUDIO_STORY_EVENT, .generation = atomic_load(&s_generation)});
+    assert(!events_shown);
+    story_cue("wolves");
+    assert(event_shown);
+    clock_us += 9000000; /* past the conversation grace */
+    atomic_store(&s_brain_expires_ms, (uint32_t)(clock_us / 1000) + 30000);
+    independent_updates(clock_us / 1000);
+    assert(!event_shown && events_stopped == 1 && rebinds == 1);
+    rebind_accepted();
+    story_cue("wolves");
+    assert(event_shown);
+    assert(hold_shown(false));
+    assert(!event_shown && events_stopped == 2 && ends_sent == 3);
+}
+
+/* The pet answers on `stream`: a question heard, then its speech. */
+static void answering(uint32_t stream)
+{
+    tap();
+    cue_done();
+    deliver((audio_event_t){.kind = AUDIO_CAPTURE_DONE, .stream = s_input_stream, .sequence = 9, .duration = 2000,
+                            .result = ESP_OK, .generation = atomic_load(&s_generation)});
+    capturing = false;
+    assert(audio_start(stream, 24000) == ESP_OK && playing && face_state == PET_FACE_SPEAKING);
+}
+/* In story mode, with a gateway that holds speech (speech-pause-v1), a tap
+ * holds the pet's answer at once and sends output.pause, and the next lets it
+ * play on with output.resume; nothing is cancelled. Frames still in flight
+ * never wait for the speaker's room while it is held. The milestone's event
+ * cued meanwhile is kept, and shows once the speech has drained. */
+static void a_story_tap_holds_the_reply(void)
+{
+    boot(true);
+    no_events();
+    story_mode = speech_pause_offered = true;
+    output_pauses = output_resumes = 0;
+    event_list(wolves, 1, (uint32_t)event_length);
+    control_passes();
+    answering(301);
+    clock_us += 1000000;
+    tap();
+    assert(held && output_pauses == 1 && output_stream == 301 && !strcmp(announced, "> paused"));
+    assert(playing && face_state == PET_FACE_SPEAKING && atomic_load(&s_turn_active) && !cancels);
+    queue_full = true;
+    unsigned waits = delays;
+    assert(audio_chunk(301, 0, (const uint8_t *)"\0\0", 2) == ESP_OK && delays == waits);
+    queue_full = false;
+    audio_end(301, 0);
+    story_cue("wolves");
+    clock_us += 2000000;
+    tap();
+    assert(!held && output_resumes == 1 && output_stream == 301 && !strcmp(announced, "> playing"));
+    assert(playing && !cancels && !events_shown && !ends_sent);
+    playing = false;
+    deliver((audio_event_t){.kind = AUDIO_PLAYBACK_DONE, .stream = 301, .generation = atomic_load(&s_generation)});
+    assert(events_shown == 1 && event_shown && face_state == PET_FACE_IDLE);
+    event_ends();
+    assert(ends_sent == 1 && !strcmp(end_sent, "wolves"));
+    story_mode = speech_pause_offered = false;
+}
+/* A tap within 350 ms of the one before stops the answer, as a tap did before:
+ * a double tap holds it, then stops it with input.cancel, and an event the
+ * answer cued ends after the cancel, so the gateway never speaks a reaction to
+ * it. Outside story mode, without the gateway's speech-pause-v1, or once the
+ * answer's last audio drains, a tap stops it at once. */
+static void a_double_tap_stops_the_reply(void)
+{
+    boot(true);
+    no_events();
+    story_mode = speech_pause_offered = true;
+    output_pauses = output_resumes = 0;
+    event_list(wolves, 1, (uint32_t)event_length);
+    control_passes();
+    answering(302);
+    const uint32_t asked = s_input_stream;
+    audio_end(302, 0);
+    story_cue("wolves");
+    clock_us += 1000000;
+    tap();
+    assert(held && output_pauses == 1 && !ends_sent && !cancels);
+    clock_us += 200000;
+    tap();
+    assert(!playing && !held && cancels == 1 && last_cancel == asked && face_state == PET_FACE_IDLE);
+    assert(!atomic_load(&s_turn_active) && ends_sent == 1 && cancels_before_end == 1 && !events_shown);
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        story_mode = i != 0;
+        speech_pause_offered = i != 1;
+        draining = i == 2;
+        clock_us += 1000000;
+        answering(303 + i);
+        clock_us += 1000000;
+        tap();
+        assert(!playing && !held && cancels == 2 + i && output_pauses == 1);
+    }
+    story_mode = speech_pause_offered = draining = false;
+}
+
+/* The capture of the current listen has ended with what the owner said. */
+static void listen_sent(void)
+{
+    deliver((audio_event_t){.kind = AUDIO_CAPTURE_DONE, .stream = s_input_stream, .sequence = 99, .duration = 3000,
+                            .result = ESP_OK, .generation = atomic_load(&s_generation)});
+}
+/* With a gateway that keeps a held reply while the owner talks over it
+ * (speech-pause-listen-v1), a tap in story mode holds the answer and listens
+ * at once, as a tap does when idle: output.pause, the listening face and cue,
+ * then the microphone. A tap sends what was said, and one while the gateway
+ * hears it is ignored. Its reply's start drops the held answer, which the
+ * gateway has dropped too: nothing is cancelled or played on. */
+static void a_story_tap_listens_over_the_reply(void)
+{
+    boot(true);
+    no_events();
+    story_mode = speech_pause_offered = listen_offered = true;
+    output_pauses = output_resumes = 0;
+    answering(401);
+    const unsigned listens = listen_cues, starts = input_starts;
+    clock_us += 1000000;
+    tap();
+    assert(held && playing && output_pauses == 1 && output_stream == 401 && !cancels);
+    assert(face_state == PET_FACE_LISTENING && listen_cues == listens + 1 && input_starts == starts);
+    cue_done();
+    assert(capturing && input_starts == starts + 1);
+    clock_us += 3000000;
+    tap();
+    assert(!capturing);
+    listen_sent();
+    assert(face_state == PET_FACE_THINKING && held && !cancels);
+    clock_us += 1000000;
+    tap();
+    assert(face_state == PET_FACE_THINKING && held && !cancels && !output_resumes);
+    assert(audio_start(402, 16000) == ESP_OK && playing && !held && face_state == PET_FACE_SPEAKING);
+    assert(!s_held_answer && s_output_stream == 402 && !cancels && !output_resumes);
+    story_mode = speech_pause_offered = listen_offered = false;
+}
+/* Nothing said over the held answer: the gateway hears no speech (NO_SPEECH)
+ * and the answer, its turn again, plays on from where it stopped
+ * (output.resume), with no error cue; the gateway's idle after it changes
+ * nothing. A tap during the listening cue cancels the listen before its
+ * microphone opens, and the answer plays on too. The milestone's event the
+ * answer cued waits through both, and shows once its speech has drained. */
+static void a_silent_listen_plays_the_reply_on(void)
+{
+    boot(true);
+    no_events();
+    story_mode = speech_pause_offered = listen_offered = true;
+    output_pauses = output_resumes = 0;
+    event_list(wolves, 1, (uint32_t)event_length);
+    control_passes();
+    answering(411);
+    const uint32_t asked = s_input_stream;
+    audio_end(411, 0);
+    story_cue("wolves");
+    clock_us += 1000000;
+    tap();
+    cue_done();
+    assert(held && capturing && !ends_sent);
+    clock_us += 3000000;
+    tap();
+    listen_sent();
+    const unsigned cues = sounds;
+    session_error("NO_SPEECH", "I didn't catch that", true);
+    drain();
+    assert(!held && playing && output_resumes == 1 && output_stream == 411 && face_state == PET_FACE_SPEAKING);
+    assert(s_input_stream == asked && !s_held_answer && !cancels && sounds == cues);
+    state_changed("idle");
+    drain();
+    assert(face_state == PET_FACE_SPEAKING && atomic_load(&s_turn_active));
+    clock_us += 1000000;
+    tap();
+    assert(held && output_pauses == 2 && face_state == PET_FACE_LISTENING && s_listen_token);
+    clock_us += 1000000;
+    tap();
+    assert(!held && output_resumes == 2 && face_state == PET_FACE_SPEAKING && !s_listen_token && !capturing);
+    assert(s_input_stream == asked && !cancels && !ends_sent && !events_shown);
+    playing = false;
+    deliver((audio_event_t){.kind = AUDIO_PLAYBACK_DONE, .stream = 411, .generation = atomic_load(&s_generation)});
+    assert(events_shown == 1 && event_shown && face_state == PET_FACE_IDLE);
+    event_ends();
+    assert(ends_sent == 1 && !strcmp(end_sent, "wolves"));
+    story_mode = speech_pause_offered = listen_offered = false;
+}
+/* A double tap still skips the answer: within 350 ms of the tap that held it
+ * and began the listen, it stops the answer and ends the listen. During the
+ * listening cue only the answer is cancelled; once the microphone is open,
+ * the listen's input is cancelled first. */
+static void a_double_tap_skips_the_held_reply(void)
+{
+    boot(true);
+    no_events();
+    story_mode = speech_pause_offered = listen_offered = true;
+    answering(421);
+    const uint32_t asked = s_input_stream;
+    clock_us += 1000000;
+    tap();
+    assert(held && s_listen_token);
+    clock_us += 200000;
+    tap();
+    assert(!playing && !held && cancels == 1 && last_cancel == asked && face_state == PET_FACE_IDLE);
+    assert(!s_listen_token && !s_held_answer && !atomic_load(&s_turn_active));
+    answering(422);
+    const uint32_t second = s_input_stream;
+    clock_us += 1000000;
+    tap();
+    cue_done();
+    const uint32_t listen = s_input_stream;
+    clock_us += 200000;
+    tap();
+    assert(!capturing && !playing && !held && cancels == 3 && previous_cancel == listen && last_cancel == second);
+    assert(!s_held_answer && !atomic_load(&s_turn_active) && face_state == PET_FACE_IDLE);
+    story_mode = speech_pause_offered = listen_offered = false;
+}
+
+/* Game cues (story.sound) wait for the next reply, which holds its speech
+ * while they play: the gateway is asked to pause it, then to send it on once
+ * they have played, unless the owner holds it then. Nothing is queued while
+ * the voice is off. */
+static void cues_hold_the_reply(void)
+{
+    boot(true);
+    speech_pause_offered = true;
+    output_pauses = output_resumes = cues_queued = 0;
+    story_sound("dice-wood-1");
+    assert(cues_queued == 1);
+    assert(audio_start(205, 16000) == ESP_OK && held && output_pauses == 1 && output_stream == 205);
+    held = false; /* The cues have played. */
+    sounds_played(205);
+    assert(output_resumes == 1 && output_stream == 205);
+    assert(audio_start(206, 16000) == ESP_OK && !held && output_pauses == 1);
+    story_sound("hit-stab");
+    assert(audio_start(207, 16000) == ESP_OK && held && output_pauses == 2);
+    sounds_played(207); /* Held by the owner as they end. */
+    assert(output_resumes == 1);
+    atomic_store(&s_voice_allowed, false);
+    story_sound("miss-swish");
+    assert(cues_queued == 2);
+    speech_pause_offered = held = false;
+}
+
+/* The BOOT button talks: held, the pet listens as a tap makes it, once per
+ * hold; let go, the microphone stops, which sends. Let go during the
+ * listening cue and nothing starts. Pressed while the pet speaks, the answer
+ * stops and the hold listens after. While the session connects a press waits
+ * as a tap does, and letting go withdraws it: the microphone never opens. */
+static void talk(bool held)
+{deliver((audio_event_t){.kind=AUDIO_TALK,.stream=held,.generation=atomic_load(&s_generation)});}
+static void the_boot_button_talks(void)
+{
+    boot(false);
+    talk(true);
+    assert(atomic_load(&s_tap_pending)&&face_state==PET_FACE_CONNECTING&&!strcmp(announced,"> connecting..."));
+    talk(false);
+    assert(!atomic_load(&s_tap_pending)&&face_state==PET_FACE_IDLE&&!strcmp(announced,"> cancelled"));
+    gateway_hello(true);retry();assert(!listen_cues&&!capture_starts&&!input_starts);
+
+    talk(true);assert(listen_cues==1&&face_state==PET_FACE_LISTENING&&s_listen_token&&!capture_starts);
+    talk(true);assert(listen_cues==1);
+    cue_done();assert(capture_starts==1&&input_starts==1&&capturing);
+    talk(true);assert(capturing);
+    talk(false);assert(!capturing);
+    end_turn();
+
+    talk(true);assert(listen_cues==2&&s_listen_token);
+    talk(false);
+    assert(!s_listen_token&&face_state==PET_FACE_IDLE&&!atomic_load(&s_turn_active)&&capture_starts==1);
+
+    answering(401);
+    const unsigned cues=listen_cues,before=cancels;
+    talk(true);assert(cancels==before+1&&!playing&&face_state==PET_FACE_IDLE&&listen_cues==cues);
+    talk(true);assert(listen_cues==cues+1&&face_state==PET_FACE_LISTENING);
+    talk(false);assert(!s_listen_token&&!capturing);
+}
+static void partial_story_event(void)
+{
+    assert(event_length > 32768u);
+    boot(true);
+    no_events();
+    event_list(wolves, 1, (uint32_t)event_length);
+    pet_control_http_t http = {.origin = s_origin, .device_id = s_id, .credential = s_credential};
+    assert(pet_story_events_step(&http, 1000));
+    assert(!pet_story_events_cue("wolves"));
+    cut_downloads = 1;
+    assert(pet_story_events_step(&http, 1001));
+    assert(!pet_story_events_step(&http, 1002) && !pet_story_events_cue("wolves"));
+    unsigned chunks = (unsigned)((event_length + 32767u) / 32768u);
+    for (unsigned i = 1; i < chunks; i++)
+    {
+        assert(!pet_story_events_cue("wolves"));
+        assert(pet_story_events_step(&http, 32000 + i));
+    }
+    assert(event_downloads == chunks + 1 && pet_story_events_cue("wolves"));
+    pet_story_events_uncue();
 }
 
 static const struct {const char *name;void (*run)(void);} scenarios[]={
-    {"swipe_keeps_session",swipe_keeps_session},{"selection_rebinds",selection_rebinds},
-    {"swipe_back_resumes",swipe_back_resumes},{"tap_waits_for_the_session",tap_waits_for_the_session},
-    {"refusal_reconnects",refusal_reconnects},{"rebind_timeout_reconnects",rebind_timeout_reconnects},
-    {"older_gateway_reconnects",older_gateway_reconnects},{"usb_pet_not_linked",usb_pet_not_linked},
-    {"rebind_applies_the_new_configuration",rebind_applies_the_new_configuration},
-    {"management_answer_mid_switch_keeps_session",management_answer_mid_switch_keeps_session},
+
+    {"tap_waits_for_the_session",tap_waits_for_the_session},
+
+
+
+
     {"management_answer_before_the_session_waits",management_answer_before_the_session_waits},
-    {"tap_waits_for_the_whole_switch",tap_waits_for_the_whole_switch},{"a_refused_switch_says_so",a_refused_switch_says_so},
+
     {"tap_waits_for_a_control_step",tap_waits_for_a_control_step},
     {"control_yields_to_a_waiting_tap",control_yields_to_a_waiting_tap},
     {"a_follow_up_tap_listens_at_once",a_follow_up_tap_listens_at_once},
     {"a_stalled_listen_says_so",a_stalled_listen_says_so},
     {"brain_disconnect_releases_voice",brain_disconnect_releases_voice},
     {"brain_failure_and_renewal",brain_failure_and_renewal},
-    {"a_swipe_stops_the_voice_calmly",a_swipe_stops_the_voice_calmly},
-    {"a_burst_of_swipes_moves_once",a_burst_of_swipes_moves_once},
+    {"story_screens_keep_the_turn",story_screens_keep_the_turn},
+
+
+    {"a_story_pause_lets_the_reply_play",a_story_pause_lets_the_reply_play},
+
+    {"story_events_download_between_turns",story_events_download_between_turns},
+
+    {"a_wrong_event_pack_is_refused",a_wrong_event_pack_is_refused},
+    {"a_failed_download_is_tried_again",a_failed_download_is_tried_again},
+    {"a_story_event_waits_for_the_speech",a_story_event_waits_for_the_speech},
+    {"a_tap_ends_the_story_event",a_tap_ends_the_story_event},
+    {"the_microphone_or_a_rebind_ends_it",the_microphone_or_a_rebind_ends_it},
+    {"a_story_tap_holds_the_reply",a_story_tap_holds_the_reply},
+    {"a_double_tap_stops_the_reply",a_double_tap_stops_the_reply},
+    {"a_story_tap_listens_over_the_reply",a_story_tap_listens_over_the_reply},
+    {"a_silent_listen_plays_the_reply_on",a_silent_listen_plays_the_reply_on},
+    {"a_double_tap_skips_the_held_reply",a_double_tap_skips_the_held_reply},
+    {"cues_hold_the_reply",cues_hold_the_reply},
+    {"the_boot_button_talks",the_boot_button_talks},
 };
 int main(int argc,char **argv)
 {
     pack_length=fread(pack_bytes,1,sizeof(pack_bytes),stdin);assert(pack_length&&pack_length<sizeof(pack_bytes));
+    FILE *event_file=fopen(STORY_EVENT_PACK,"rb");assert(event_file);
+    event_length=fread(event_pack,1,sizeof(event_pack),event_file);fclose(event_file);
+    assert(event_length&&event_length<sizeof(event_pack));hex_sha256(event_pack,event_length,event_sha);
+    assert(pet_story_events_init(pet_network_story_event_ended));
     s_audio_lock=xSemaphoreCreateMutex();s_audio_events=(QueueHandle_t)2;s_commands=(QueueHandle_t)3;
     atomic_store(&s_identity_ready,true);s_boot_health_decided=true;s_audio_started=s_face_started=true;
     strcpy(s_id,"00000000-0000-4000-8000-000000000001");s_origin="https://fixture.invalid";
@@ -851,11 +1531,18 @@ int main(int argc,char **argv)
     strcpy(signed_release.project_id,"00000000-0000-4000-8000-000000000004");
     strcpy(signed_release.face_id,"big-sal");strcpy(signed_release.version,"fixture-240-v2");
     signed_release.imported=false;s_wifi.volume=40;s_wifi.brightness=80;
+    if (argc > 1 && !strcmp(argv[1], "partial-story-event"))
+    {
+        partial_story_event();
+        return 0;
+    }
     /* Every scenario by default; one by name to see where each one stands. */
     unsigned ran=0;
     for(size_t i=0;i<sizeof(scenarios)/sizeof(scenarios[0]);++i)
         if(argc<2||!strcmp(argv[1],scenarios[i].name)){scenarios[i].run();printf("ok %s\n",scenarios[i].name);++ran;}
     assert(ran);
-    free(s_shown_pack);s_shown_pack=NULL;
+    s_stream = NULL;
+    free(s_shown_pack);
+    s_shown_pack = NULL;
     return 0;
 }

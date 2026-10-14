@@ -10,6 +10,7 @@
  * cloud's THREE_PET_MAX_RELEASE_BYTES and THREE_PET_MINIMUM_FIRMWARE_EPOCH. */
 #define PET_RELEASE_V2_THREE_PET_MAX_BYTES 3000000u
 #define PET_RELEASE_V2_THREE_PET_EPOCH 3u
+#define PET_RELEASE_V2_TWO_PET_EPOCH 6u
 #define PET_RELEASE_V2_TARGETED_EPOCH 5u
 
 /* Compact authenticated facts; larger inventory, action and source documents

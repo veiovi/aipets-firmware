@@ -29,6 +29,8 @@ int xSemaphoreTake(SemaphoreHandle_t handle,TickType_t ticks){(void)handle;(void
 int xSemaphoreGive(SemaphoreHandle_t handle){(void)handle;lock_held=false;return pdTRUE;}
 void pet_audio_capture_stop(void){capturing=false;}
 void pet_audio_playback_cancel(void){playing=false;}
+pet_atmosphere_t pet_atmosphere_from_name(const char *name){(void)name;return PET_ATMOSPHERE_NONE;}
+void pet_atmosphere_cue(pet_atmosphere_t atmosphere){(void)atmosphere;}
 void pet_network_freeze_bound(void){++freezes;}
 void pet_control_http_close_kept(void){}
 static pet_face_state_t face_state=PET_FACE_IDLE;
@@ -39,8 +41,8 @@ static bool network_ready=true,input_start_ok=true,input_end_ok=true,capture_ok=
 static unsigned input_starts,input_ends,cancels,captures,config_results,speech_results;
 static uint32_t cancelled_stream;
 bool pet_network_is_ready(void){return network_ready;}
-esp_err_t pet_network_input_start(uint32_t stream,const char *ai_pet_id)
-{assert(!lock_held&&stream&&ai_pet_id);++input_starts;return input_start_ok?ESP_OK:ESP_FAIL;}
+esp_err_t pet_network_input_start(uint32_t stream,const char *ai_pet_id,const char *blessing)
+{assert(!lock_held&&stream&&ai_pet_id&&blessing&&!blessing[0]);++input_starts;return input_start_ok?ESP_OK:ESP_FAIL;}
 esp_err_t pet_network_input_end(uint32_t stream,uint32_t sequence,uint32_t duration)
 {assert(!lock_held&&stream);(void)sequence;(void)duration;++input_ends;return input_end_ok?ESP_OK:ESP_FAIL;}
 esp_err_t pet_network_cancel(uint32_t stream){assert(!lock_held);++cancels;cancelled_stream=stream;return ESP_OK;}
@@ -153,6 +155,10 @@ esp_err_t pet_audio_playback_enqueue(uint32_t stream,uint32_t sequence,const uin
     ++speaker_queued;++enqueued;return ESP_OK;
 }
 bool pet_audio_playback_queue_healthy(void){return !playing||SPEAKER_SLOTS-speaker_queued>1u;}
+bool pet_audio_playback_held(void)
+{
+    return false; /* Only the Pocket holds a reply. */
+}
 void vTaskDelay(TickType_t ticks)
 {
     static unsigned elapsed;speaker_waited_ms+=ticks;elapsed+=ticks; /* One tick is 1 ms here. */

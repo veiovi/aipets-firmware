@@ -88,7 +88,6 @@ class DeviceSettingsWiringTests(unittest.TestCase):
         self.assertIn('"wifi_pass_"', config)
         self.assertIn("pet_config_recall_wifi", config)
         self.assertIn("pet_config_wifi_saved", config)
-        self.assertIn("connect_wifi_profile(!s_wifi_using_fallback)", network)
         self.assertIn("WIFI_RETRIES_PER_PROFILE", network)
         self.assertIn("pet_config_wifi_saved(networks[network_count].ssid)",
                       "".join(network.split()))
@@ -185,7 +184,7 @@ class DeviceSettingsWiringTests(unittest.TestCase):
         network = self.read("pet_network.c")
         scan = network[network.index("esp_err_t pet_network_scan("):
                        network.index("esp_err_t pet_network_input_start")]
-        self.assertIn("if (s_scan_running) return ESP_OK;", scan)
+        self.assertIn("if (atomic_exchange(&s_scan_running, true)) return ESP_OK;", scan)
         app = self.read("app_main.c")
         wifi_event = app[app.index("case APP_EVENT_WIFI_SCAN:"):
                          app.index("case APP_EVENT_VOLUME_CHANGED:")]
@@ -213,8 +212,8 @@ class DeviceSettingsWiringTests(unittest.TestCase):
     def test_horizontal_swipes_cycle_faces_without_replacing_vertical_gestures(self) -> None:
         face = self.read("pet_face.c")
         touch = face[face.index("static void touch_event"):face.index("static void close_settings_event")]
-        self.assertIn("request_adjacent_face(dx < 0 ? 1 : -1)", touch)
-        self.assertIn("dy >= 48", touch)
+        self.assertIn("request_adjacent_face(swipe == PET_FACE_SWIPE_LEFT ? 1 : -1)", touch)
+        self.assertIn("swipe == PET_FACE_SWIPE_DOWN", touch)
         self.assertIn("touch_started_at.y >= 288", touch)
         app = self.read("app_main.c")
         switching = app[app.index("case APP_EVENT_FACE_ID_CHANGED:"):
@@ -294,9 +293,9 @@ class DeviceSettingsWiringTests(unittest.TestCase):
         switching = app[app.index("case APP_EVENT_FACE_ID_CHANGED:"):
                         app.index("case APP_EVENT_RECORDING_TIMEOUT_CHANGED:")]
         self.assertNotIn("pet_network_set_ai_pet_id", switching)
-        network = self.read("pet_network.c")
-        audio_start = network[network.index("static esp_err_t send_turn_start"):
-                              network.index("esp_err_t pet_network_send_microphone")]
+        wire = self.read("pet_session_wire.c")
+        audio_start = wire[wire.index("bool pet_session_wire_input_start"):
+                           wire.index("static bool same(")]
         self.assertIn('cJSON_AddStringToObject(root, "aiPetId"', audio_start)
         self.assertNotIn('"faceId"', audio_start)
 
@@ -310,11 +309,9 @@ class DeviceSettingsWiringTests(unittest.TestCase):
         app = self.read("app_main.c")
         network = self.read("pet_network.c")
         component_cmake = self.read("CMakeLists.txt")
-        project_cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
         self.assertIn('esp_app_get_description()->version', app)
         self.assertIn('cJSON_AddStringToObject(root, "firmware", esp_app_get_description()->version)', network)
         self.assertIn('esp_app_format', component_cmake)
-        self.assertIn('set(PROJECT_VER "aipet-6.0.2-240")', project_cmake)
         self.assertNotIn('AI Pet firmware 0.1.0 booting', app)
         self.assertNotIn('cJSON_AddStringToObject(root, "firmware", "0.1.0")', network)
 

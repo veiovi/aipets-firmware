@@ -1,123 +1,123 @@
 # Getting started
 
-Build the firmware for your board, flash it with esptool and link the device.
-To install without any tools, use **Install or update firmware** on aipets.com
-instead ([README](../README.md#three-ways-to-start)).
+Build for your exact [supported board](../README.md#supported-boards), then
+install over USB. The hosted **Install or update firmware** page at
+[aipets.com](https://aipets.com) is the simpler option when it offers a
+compatible release for your board and current layout.
 
 ## What you need
 
-- A [supported board](../README.md#supported-boards) and a USB-C data cable.
+- A supported ESP32-S3 board and a USB-C data cable.
 - [ESP-IDF v5.5.3](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32s3/get-started/index.html),
-  or Docker to build in the `espressif/idf:v5.5.3` image.
-- Git and Python 3.
+  Git and Python 3.
 
 ## Get the source
 
-Clone this repository with its submodule, Waveshare's board support for the
-1.85B:
-
 ```sh
-git clone --recursive <this repository's URL>
+git clone --recursive https://github.com/veiovi/aipets-firmware.git
+cd aipets-firmware
 ```
 
-In an existing clone, run `git submodule update --init`.
+For an existing clone, run `git submodule update --init`. The submodule is
+Waveshare's board support for the 1.85B.
 
 ## Build
 
-In an ESP-IDF 5.5.3 shell, from the repository root:
+Activate your ESP-IDF 5.5.3 environment, then run from the repository root:
 
 ```sh
-. ~/esp/esp-idf-v5.5.3/export.sh    # wherever you installed ESP-IDF
 tools/build-firmware.sh waveshare-esp32-s3-touch-lcd-1.85b
 ```
 
-Use the `AIPET_BOARD` name of your board from the
-[board table](../README.md#supported-boards). The first build downloads the
-board's components, pinned by `firmware/dependencies*.lock`. The results are
-in `build/<board>/`:
+Replace the board name with its exact `AIPET_BOARD` value from the README.
+Dependencies are pinned in `firmware/dependencies*.lock`; the first build
+downloads the required components. Outputs go to `build/<board>/`.
 
-| File | Flash offset |
-| --- | --- |
-| `bootloader/bootloader.bin` | `0x0` |
-| `partition_table/partition-table.bin` | `0x8000` |
-| `ota_data_initial.bin` | `0x10000` |
-| `aipet_firmware.bin` | `0x30000` and `0x3b0000` (both app slots) |
+The script applies the base, vNext, vNext release, Pocket and Pocket release
+defaults, plus AMOLED defaults for that board. Its optional second argument
+sets the build directory; a third defaults file overrides configuration for
+[your backend](backend.md). Use a fresh build directory when changing board
+or defaults. Reproducible-build settings remove build timestamps and source
+paths; compare hashes with identical source, toolchain and configuration.
 
-Or build in Docker, as the CI does:
+The current partition table contains:
 
-```sh
-docker run --rm -v "$PWD":/project -w /project espressif/idf:v5.5.3 \
-  tools/build-firmware.sh waveshare-esp32-s3-touch-lcd-1.54
-```
+| Region | Offset | Size |
+| --- | --- | --- |
+| NVS settings | `0x9000` | `0x6000` |
+| Factory application | `0x30000` | `0x380000` |
+| Pet journal | `0x3b0000` | `0x10000` |
+| Story sound bank | `0x3c0000` | `0x200000` |
+| Pet store | `0x5c0000` | `0xa40000` |
 
-`tools/build-firmware.sh` applies the release configuration:
-`firmware/sdkconfig.defaults`, then the `vnext`, `vnext.release`, `pocket` and
-`pocket.release` defaults, and `sdkconfig.amoled_206.defaults` for the AMOLED.
-Builds are reproducible (`CONFIG_APP_REPRODUCIBLE_BUILD`): the same commit
-gives byte-identical images on another machine with ESP-IDF 5.5.3.
-A third argument adds your own defaults file last
-([backend settings](backend.md)).
+The authoritative complete table is
+[`firmware/partitions-pocket.csv`](../firmware/partitions-pocket.csv).
+There is no second application slot or OTA selection partition in this layout.
 
 ### Host tests
-
-The tests in `firmware/tests` run on your computer with Python 3 and a C
-compiler:
 
 ```sh
 python3 -m unittest discover -s firmware/tests -p 'test_*.py'
 ```
 
-Tests that need LVGL, ESP-IDF or Pillow skip without them. Set
-`LVGL_SOURCE_DIR` (for example `firmware/managed_components/lvgl__lvgl` after a
-build) and `IDF_PATH` to run them all.
+Tests need Python 3 and a C compiler. Some require LVGL, ESP-IDF or Pillow;
+inspect reported skips. `LVGL_SOURCE_DIR` can point to
+`firmware/managed_components/lvgl__lvgl` after a build, and `IDF_PATH` to
+your ESP-IDF installation. For a code change, run the affected modules first.
 
-## Flash
+## Flash and migrate
 
-esptool comes with ESP-IDF (`esptool.py`), or install it with
-`pip install esptool`. Replace `PORT` with the board's serial port, for example
-`/dev/cu.usbmodem1101` on macOS, `/dev/ttyACM0` on Linux or `COM5` on Windows.
-If esptool can't connect, put the board in download mode as Waveshare's
-guide for your board describes.
+**The old dual-application layout is incompatible with this app's data map.**
+In particular, `0x3b0000` is now the pet journal, not a second application.
+Never use old two-slot flash commands, and never write this app alone over
+an older partition table. Firmware updates are USB-only in the current layout.
 
-**A new board, or starting over.** This removes everything on the board,
-including Waveshare's demo, Wi-Fi settings and pets:
+For an existing device, prefer the board-matched hosted installer when it
+explicitly supports migration from your installed layout. A manual migration
+that preserves data requires a verified backup and a layout-aware migration
+procedure; this repository does not provide a one-command preserving migration.
+Do not restore an old raw NVS or pet journal into an incompatible layout.
+Backups contain Wi-Fi credentials and device credentials: keep them private.
+
+### Fresh installation or deliberate reset
+
+This procedure **erases all device settings, Wi-Fi credentials, account linking,
+pets, sound content and the vendor demo**. Reconnect and reinstall content
+afterward. Use it only when starting fresh or when you accept that loss.
+
+Replace `PORT` with your device's serial port. Use esptool from your ESP-IDF
+environment; enter download mode as described in your board's Waveshare guide
+if it cannot connect. From the repository root after building:
 
 ```sh
 esptool.py --chip esp32s3 -p PORT erase_flash
-esptool.py --chip esp32s3 -p PORT write_flash 0x0 aipets-firmware-<board>-<version>-full.bin
-```
-
-For your own build, write its files instead of the full image, from
-`build/<board>/`:
-
-```sh
-esptool.py --chip esp32s3 -p PORT write_flash 0x0 bootloader/bootloader.bin \
-  0x8000 partition_table/partition-table.bin 0x10000 ota_data_initial.bin \
-  0x30000 aipet_firmware.bin 0x3b0000 aipet_firmware.bin
-```
-
-**Updating a board that already runs this firmware** keeps its Wi-Fi, link and
-pets. Write only the app, to both app slots, and don't go back to an older
-release:
-
-```sh
 esptool.py --chip esp32s3 -p PORT write_flash \
-  0x30000 aipets-firmware-<board>-<version>-app.bin \
-  0x3b0000 aipets-firmware-<board>-<version>-app.bin
+  0x0 build/waveshare-esp32-s3-touch-lcd-1.85b/bootloader/bootloader.bin \
+  0x8000 build/waveshare-esp32-s3-touch-lcd-1.85b/partition_table/partition-table.bin \
+  0x30000 build/waveshare-esp32-s3-touch-lcd-1.85b/aipet_firmware.bin
 ```
 
-Check downloaded images against the release's `SHA256SUMS` first.
+Use the directory for your exact board. For packaged images, check
+`SHA256SUMS`, the board identity and the layout in `manifest.json` first.
+A full image is for a fresh/reset installation; use its recorded offsets.
+
+### Updating within the same layout
+
+Only after confirming that the device already uses `one-pet-10m-v5`, an
+app-only write at `0x30000` updates firmware without writing settings or pet
+regions. Use a build for the same board and a compatible firmware epoch.
+Do not erase flash, write the full image or downgrade as part of this update.
+Verify boot and a real interaction afterward; a successful USB write alone
+does not prove the update works.
 
 ## First boot
 
-1. The boot screen checks the display, touch, Wi-Fi and pets.
-2. **WI-FI**: choose your network, or **HIDDEN** to type its name, then type
-   the password on the **JOIN** keyboard.
-3. **LINK**: the device shows its link code. [Link it](../README.md#linking-a-device)
-   on aipets.com, or on your own backend.
-4. Without pets, the device stays in its menu. Install a pet from aipets.com,
-   or over USB ([pet packs](pet-packs.md)).
+1. Choose a Wi-Fi network, or **HIDDEN** to enter its name, then its password.
+2. [Link the device](../README.md#linking-a-device) to your backend account.
+3. Install one pet from the backend, or prepare an unsigned animation pack
+   over USB ([pet packs](pet-packs.md)).
 
-Swipe down to open the control deck at any time. Its system log shows what the
-device is doing, and **ABOUT** lists the open-source notices. To watch the
-serial log, run `idf.py -B ../build/<board> -p PORT monitor` from `firmware/`.
+Swipe down for the control deck. The system log shows device activity and
+**ABOUT** lists open-source notices. From `firmware/`, use
+`idf.py -B ../build/<board> -p PORT monitor` to read serial output. Review logs
+for private details before sharing them.

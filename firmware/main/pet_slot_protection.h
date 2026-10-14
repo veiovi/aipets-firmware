@@ -2,7 +2,7 @@
 #include "pet_release_v2.h"
 #include "pet_slot_store.h"
 
-/* Firmware rollback protection of the Pocket Terminal's three-pet store: the
+/* Firmware rollback protection of the Pocket Terminal's two-pet store: the
  * single-pet rule (pet_release_v2_protection.h) for every slot. Each occupied
  * slot proves its pack with the signed release record its cloud installation
  * wrote, for the authenticated account and the slot's exact pack (the

@@ -13,13 +13,22 @@
 #define PET_LAYOUT_REGIONS_MAX 9u
 typedef enum { PET_LAYOUT_EMBEDDED_V1, PET_LAYOUT_DUAL_V1,
     PET_LAYOUT_SINGLE_2M, PET_LAYOUT_SINGLE_2P5M, PET_LAYOUT_SINGLE_3M,
-    PET_LAYOUT_SINGLE_4M, PET_LAYOUT_THREE_3P5M } pet_layout_id_t;
+    PET_LAYOUT_SINGLE_4M, PET_LAYOUT_THREE_3P5M, PET_LAYOUT_TWO_4M, PET_LAYOUT_ONE_10M } pet_layout_id_t;
 /* Pocket Terminal: two 3.5 MiB firmware copies and one pet store holding three
  * slots. Each slot is a 3,002,368-byte pack area (733 sectors, at least the
  * 3,000,000-byte pack cap) followed by its 8 KiB signed release record. */
 #define PET_LAYOUT_THREE_SLOTS 3u
 #define PET_LAYOUT_THREE_SLOT_PACK_BYTES 0x2dd000u
 #define PET_LAYOUT_THREE_SLOT_BYTES (PET_LAYOUT_THREE_SLOT_PACK_BYTES + PET_LAYOUT_MANIFEST_BYTES)
+#define PET_LAYOUT_TWO_SLOTS 2u
+#define PET_LAYOUT_TWO_SLOT_PACK_BYTES 0x3fe000u
+#define PET_LAYOUT_TWO_SLOT_BYTES 0x400000u
+#define PET_LAYOUT_TWO_MAX_PACK_BYTES 4000000u
+/* USB firmware, one Wi-Fi pet and a dedicated 2 MiB sound bank. The physical
+ * pack capacity is independent of the bounded resident/cache RAM budget. */
+#define PET_LAYOUT_ONE_SLOT_PACK_BYTES 0xa3e000u
+#define PET_POCKET_MAX_PACK_BYTES PET_LAYOUT_ONE_SLOT_PACK_BYTES
+#define PET_POCKET_BUFFER_BYTES 4000000u
 typedef struct {
     char name[17];
     uint8_t type, subtype;
@@ -34,6 +43,7 @@ typedef struct {
 } pet_flash_layout_t;
 const char *pet_flash_layout_name(pet_layout_id_t id);
 bool pet_flash_layout_known(pet_layout_id_t id, pet_flash_layout_t *layout);
+bool pet_flash_layout_is_pocket(const pet_flash_layout_t *layout);
 /* Runtime receives ESP-IDF's validated partition entries and the detected flash
  * size. Unknown/additional/duplicate/encrypted/read-only regions fail closed.
  * Secure boot/download restrictions need a separate hardware check in USB UI. */

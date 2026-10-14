@@ -38,7 +38,7 @@ bool pet_replace_capacity_valid(uint32_t bytes)
 {
     /* The four single-pet layouts, and one slot of the three-pet store. */
     return bytes == 0xbbe000u || bytes == 0xabe000u || bytes == 0x9be000u || bytes == 0x7be000u ||
-        bytes == 0x2dd000u;
+        bytes == 0x2dd000u || bytes == 0x3fe000u || bytes == 0xa3e000u;
 }
 bool pet_replace_empty(pet_replace_t *s, uint32_t capacity)
 {

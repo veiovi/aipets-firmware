@@ -193,9 +193,9 @@ typedef enum {
 #define FP_TALK_STAGE_MIN_DWELL_TICKS 2
 #define FP_TALK_LOWER_STREAK_TICKS 2
 #define FP_SHOWCASE_GAP_TICKS 15
-/* Natural idle: ticks of calm before a manual action (about 4 to 10 minutes). */
-#define FP_CALM_MIN_TICKS 7200
-#define FP_CALM_MAX_TICKS 18000
+/* Natural idle: ticks of calm before a manual action (about 7 to 15 seconds). */
+#define FP_CALM_MIN_TICKS 210
+#define FP_CALM_MAX_TICKS 450
 #define FP_SHOWCASE_MIN_HOLD_MS 3000
 #define FP_SHOWCASE_MAX_HOLD_MS 6000
 #define FP_EMOTION_REQUEST_NONE (-1)
@@ -290,7 +290,7 @@ typedef struct {
 
 struct fp_player {
     uint32_t magic;
-    const uint8_t *pack;
+    fp_pack_source_t source;
     uint32_t pack_bytes;
     fp_pack_info_t info;
     fp_pack_view_t view;
@@ -355,6 +355,7 @@ struct fp_player {
     int32_t drift_started, drift_x, drift_y, drift_from_x, drift_from_y;
     int32_t drift_to_x, drift_to_y, drift_elapsed, drift_duration;
 
+    uint8_t tick_committed;
     /* Presentation identity. The director still advances every 33 ms, but
      * identical authored visuals do not need another framebuffer expansion
      * or LVGL transformed-canvas invalidation. */
@@ -382,6 +383,9 @@ struct fp_player {
 
 uint16_t fp_rd16(const uint8_t *p);
 uint32_t fp_rd32(const uint8_t *p);
+const uint8_t *fp_source_at(const fp_pack_source_t *source, uint32_t offset);
+const uint8_t *fp_player_at(const fp_player_t *player, uint32_t offset);
+const uint8_t *fp_player_resource(const fp_player_t *player, uint16_t frame);
 
 typedef struct {
     uint16_t frame;
