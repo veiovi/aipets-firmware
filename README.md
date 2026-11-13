@@ -3,6 +3,19 @@
 Firmware for [AI Pets](https://aipets.com): a little animated companion that
 lives on an ESP32-S3 touch board and talks with you.
 
+## Try a story before setting up a board
+
+[Play Luna and the Lost Lullaby](https://aipets.com/play/luna), or
+[choose another companion](https://aipets.com/play). The short browser demos
+start without an account or hardware. Creating your own pets and continuing
+in Studio requires an account.
+
+The hosted Studio and AI-provider usage are separate from the Apache-2.0
+firmware in this repository. See [how AI Pets works](https://aipets.com/how-it-works)
+for the browser, provider-key and device setup paths.
+
+## What the firmware does
+
 - One installed pet, with an animation pack up to 10,739,712 bytes.
 - Tap to talk. The device records your question and plays the pet's spoken
   answer. Speech recognition, the pet's personality, memory and voice run on
